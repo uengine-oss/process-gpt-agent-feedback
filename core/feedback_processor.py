@@ -168,8 +168,7 @@ async def save_to_mem0(agent_feedbacks: List[Dict]):
                 user_id=agent_id,
                 metadata={
                     "data_type": "feedback"
-                },
-                infer=False  # 추론 없이 원본 그대로 저장
+                }
             )
             
             log(f"Mem0 학습 완료 (Supabase): 에이전트 {agent_name} (ID: {agent_id})")

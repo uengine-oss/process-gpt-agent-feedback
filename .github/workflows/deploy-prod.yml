@@ -1,4 +1,4 @@
-name: process-gpt-build-and-deploy
+name: process-gpt-agent-feedback-prod-deploy
 
 on:
   release:
@@ -16,10 +16,10 @@ jobs:
         run: |
           echo "${{ secrets.GHCR_PAT }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
 
-      - name: Build and push Docker image to GHCR
+      - name: Build and push Docker image to GHCR (PROD)
         run: |
           IMAGE_TAG=$(echo $GITHUB_SHA | cut -c1-7)
-          IMAGE_NAME=ghcr.io/uengine-oss/crewai-agent-feedback:$IMAGE_TAG
+          IMAGE_NAME=ghcr.io/uengine-oss/process-gpt-agent-feedback:$IMAGE_TAG
 
           docker build -t $IMAGE_NAME .
           docker push $IMAGE_NAME
@@ -43,8 +43,8 @@ jobs:
         run: |
           cd gitops-repo
           
-          # Update crewai-agent-feedback deployment image in production
-          yq eval '.spec.template.spec.containers[0].image = "'$IMAGE_NAME'"' -i prod/deployments/crewai-agent-feedback-deployment.yaml
+          # Update process-gpt-agent-feedback deployment image in production
+          yq eval '.spec.template.spec.containers[0].image = "'$IMAGE_NAME'"' -i prod/deployments/process-gpt-agent-feedback-deployment.yaml
           
           echo "Updated image to: $IMAGE_NAME"
 
@@ -55,7 +55,7 @@ jobs:
           git config --local user.name "GitHub Action"
           
           git add .
-          git commit -m "Update crewai-agent-feedback image to $IMAGE_TAG (PRODUCTION)" || exit 0
+          git commit -m "Update process-gpt-agent-feedback image to $IMAGE_TAG (PRODUCTION)" || exit 0
           git push
 
       - name: Create deployment summary
