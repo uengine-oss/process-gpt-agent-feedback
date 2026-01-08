@@ -5,7 +5,7 @@ Claude Skill을 저장하는 로직 (HTTP API를 통해 구현)
 
 from typing import Dict, List, Optional
 from utils.logger import log, handle_error
-from core.database import update_agent_and_tenant_skills, _get_agent_by_id, record_skill_history, record_knowledge_history
+from core.database import update_agent_and_tenant_skills, _get_agent_by_id, record_knowledge_history
 from core.skill_api_client import (
     upload_skill,
     update_skill_file,

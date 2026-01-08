@@ -84,33 +84,7 @@ GRANT EXECUTE ON FUNCTION public.delete_memories_by_agent(text) TO anon;
 
 
 -- ============================================================================
--- 3. 스킬 변경 이력 테이블 (레거시, 선택적)
--- ============================================================================
-
-CREATE TABLE IF NOT EXISTS public.skill_history (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    skill_name TEXT NOT NULL,
-    agent_id UUID NOT NULL,
-    tenant_id TEXT,
-    operation TEXT NOT NULL CHECK (operation IN ('CREATE', 'UPDATE', 'DELETE')),
-    previous_content TEXT,
-    new_content TEXT,
-    feedback_content TEXT,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    CONSTRAINT skill_history_agent_id_fkey FOREIGN KEY (agent_id, tenant_id) 
-        REFERENCES public.users (id, tenant_id) ON UPDATE CASCADE ON DELETE CASCADE
-);
-
-CREATE INDEX IF NOT EXISTS idx_skill_history_skill_name ON public.skill_history(skill_name);
-CREATE INDEX IF NOT EXISTS idx_skill_history_agent_id ON public.skill_history(agent_id);
-CREATE INDEX IF NOT EXISTS idx_skill_history_tenant_id ON public.skill_history(tenant_id);
-CREATE INDEX IF NOT EXISTS idx_skill_history_created_at ON public.skill_history(created_at DESC);
-
-GRANT SELECT, INSERT ON public.skill_history TO anon;
-
-
--- ============================================================================
--- 4. 에이전트 지식 변경 이력 테이블 (통합)
+-- 3. 에이전트 지식 변경 이력 테이블 (통합)
 -- MEMORY, DMN_RULE, SKILL 모든 지식 타입의 변경 이력 관리
 -- ============================================================================
 
@@ -152,7 +126,7 @@ GRANT SELECT, INSERT ON public.agent_knowledge_history TO anon;
 
 
 -- ============================================================================
--- 5. 배치 작업 이력 테이블
+-- 4. 배치 작업 이력 테이블
 -- 중복 제거 등 배치 작업의 실행 이력과 통계 저장
 -- ============================================================================
 
@@ -195,7 +169,7 @@ GRANT SELECT, INSERT, UPDATE ON public.batch_job_history TO anon;
 
 
 -- ============================================================================
--- 6. 배치 작업 백업 테이블 (롤백용)
+-- 5. 배치 작업 백업 테이블 (롤백용)
 -- 배치 작업으로 삭제/이동된 항목의 백업 저장
 -- ============================================================================
 

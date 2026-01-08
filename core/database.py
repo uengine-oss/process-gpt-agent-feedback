@@ -303,36 +303,3 @@ def record_knowledge_history(
         log(f"⚠️ 지식 변경 이력 기록 실패 (무시하고 계속 진행): {e}")
         log(f"   상세 에러: {traceback.format_exc()}")
 
-
-def record_skill_history(
-    skill_name: str,
-    agent_id: str,
-    tenant_id: Optional[str],
-    operation: str,
-    previous_content: Optional[Dict[str, Any]] = None,
-    new_content: Optional[Dict[str, Any]] = None,
-    feedback_content: Optional[str] = None
-) -> None:
-    """
-    스킬 변경 이력 기록 (하위 호환성 유지용 래퍼 함수)
-    
-    Args:
-        skill_name: 스킬 이름
-        agent_id: 에이전트 ID
-        tenant_id: 테넌트 ID
-        operation: 작업 타입 ("CREATE" | "UPDATE" | "DELETE")
-        previous_content: 이전 내용 (UPDATE/DELETE 시)
-        new_content: 새 내용 (CREATE/UPDATE 시)
-        feedback_content: 원본 피드백 내용 (선택적)
-    """
-    record_knowledge_history(
-        knowledge_type="SKILL",
-        knowledge_id=skill_name,
-        agent_id=agent_id,
-        tenant_id=tenant_id,
-        operation=operation,
-        previous_content=previous_content,
-        new_content=new_content,
-        feedback_content=feedback_content,
-        knowledge_name=skill_name
-    )
