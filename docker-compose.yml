@@ -1,0 +1,29 @@
+version: '3.8'
+
+services:
+  agent-feedback:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: process-gpt-agent-feedback
+    ports:
+      - "6789:6789"
+    environment:
+      - PORT=6789
+      - PYTHONUNBUFFERED=1
+      - PYTHONIOENCODING=utf-8
+    env_file:
+      - .env
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:6789/docs')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+

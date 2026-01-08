@@ -1,0 +1,28 @@
+[project]
+name = "process-gpt-agent-feedback"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.109.0",
+    "firebase-admin>=6.4.0",
+    "langchain>=0.3.0",
+    "langchain-community>=0.3.23",
+    "langchain-core>=0.3.0",
+    "langchain-mcp-adapters>=0.0.9",
+    "langchain-openai>=0.2.14",
+    "mem0ai>=0.1.94",
+    "process-gpt-llm-factory==1.0.2",
+    "psycopg2-binary>=2.9.9",
+    "pydantic>=2.6.0",
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.21.0",
+    "python-dotenv>=1.1.0",
+    "pytz>=2024.1",
+    "requests>=2.31.0",
+    "supabase>=2.0.0",
+    "unstructured>=0.17.2",
+    "uvicorn>=0.27.0",
+    "vecs>=0.1.0",
+]

@@ -1,7 +1,10 @@
+langchain>=0.3.0
+langchain-core>=0.3.0
 langchain-community>=0.3.23
 langchain-mcp-adapters>=0.0.9
 langchain-openai>=0.2.14
 python-dotenv>=1.1.0
+requests>=2.31.0
 supabase>=2.0.0
 unstructured>=0.17.2
 psycopg2-binary>=2.9.9
@@ -14,3 +17,4 @@ vecs>=0.1.0
 pytest>=8.0.0
 pytest-asyncio>=0.21.0
 mem0ai>=0.1.94
+process-gpt-llm-factory==1.0.2

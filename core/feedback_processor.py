@@ -1,10 +1,9 @@
 import json
 import os
 from typing import Dict, List
-from langchain_openai import ChatOpenAI
-from mem0 import Memory
 from utils.logger import log, handle_error
 from dotenv import load_dotenv
+from llm_factory import create_llm
 
 # ============================================================================
 # 설정 및 초기화
@@ -19,10 +18,6 @@ DB_HOST = os.getenv("DB_HOST")
 DB_PORT = os.getenv("DB_PORT")
 DB_NAME = os.getenv("DB_NAME")
 
-if not all([DB_USER, DB_PASSWORD, DB_HOST, DB_PORT, DB_NAME]):
-    raise ValueError("❌ DB 연결 환경 변수가 설정되지 않았습니다. .env 파일을 확인해주세요.")
-
-CONNECTION_STRING = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 
 # ============================================================================
 # 유틸리티 함수
@@ -41,11 +36,7 @@ def clean_json_response(content: str) -> str:
 async def match_feedback_to_agents(feedback: str, agents: List[Dict], task_description: str = "") -> Dict:
     """AI를 사용해 피드백을 각 에이전트에 매칭"""
     
-    llm = ChatOpenAI(
-        model="gpt-4o-mini",
-        temperature=0.1,
-        api_key=os.getenv("OPENAI_API_KEY")
-    )
+    llm = create_llm(model="gpt-4o", streaming=False, temperature=0)
     
     agents_info = "\n".join([
         f"- 에이전트 ID: {agent['id']}, 이름: {agent['name']}, 역할: {agent['role']}, 목표: {agent['goal']}"
@@ -102,8 +93,11 @@ async def match_feedback_to_agents(feedback: str, agents: List[Dict], task_descr
   "agent_feedbacks": [
     {{
       "agent_id": "에이전트_ID",
-      "agent_name": "에이전트_이름", 
-      "specific_feedback": "시간순 피드백들을 통합한 자연스러운 학습 가이드"
+      "agent_name": "에이전트_이름",
+      "learning_candidate": {{
+        "content": "시간순 피드백들을 통합한 자연스러운 학습 가이드",
+        "intent_hint": "이 피드백이 판단 기준(조건-결과)인지 / 절차(작업 순서)인지 / 지침(선호/주의)인지에 대한 요약 힌트"
+      }}
     }}
   ]
 }}
@@ -121,8 +115,10 @@ async def match_feedback_to_agents(feedback: str, agents: List[Dict], task_descr
         parsed_result = json.loads(cleaned_content)
         if parsed_result.get("agent_feedbacks"):
             for feedback in parsed_result["agent_feedbacks"]:
-                log(f"📝 에이전트 '{feedback.get('agent_name', 'Unknown')}' 피드백:")
-                log(f"   {feedback.get('specific_feedback', 'No feedback')}")
+                learning_candidate = feedback.get('learning_candidate', {})
+                log(f"📝 에이전트 '{feedback.get('agent_name', 'Unknown')}' 학습 후보:")
+                log(f"   내용: {learning_candidate.get('content', 'No content')}")
+                log(f"   의도 힌트: {learning_candidate.get('intent_hint', 'No hint')}")
         
         return parsed_result
     except json.JSONDecodeError as e:
@@ -132,47 +128,4 @@ async def match_feedback_to_agents(feedback: str, agents: List[Dict], task_descr
     except Exception as e:
         handle_error("피드백매칭", e)
         return {"agent_feedbacks": []}
-
-# ============================================================================
-# Mem0 학습
-# ============================================================================
-
-async def save_to_mem0(agent_feedbacks: List[Dict]):
-    """에이전트별 피드백을 Mem0에 저장 - Supabase 연결"""
-    try:
-        # Supabase 기반 Memory 인스턴스 초기화
-        config = {
-            "vector_store": {
-                "provider": "supabase",
-                "config": {
-                    "connection_string": CONNECTION_STRING,
-                    "collection_name": "memories",
-                    "index_method": "hnsw",
-                    "index_measure": "cosine_distance"
-                }
-            }
-        }
-        memory = Memory.from_config(config_dict=config)
-        
-        for feedback_data in agent_feedbacks:
-            agent_id = feedback_data['agent_id']
-            agent_name = feedback_data['agent_name']
-            specific_feedback = feedback_data['specific_feedback']
-            
-            # 에이전트별로 학습 데이터 저장 - "피드백: 내용" 형식
-            memory.add(
-                messages=[{
-                    "role": "user",
-                    "content": f"{specific_feedback}"
-                }],
-                user_id=agent_id,
-                metadata={
-                    "data_type": "feedback"
-                }
-            )
-            
-            log(f"Mem0 학습 완료 (Supabase): 에이전트 {agent_name} (ID: {agent_id})")
-            
-    except Exception as e:
-        handle_error("Mem0학습", e)
 

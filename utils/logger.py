@@ -3,13 +3,32 @@
 # ============================================================================
 
 import traceback
+import sys
+
+
+def _safe_print(prefix: str, message: str) -> None:
+    """
+    Windows 콘솔(cp949 등) 환경에서도 깨지지 않도록 안전하게 출력.
+    - 이모지 등 인코딩이 안 되는 문자는 제거/대체합니다.
+    """
+    text = f"{prefix} {message}" if prefix else message
+    try:
+        print(text, flush=True)
+    except UnicodeEncodeError:
+        # 인코딩 불가 문자를 대체 문자로 바꿔서 다시 출력
+        safe_text = text.encode(sys.stdout.encoding or "utf-8", errors="replace").decode(
+            sys.stdout.encoding or "utf-8", errors="replace"
+        )
+        print(safe_text, flush=True)
+
 
 def log(message: str) -> None:
     """일반 로그"""
-    print(f"📝 {message}", flush=True)
+    _safe_print("LOG:", message)
+
 
 def handle_error(operation: str, error: Exception) -> None:
     """에러 처리"""
-    print(f"❌ [{operation}] 오류: {str(error)}", flush=True)
-    print(f"❌ 상세: {traceback.format_exc()}", flush=True)
+    _safe_print("ERROR:", f"[{operation}] 오류: {str(error)}")
+    _safe_print("ERROR:", f"상세: {traceback.format_exc()}")
     raise Exception(f"{operation} 실패: {error}")

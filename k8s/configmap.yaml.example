@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: agent-feedback-config
+  labels:
+    app: process-gpt-agent-feedback
+data:
+  # 배치 중복 제거 설정
+  batch-dedup-enabled: "true"
+  batch-dedup-interval-seconds: "3600"  # 1시간
+  batch-dedup-dry-run: "false"
+  
+  # 기타 설정 (필요시 추가)
+  # port: "8000"
+

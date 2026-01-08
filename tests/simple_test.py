@@ -38,7 +38,7 @@ async def test_single_todo():
         print(f"📋 작업지시사항: {row.get('description', 'N/A')}")
         print(f"💬 피드백: {row.get('feedback', 'N/A')}")
         print(f"👥 에이전트: {row.get('user_id', 'N/A')}")
-        print(f"📊 상태: {row.get('draft_status', 'N/A')}")
+        print(f"📊 상태: {row.get('feedback_status', 'N/A')}")
         print("-" * 50)
         
     except Exception as e:
