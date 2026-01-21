@@ -101,7 +101,7 @@ async def commit_to_memory(agent_id: str, content: str, source_type: str = "feed
                 memory.delete(memory_id, agent_id=agent_id)
                 log(f"🗑️ MEMORY 삭제 완료 (fallback): 에이전트 {agent_id}, memory_id={memory_id}")
             
-            # 변경 이력 기록
+            # 변경 이력 기록 (실패 시 전체 작업 실패: "변경 이력에 저장 안되면 무조건 실패")
             try:
                 agent_info = _get_agent_by_id(agent_id)
                 tenant_id = agent_info.get("tenant_id") if agent_info else None
@@ -123,7 +123,8 @@ async def commit_to_memory(agent_id: str, content: str, source_type: str = "feed
                     batch_job_id=batch_job_id
                 )
             except Exception as e:
-                log(f"   ⚠️ MEMORY 변경 이력 기록 실패 (무시하고 계속 진행): {e}")
+                log(f"   ❌ MEMORY 변경 이력 기록 실패: {e}")
+                raise
             
             return
         
@@ -157,7 +158,7 @@ async def commit_to_memory(agent_id: str, content: str, source_type: str = "feed
             memory.update(memory_id, content, agent_id=agent_id, metadata=metadata)
             log(f"✏️ MEMORY 수정 완료: 에이전트 {agent_id}, memory_id={memory_id}, 타입={source_type}")
             
-            # 변경 이력 기록
+            # 변경 이력 기록 (실패 시 전체 작업 실패)
             try:
                 agent_info = _get_agent_by_id(agent_id)
                 tenant_id = agent_info.get("tenant_id") if agent_info else None
@@ -178,7 +179,8 @@ async def commit_to_memory(agent_id: str, content: str, source_type: str = "feed
                     feedback_content=None
                 )
             except Exception as e:
-                log(f"   ⚠️ MEMORY 변경 이력 기록 실패 (무시하고 계속 진행): {e}")
+                log(f"   ❌ MEMORY 변경 이력 기록 실패: {e}")
+                raise
             
             return
         
@@ -226,7 +228,8 @@ async def commit_to_memory(agent_id: str, content: str, source_type: str = "feed
                         feedback_content=None
                     )
                 except Exception as e:
-                    log(f"   ⚠️ MEMORY 변경 이력 기록 실패 (무시하고 계속 진행): {e}")
+                    log(f"   ❌ MEMORY 변경 이력 기록 실패: {e}")
+                    raise
         
     except Exception as e:
         handle_error(f"MEMORY{operation}", e)

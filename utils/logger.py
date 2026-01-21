@@ -27,8 +27,15 @@ def log(message: str) -> None:
     _safe_print("LOG:", message)
 
 
-def handle_error(operation: str, error: Exception) -> None:
-    """에러 처리"""
+def handle_error(operation: str, error: Exception, raise_exception: bool = False) -> None:
+    """에러 처리
+    
+    Args:
+        operation: 작업 이름
+        error: 발생한 예외
+        raise_exception: True이면 예외를 다시 발생시킴 (기본값: False)
+    """
     _safe_print("ERROR:", f"[{operation}] 오류: {str(error)}")
     _safe_print("ERROR:", f"상세: {traceback.format_exc()}")
-    raise Exception(f"{operation} 실패: {error}")
+    if raise_exception:
+        raise Exception(f"{operation} 실패: {error}")

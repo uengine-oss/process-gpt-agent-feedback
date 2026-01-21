@@ -122,6 +122,8 @@ load_dotenv()
 
 MCP_SERVER_URL = os.getenv("MCP_SERVER_URL", "http://localhost:8765/mcp")
 MCP_SERVER_NAME = os.getenv("MCP_SERVER_NAME", "claude-skills")
+COMPUTER_USE_MCP_URL = os.getenv("COMPUTER_USE_MCP_URL", "").strip()
+USE_SKILL_CREATOR_WORKFLOW = os.getenv("USE_SKILL_CREATOR_WORKFLOW", "false").lower() in ("true", "1", "yes")
 
 _mcp_client: Optional[MultiServerMCPClient] = None
 _mcp_tools: Optional[List[Any]] = None
@@ -156,14 +158,22 @@ def get_mcp_client() -> Optional[MultiServerMCPClient]:
             elif MCP_SERVER_URL.endswith("/sse"):
                 transport = "sse"
             
-            _mcp_client = MultiServerMCPClient(
-                connections={
-                    MCP_SERVER_NAME: {
-                        "url": MCP_SERVER_URL,
-                        "transport": transport,
-                    }
+            connections = {
+                MCP_SERVER_NAME: {
+                    "url": MCP_SERVER_URL,
+                    "transport": transport,
                 }
-            )
+            }
+            if COMPUTER_USE_MCP_URL:
+                cu_transport = "http"
+                if COMPUTER_USE_MCP_URL.startswith("ws://") or COMPUTER_USE_MCP_URL.startswith("wss://"):
+                    cu_transport = "websocket"
+                elif COMPUTER_USE_MCP_URL.endswith("/sse"):
+                    cu_transport = "sse"
+                connections["computer-use"] = {"url": COMPUTER_USE_MCP_URL, "transport": cu_transport}
+                log(f"   computer-use MCP 추가: url={COMPUTER_USE_MCP_URL[:50]}...")
+            
+            _mcp_client = MultiServerMCPClient(connections=connections)
         except Exception as e:
             handle_error("MCP클라이언트초기화", e)
             return None
@@ -229,9 +239,20 @@ def get_mcp_tools(force_reload: bool = False) -> List[Any]:
 
 def get_mcp_tool_by_name(name: str) -> Optional[Any]:
     """
-    이름으로 MCP 도구 검색
+    이름으로 MCP 도구 검색 (동기)
     """
     tools = get_mcp_tools()
+    for tool in tools:
+        if getattr(tool, "name", None) == name:
+            return tool
+    return None
+
+
+async def get_mcp_tool_by_name_async(name: str, force_reload: bool = False) -> Optional[Any]:
+    """
+    이름으로 MCP 도구 검색 (비동기). skill_creator_committer 등에서 ainvoke 시 사용.
+    """
+    tools = await get_mcp_tools_async(force_reload=force_reload)
     for tool in tools:
         if getattr(tool, "name", None) == name:
             return tool

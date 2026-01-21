@@ -36,18 +36,25 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from core.polling_manager import start_feedback_polling, initialize_connections
-from core.batch_scheduler import start_batch_deduplication
-from core.batch_api import router as batch_router
 from utils.logger import log
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """애플리케이션 생명주기 관리"""
-    log("서버 시작 - 연결 초기화 및 폴링 시작")
+    log("서버 시작 - 연결 초기화 및 피드백 폴링 시작")
     initialize_connections()
-    asyncio.create_task(start_feedback_polling(interval=7))
-    # asyncio.create_task(start_batch_deduplication())  # 배치 스케줄러 시작
+    # 피드백 폴링 작업을 백그라운드 태스크로 시작
+    # start_feedback_polling 내부에서 모든 예외를 처리하므로 예외가 발생해도 계속 실행됨
+    polling_task = asyncio.create_task(start_feedback_polling(interval=7))
     yield
+    # 서버 종료 시 폴링 작업 취소
+    polling_task.cancel()
+    try:
+        await polling_task
+    except asyncio.CancelledError:
+        pass
+    except Exception as e:
+        log(f"⚠️ 폴링 작업 종료 중 에러 (무시): {str(e)[:200]}...")
     log("서버 종료")
 
 # FastAPI 앱 생성
@@ -67,17 +74,23 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 라우터 등록
-app.include_router(batch_router)
-
 # ============================================================================
 # 서버 실행
 # ============================================================================
+def _is_debug() -> bool:
+    v = os.environ.get("DEBUG", "").lower()
+    return v in ("1", "true", "yes", "on")
+
 if __name__ == "__main__":
     import uvicorn
+    debug = _is_debug()
+    if debug:
+        log("디버그 모드: reload=True, log_level=debug")
     uvicorn.run(
-        app, 
-        host="0.0.0.0", 
-        port=int(os.environ.get("PORT", 8000)),
-        ws="none"
+        "main:app" if debug else app,
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", 6789)),
+        ws="none",
+        reload=debug,
+        log_level="debug" if debug else "info",
     ) 

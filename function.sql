@@ -19,12 +19,12 @@ BEGIN
     WITH cte AS (
       SELECT *
         FROM todolist
-       WHERE feedback_status IS NULL 
-         AND feedback IS NOT NULL 
+       WHERE feedback IS NOT NULL 
          AND feedback != '[]'::jsonb 
          AND feedback != '{}'::jsonb
          AND proc_def_id IS NOT NULL
          AND proc_def_id != ''
+         AND (feedback_status IS NULL OR feedback_status = 'REQUESTED')
        ORDER BY updated_at DESC
        LIMIT p_limit
        FOR UPDATE SKIP LOCKED
@@ -126,86 +126,79 @@ GRANT SELECT, INSERT ON public.agent_knowledge_history TO anon;
 
 
 -- ============================================================================
--- 4. 배치 작업 이력 테이블
--- 중복 제거 등 배치 작업의 실행 이력과 통계 저장
+-- 4. 에이전트 지식 레지스트리 테이블
+-- 에이전트가 가진 모든 지식(MEMORY, DMN_RULE, SKILL)의 메타데이터를 중앙에서 관리
+-- 지식의 존재 여부를 빠르게 확인하고 조회할 수 있도록 지원
 -- ============================================================================
 
-CREATE TABLE IF NOT EXISTS public.batch_job_history (
+CREATE TABLE IF NOT EXISTS public.agent_knowledge_registry (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    job_id TEXT NOT NULL UNIQUE,
-    agent_id UUID,
-    tenant_id TEXT,
-    started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    completed_at TIMESTAMPTZ,
-    status TEXT NOT NULL CHECK (status IN ('RUNNING', 'COMPLETED', 'FAILED', 'ROLLED_BACK')),
-    dry_run BOOLEAN NOT NULL DEFAULT false,
     
-    -- 통계
-    total_agents INTEGER DEFAULT 0,
-    processed_agents INTEGER DEFAULT 0,
-    total_deleted INTEGER DEFAULT 0,
-    total_moved INTEGER DEFAULT 0,
-    total_kept INTEGER DEFAULT 0,
-    total_errors INTEGER DEFAULT 0,
-    
-    -- 결과 요약
-    summary JSONB,
-    
-    -- 에러 정보
-    error_message TEXT,
-    error_details JSONB,
-    
-    CONSTRAINT batch_job_history_agent_id_fkey FOREIGN KEY (agent_id, tenant_id) 
-        REFERENCES public.users (id, tenant_id) ON UPDATE CASCADE ON DELETE SET NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_batch_job_history_job_id ON public.batch_job_history(job_id);
-CREATE INDEX IF NOT EXISTS idx_batch_job_history_agent_id ON public.batch_job_history(agent_id);
-CREATE INDEX IF NOT EXISTS idx_batch_job_history_tenant_id ON public.batch_job_history(tenant_id);
-CREATE INDEX IF NOT EXISTS idx_batch_job_history_started_at ON public.batch_job_history(started_at DESC);
-CREATE INDEX IF NOT EXISTS idx_batch_job_history_status ON public.batch_job_history(status);
-
-GRANT SELECT, INSERT, UPDATE ON public.batch_job_history TO anon;
-
-
--- ============================================================================
--- 5. 배치 작업 백업 테이블 (롤백용)
--- 배치 작업으로 삭제/이동된 항목의 백업 저장
--- ============================================================================
-
-CREATE TABLE IF NOT EXISTS public.batch_job_backup (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    job_id TEXT NOT NULL,
+    -- 에이전트 정보
     agent_id UUID NOT NULL,
-    tenant_id TEXT NOT NULL,
+    tenant_id TEXT,
     
-    -- 백업 항목 정보
-    storage_type TEXT NOT NULL CHECK (storage_type IN ('MEMORY', 'DMN_RULE', 'SKILL')),
-    item_id TEXT NOT NULL,
-    operation TEXT NOT NULL CHECK (operation IN ('DELETE', 'MOVE')),
+    -- 지식 정보
+    knowledge_type TEXT NOT NULL CHECK (knowledge_type IN ('MEMORY', 'DMN_RULE', 'SKILL')),
+    knowledge_id TEXT NOT NULL,
+    knowledge_name TEXT,
     
-    -- 백업 내용
-    original_content JSONB NOT NULL,
-    
-    -- 이동 정보 (MOVE인 경우)
-    moved_to_storage TEXT,
-    moved_to_id TEXT,
+    -- 지식 메타데이터
+    content_summary TEXT,  -- 지식 내용 요약
+    content_hash TEXT,  -- 지식 내용의 해시 (변경 감지용)
     
     -- 메타데이터
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_accessed_at TIMESTAMPTZ,  -- 마지막 접근 시간
     
-    CONSTRAINT batch_job_backup_job_id_fkey FOREIGN KEY (job_id) 
-        REFERENCES public.batch_job_history(job_id) ON UPDATE CASCADE ON DELETE CASCADE,
-    CONSTRAINT batch_job_backup_agent_id_fkey FOREIGN KEY (agent_id, tenant_id) 
-        REFERENCES public.users (id, tenant_id) ON UPDATE CASCADE ON DELETE CASCADE
+    -- 제약 조건
+    CONSTRAINT agent_knowledge_registry_agent_id_fkey FOREIGN KEY (agent_id, tenant_id) 
+        REFERENCES public.users (id, tenant_id) ON UPDATE CASCADE ON DELETE CASCADE,
+    
+    -- 동일 에이전트의 동일 지식은 하나만 유지
+    CONSTRAINT agent_knowledge_registry_unique UNIQUE (agent_id, knowledge_type, knowledge_id)
 );
 
-CREATE INDEX IF NOT EXISTS idx_batch_job_backup_job_id ON public.batch_job_backup(job_id);
-CREATE INDEX IF NOT EXISTS idx_batch_job_backup_agent_id ON public.batch_job_backup(agent_id);
-CREATE INDEX IF NOT EXISTS idx_batch_job_backup_tenant_id ON public.batch_job_backup(tenant_id);
-CREATE INDEX IF NOT EXISTS idx_batch_job_backup_storage_type ON public.batch_job_backup(storage_type);
+-- 인덱스 생성 (빠른 조회를 위해)
+CREATE INDEX IF NOT EXISTS idx_agent_knowledge_registry_agent_id ON public.agent_knowledge_registry(agent_id);
+CREATE INDEX IF NOT EXISTS idx_agent_knowledge_registry_tenant_id ON public.agent_knowledge_registry(tenant_id);
+CREATE INDEX IF NOT EXISTS idx_agent_knowledge_registry_knowledge_type ON public.agent_knowledge_registry(knowledge_type);
+CREATE INDEX IF NOT EXISTS idx_agent_knowledge_registry_knowledge_id ON public.agent_knowledge_registry(knowledge_id);
+CREATE INDEX IF NOT EXISTS idx_agent_knowledge_registry_knowledge_name ON public.agent_knowledge_registry(knowledge_name);
+CREATE INDEX IF NOT EXISTS idx_agent_knowledge_registry_content_hash ON public.agent_knowledge_registry(content_hash);
+CREATE INDEX IF NOT EXISTS idx_agent_knowledge_registry_created_at ON public.agent_knowledge_registry(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_agent_knowledge_registry_updated_at ON public.agent_knowledge_registry(updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_agent_knowledge_registry_last_accessed_at ON public.agent_knowledge_registry(last_accessed_at DESC);
 
-GRANT SELECT, INSERT, DELETE ON public.batch_job_backup TO anon;
+-- 복합 인덱스 (가장 자주 사용되는 쿼리 패턴)
+CREATE INDEX IF NOT EXISTS idx_agent_knowledge_registry_lookup ON public.agent_knowledge_registry(
+    agent_id, knowledge_type
+);
+CREATE INDEX IF NOT EXISTS idx_agent_knowledge_registry_search ON public.agent_knowledge_registry(
+    agent_id, knowledge_type, knowledge_name
+);
+
+GRANT SELECT, INSERT, UPDATE, DELETE ON public.agent_knowledge_registry TO anon;
+
+-- updated_at 자동 업데이트 트리거 함수
+CREATE OR REPLACE FUNCTION update_agent_knowledge_registry_updated_at()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at = NOW();
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+-- 트리거 생성
+DROP TRIGGER IF EXISTS trigger_update_agent_knowledge_registry_updated_at ON public.agent_knowledge_registry;
+CREATE TRIGGER trigger_update_agent_knowledge_registry_updated_at
+    BEFORE UPDATE ON public.agent_knowledge_registry
+    FOR EACH ROW
+    EXECUTE FUNCTION update_agent_knowledge_registry_updated_at();
+
+
+
 
 
 -- ============================================================================

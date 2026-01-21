@@ -295,6 +295,24 @@ async def retrieve_existing_skills(agent_id: str, search_text: str = "", top_k: 
         except Exception as e:
             log(f"   ⚠️ 업로드된 스킬 목록 조회 실패: {e}")
         
+        # agent_skills에 있는 스킬들도 HTTP API로 확인하여 업로드된 스킬인지 검증
+        # (list_uploaded_skills가 실패하거나 빈 결과를 반환해도 agent_skills에 있는 스킬은 확인 필요)
+        if agent_skills:
+            allowed_skill_names = [s.strip() for s in agent_skills.split(",") if s.strip()]
+            for skill_name in allowed_skill_names:
+                if skill_name not in uploaded_skills_set:
+                    # HTTP API로 실제 존재 여부 확인
+                    try:
+                        skill_info = check_skill_exists_with_info(skill_name)
+                        if skill_info and skill_info.get("exists"):
+                            uploaded_skills_set.add(skill_name)
+                            log(f"   ✅ agent_skills에서 업로드된 스킬 확인: {skill_name}")
+                    except Exception as e:
+                        log(f"   ⚠️ agent_skills 스킬 확인 실패 ({skill_name}): {e}")
+        
+        if uploaded_skills_set:
+            log(f"   📋 최종 업로드된 스킬 목록: {len(uploaded_skills_set)}개 ({', '.join(list(uploaded_skills_set)[:5])}{'...' if len(uploaded_skills_set) > 5 else ''})")
+        
         # only_uploaded_skills가 True면 업로드된 스킬만 조회 (배치 작업용)
         if only_uploaded_skills:
             log(f"   🔍 배치 작업 모드: 업로드된 스킬만 조회 (기본 내장 스킬 제외)")
@@ -399,53 +417,8 @@ async def retrieve_existing_skills(agent_id: str, search_text: str = "", top_k: 
                 except Exception as e:
                     log(f"   ⚠️ HTTP API 스킬 확인 실패: {e}")
             else:
-                # 기본 내장 스킬인 경우 MCP read_skill_document 사용
-                try:
-                    tools = await get_mcp_tools_async()
-                    read_skill_tool = None
-                    for tool in tools:
-                        if getattr(tool, "name", None) == "read_skill_document":
-                            read_skill_tool = tool
-                            break
-                    
-                    if read_skill_tool:
-                        log(f"   🔍 MCP read_skill_document로 기본 내장 스킬 조회: '{skill_name_candidate}'")
-                        # 타임아웃 추가 (10초)
-                        doc_result = None
-                        try:
-                            doc_result = await asyncio.wait_for(
-                                read_skill_tool.ainvoke({"skill_name": skill_name_candidate}),
-                                timeout=10.0
-                            )
-                        except asyncio.TimeoutError:
-                            log(f"   ⚠️ MCP read_skill_document 타임아웃 ({skill_name_candidate}), 건너뜀")
-                        except Exception as e:
-                            log(f"   ⚠️ MCP read_skill_document 실패 ({skill_name_candidate}): {e}")
-                        
-                        # MCP 결과 처리 (doc_result가 None이 아닌 경우만)
-                        if doc_result is not None:
-                            skill_content = ""
-                            if isinstance(doc_result, str):
-                                skill_content = doc_result
-                            elif isinstance(doc_result, list):
-                                skill_content = "\n".join([str(item) for item in doc_result])
-                            elif isinstance(doc_result, dict):
-                                skill_content = doc_result.get("content", doc_result.get("text", ""))
-                            
-                            if skill_content:
-                                skill_dict = {
-                                    "id": skill_name_candidate,
-                                    "name": skill_name_candidate,
-                                    "skill_name": skill_name_candidate,
-                                    "content": skill_content,
-                                    "verified": True,  # MCP를 통해 확인됨
-                                    "is_builtin": True,  # 기본 내장 스킬 표시
-                                }
-                                results.append(skill_dict)
-                                skill_names_found.add(skill_name_candidate)
-                                log(f"   ✅ MCP를 통해 기본 내장 스킬 확인: {skill_name_candidate}")
-                except Exception as e:
-                    log(f"   ⚠️ MCP read_skill_document 실패 ({skill_name_candidate}): {e}")
+                # 기본 내장 스킬은 피드백 처리 대상이 아니므로 조회/로딩을 스킵
+                log(f"   ℹ️ 기본 내장 스킬은 조회 대상이 아님, 건너뜀: {skill_name_candidate}")
 
         # 2. MCP 도구를 통한 벡터 유사도 검색 (작업 설명 기반 검색)
         try:
@@ -495,7 +468,7 @@ async def retrieve_existing_skills(agent_id: str, search_text: str = "", top_k: 
                 # MCP 결과 파싱 (타임아웃 시 빈 리스트)
                 mcp_skills = _parse_mcp_skill_result(mcp_result) if mcp_result is not None else []
                 
-                # MCP 결과를 처리: 업로드된 스킬은 HTTP API, 기본 내장 스킬은 MCP read_skill_document 사용
+                # MCP 결과를 처리: 업로드된 스킬만 사용 (기본 내장 스킬은 피드백 처리 대상이 아님)
                 # skip_detail_fetch가 True면 상세 조회 건너뛰기
                 if skip_detail_fetch:
                     # 배치 작업 등 빠른 조회: MCP 벡터 검색 결과만 사용 (상세 조회 안 함)
@@ -503,18 +476,19 @@ async def retrieve_existing_skills(agent_id: str, search_text: str = "", top_k: 
                         skill_name = mcp_skill.get("name") or mcp_skill.get("skill_name", "")
                         if not skill_name or skill_name in skill_names_found:
                             continue
-                        
+                        # 업로드된 스킬만 유지, 기본 내장 스킬은 건너뜀
+                        if skill_name not in uploaded_skills_set:
+                            log(f"   ℹ️ 기본 내장 스킬 (벡터 검색 결과) 건너뜀: {skill_name}")
+                            continue
+
                         mcp_skill["verified"] = False
-                        mcp_skill["is_builtin"] = skill_name not in uploaded_skills_set
+                        mcp_skill["is_builtin"] = False
                         results.append(mcp_skill)
                         skill_names_found.add(skill_name)
                 else:
-                    # 일반 조회: 상세 내용도 조회
+                    # 일반 조회: 업로드된 스킬에 대해서만 상세 내용 조회
                     read_skill_tool = None
-                    for tool in tools:
-                        if getattr(tool, "name", None) == "read_skill_document":
-                            read_skill_tool = tool
-                            break
+                    # 기본 내장 스킬은 아예 사용하지 않으므로 read_skill_document 도구는 사용하지 않음
                     
                     for mcp_skill in mcp_skills:
                         skill_name = mcp_skill.get("name") or mcp_skill.get("skill_name", "")
@@ -522,7 +496,22 @@ async def retrieve_existing_skills(agent_id: str, search_text: str = "", top_k: 
                             continue
                         
                         # 업로드된 스킬인 경우 HTTP API 사용
-                        if skill_name in uploaded_skills_set:
+                        # agent_skills에 있는 스킬도 업로드된 스킬로 간주 (HTTP API로 확인)
+                        is_uploaded_skill = skill_name in uploaded_skills_set
+                        if not is_uploaded_skill and agent_skills:
+                            # agent_skills에 있으면 HTTP API로 확인
+                            allowed_skill_names = [s.strip() for s in agent_skills.split(",") if s.strip()]
+                            if skill_name in allowed_skill_names:
+                                try:
+                                    skill_info = check_skill_exists_with_info(skill_name)
+                                    if skill_info and skill_info.get("exists"):
+                                        is_uploaded_skill = True
+                                        uploaded_skills_set.add(skill_name)  # 캐시에 추가
+                                        log(f"   ✅ agent_skills에서 업로드된 스킬 확인 (벡터 검색 결과): {skill_name}")
+                                except Exception as e:
+                                    log(f"   ⚠️ agent_skills 스킬 확인 실패 ({skill_name}): {e}")
+                        
+                        if is_uploaded_skill:
                             try:
                                 skill_info = check_skill_exists_with_info(skill_name)
                                 if skill_info and skill_info.get("exists"):
@@ -570,63 +559,15 @@ async def retrieve_existing_skills(agent_id: str, search_text: str = "", top_k: 
                                 results.append(mcp_skill)
                                 skill_names_found.add(skill_name)
                         else:
-                            # 기본 내장 스킬인 경우 MCP read_skill_document 사용
-                            if read_skill_tool:
-                                try:
-                                    log(f"   🔍 기본 내장 스킬 조회 (MCP read_skill_document): {skill_name}")
-                                    # 타임아웃 추가 (10초)
-                                    doc_result = await asyncio.wait_for(
-                                        read_skill_tool.ainvoke({"skill_name": skill_name}),
-                                        timeout=10.0
-                                    )
-                                    
-                                    # MCP 결과 처리
-                                    skill_content = ""
-                                    if isinstance(doc_result, str):
-                                        skill_content = doc_result
-                                    elif isinstance(doc_result, list):
-                                        skill_content = "\n".join([str(item) for item in doc_result])
-                                    elif isinstance(doc_result, dict):
-                                        skill_content = doc_result.get("content", doc_result.get("text", ""))
-                                    
-                                    combined_skill = {
-                                        **mcp_skill,
-                                        "id": skill_name,
-                                        "name": skill_name,
-                                        "skill_name": skill_name,
-                                        "content": skill_content if skill_content else mcp_skill.get("content", ""),
-                                        "verified": True,
-                                        "is_builtin": True,
-                                    }
-                                    
-                                    results.append(combined_skill)
-                                    skill_names_found.add(skill_name)
-                                    log(f"   ✅ 기본 내장 스킬 (MCP read_skill_document): {skill_name}")
-                                except asyncio.TimeoutError:
-                                    log(f"   ⚠️ 기본 내장 스킬 MCP 조회 타임아웃 ({skill_name}), 건너뜀")
-                                    # 타임아웃 시 해당 스킬은 건너뛰고 다음으로 진행
-                                    continue
-                                except Exception as e:
-                                    log(f"   ⚠️ 기본 내장 스킬 MCP 조회 실패 ({skill_name}): {e}")
-                                    # 실패 시 MCP 벡터 검색 결과만 사용
-                                    mcp_skill["verified"] = False
-                                    mcp_skill["is_builtin"] = True
-                                    results.append(mcp_skill)
-                                    skill_names_found.add(skill_name)
-                            else:
-                                # read_skill_document 도구가 없으면 MCP 벡터 검색 결과만 사용
-                                log(f"   ⚠️ read_skill_document 도구 없음, MCP 벡터 검색 결과만 사용: {skill_name}")
-                                mcp_skill["verified"] = False
-                                mcp_skill["is_builtin"] = True
-                                results.append(mcp_skill)
-                                skill_names_found.add(skill_name)
+                            # 기본 내장 스킬은 피드백 처리 및 에이전트 스킬 후보에서 제외
+                            log(f"   ℹ️ 기본 내장 스킬 (벡터 검색 결과) 건너뜀: {skill_name}")
             else:
                 tool_names = [t.name for t in tools if hasattr(t, "name")]
                 log(f"   ⚠️ find_helpful_skills 도구를 찾을 수 없습니다. 사용 가능한 도구: {tool_names}")
         except Exception as e:
             log(f"   ⚠️ MCP 도구를 통한 스킬 검색 실패: {e}")
 
-        # 3. agent_skills에 명시된 스킬들도 확인 (업로드된 스킬은 HTTP API, 기본 내장 스킬은 MCP 사용)
+        # 3. agent_skills에 명시된 스킬들도 확인 (업로드된 스킬만 사용, 기본 내장 스킬은 무시)
         # skip_detail_fetch가 True면 상세 내용 조회 건너뛰고 이름만 추가
         if agent_skills:
             allowed_skill_names = [s.strip() for s in agent_skills.split(",") if s.strip()]
@@ -637,29 +578,24 @@ async def retrieve_existing_skills(agent_id: str, search_text: str = "", top_k: 
                     if skill_name in skill_names_found:
                         continue
                     
+                    # 기본 내장 스킬은 레지스트리/피드백 처리 대상이 아니므로 건너뜀
+                    if skill_name not in uploaded_skills_set:
+                        log(f"   ℹ️ agent_skills 기본 내장 스킬 무시 (상세 조회 스킵): {skill_name}")
+                        continue
+
                     skill_dict = {
                         "id": skill_name,
                         "name": skill_name,
                         "skill_name": skill_name,
                         "content": "",  # 상세 내용 없음
                         "verified": False,  # 상세 조회 안 했으므로 False
-                        "is_builtin": skill_name not in uploaded_skills_set,
+                        "is_builtin": False,
                     }
                     results.append(skill_dict)
                     skill_names_found.add(skill_name)
                     log(f"   ✅ agent_skills에서 스킬 추가 (상세 조회 건너뜀): {skill_name}")
             else:
-                # 일반 조회: 상세 내용도 조회
-                read_skill_tool = None
-                try:
-                    tools = await get_mcp_tools_async()
-                    for tool in tools:
-                        if getattr(tool, "name", None) == "read_skill_document":
-                            read_skill_tool = tool
-                            break
-                except Exception:
-                    pass
-                
+                # 일반 조회: 업로드된 스킬에 대해서만 상세 내용 조회
                 for skill_name in allowed_skill_names:
                     if skill_name in skill_names_found:
                         continue
@@ -692,39 +628,9 @@ async def retrieve_existing_skills(agent_id: str, search_text: str = "", top_k: 
                                     log(f"   ⚠️ 업로드된 스킬 파일 조회 실패 ({skill_name}): {e}")
                         except Exception as e:
                             log(f"   ⚠️ agent_skills 업로드된 스킬 확인 실패 ({skill_name}): {e}")
-                    elif read_skill_tool:
-                        # 기본 내장 스킬인 경우 MCP read_skill_document 사용
-                        try:
-                            # 타임아웃 추가 (10초)
-                            doc_result = await asyncio.wait_for(
-                                read_skill_tool.ainvoke({"skill_name": skill_name}),
-                                timeout=10.0
-                            )
-                            
-                            skill_content = ""
-                            if isinstance(doc_result, str):
-                                skill_content = doc_result
-                            elif isinstance(doc_result, list):
-                                skill_content = "\n".join([str(item) for item in doc_result])
-                            elif isinstance(doc_result, dict):
-                                skill_content = doc_result.get("content", doc_result.get("text", ""))
-                            
-                            if skill_content:
-                                skill_dict = {
-                                    "id": skill_name,
-                                    "name": skill_name,
-                                    "skill_name": skill_name,
-                                    "content": skill_content,
-                                    "verified": True,
-                                    "is_builtin": True,
-                                }
-                                results.append(skill_dict)
-                                skill_names_found.add(skill_name)
-                                log(f"   ✅ agent_skills에서 기본 내장 스킬 확인: {skill_name}")
-                        except asyncio.TimeoutError:
-                            log(f"   ⚠️ agent_skills 기본 내장 스킬 조회 타임아웃 ({skill_name}), 건너뜀")
-                        except Exception as e:
-                            log(f"   ⚠️ agent_skills 기본 내장 스킬 확인 실패 ({skill_name}): {e}")
+                    else:
+                        # 기본 내장 스킬은 피드백 처리 대상이 아니므로 완전히 무시
+                        log(f"   ℹ️ agent_skills 기본 내장 스킬 무시: {skill_name}")
 
         # verified=True인 스킬을 우선 정렬
         results.sort(key=lambda x: (not x.get("verified", False), x.get("relevance_score", 0) or 0), reverse=True)

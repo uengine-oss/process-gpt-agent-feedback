@@ -12,19 +12,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libpq-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Install uv
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
-
 # Set working directory
 WORKDIR /app
 
 # Copy dependency files
-COPY pyproject.toml uv.lock* requirements.txt ./
+COPY requirements.txt ./
 
-# Install dependencies
-RUN uv venv /app/.venv && \
-    . /app/.venv/bin/activate && \
-    uv pip install -r requirements.txt
+# Create virtual environment and install dependencies using pip
+RUN python -m venv /app/.venv && \
+    /app/.venv/bin/pip install --no-cache-dir --upgrade pip && \
+    /app/.venv/bin/pip install --no-cache-dir -r requirements.txt
 
 # ============================================================================
 # Runtime Stage

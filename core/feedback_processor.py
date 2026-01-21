@@ -1,9 +1,9 @@
 import json
 import os
-from typing import Dict, List
+from typing import Dict, List, Any, Optional
 from utils.logger import log, handle_error
 from dotenv import load_dotenv
-from llm_factory import create_llm
+from core.llm import create_llm
 
 # ============================================================================
 # 설정 및 초기화
@@ -33,8 +33,19 @@ def clean_json_response(content: str) -> str:
 # 피드백 매칭 프롬프트
 # ============================================================================
 
-async def match_feedback_to_agents(feedback: str, agents: List[Dict], task_description: str = "") -> Dict:
-    """AI를 사용해 피드백을 각 에이전트에 매칭"""
+async def match_feedback_to_agents(
+    feedback: str,
+    agents: List[Dict],
+    task_description: str = "",
+    events: Optional[List[Dict[str, Any]]] = None,
+) -> Dict:
+    """
+    AI를 사용해 피드백을 각 에이전트에 매칭
+
+    추가로, 해당 워크아이템(todo_id)의 이벤트 로그를 함께 전달하여
+    에이전트가 실제 어떤 스킬/지식을 언제 어떻게 사용했는지까지
+    맥락으로 고려할 수 있도록 한다.
+    """
     
     llm = create_llm(model="gpt-4o", streaming=False, temperature=0)
     
@@ -42,7 +53,31 @@ async def match_feedback_to_agents(feedback: str, agents: List[Dict], task_descr
         f"- 에이전트 ID: {agent['id']}, 이름: {agent['name']}, 역할: {agent['role']}, 목표: {agent['goal']}"
         for agent in agents
     ])
-    
+
+    # 이벤트 로그를 사람이 읽을 수 있는 요약 문자열로 변환
+    events_summary = "없음"
+    if events:
+        lines = []
+        for ev in events[:30]:  # LLM에 과도한 토큰이 가지 않도록 최대 30개까지만 전달
+            ev_type = ev.get("event_type", "")
+            status = ev.get("status", "")
+            crew_type = ev.get("crew_type", "")
+            ts = ev.get("timestamp", "")
+            # data에는 스킬 이름, 도구 호출 정보 등이 들어있을 수 있으므로 JSON 문자열로 축약
+            data_str = ""
+            try:
+                data = ev.get("data", {})
+                # 너무 길면 앞부분만 전달
+                data_str = json.dumps(data, ensure_ascii=False)
+                if len(data_str) > 300:
+                    data_str = data_str[:300] + "...(truncated)"
+            except Exception:
+                data_str = str(ev.get("data", ""))[:300]
+            lines.append(
+                f"- time={ts}, type={ev_type}, status={status}, crew_type={crew_type}, data={data_str}"
+            )
+        events_summary = "\n".join(lines)
+
     prompt = f"""
 다음 상황을 분석하여 각 에이전트에게 적절한 학습 피드백을 생성해주세요.
 
@@ -51,6 +86,9 @@ async def match_feedback_to_agents(feedback: str, agents: List[Dict], task_descr
 
 **사용자 피드백 (시간순):**
 {feedback}
+
+**해당 작업의 이벤트 로그 (시간순, 실제 스킬/도구 사용 내역):**
+{events_summary}
 
 **에이전트 목록:**
 {agents_info}

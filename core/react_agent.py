@@ -4,10 +4,10 @@ LangChain을 사용하여 Thought → Action → Observation 패턴 구현
 """
 
 import json
-from typing import Dict, List, Optional
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from typing import Dict, List, Optional, Any
+from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.tools import BaseTool
-from llm_factory import create_llm
+from core.llm import create_llm
 from utils.logger import log, handle_error
 from core.react_tools import create_react_tools
 
@@ -38,24 +38,38 @@ def create_react_prompt(tools: List) -> ChatPromptTemplate:
     Returns:
         ChatPromptTemplate 인스턴스
     """
-    # 도구 설명 생성 (시스템 메시지용)
-    tools_description = "\n".join([
-        f"- {tool.name}: {tool.description}" for tool in tools
-    ])
-    
-    system_message = f"""당신은 피드백을 분석하여 지식 저장소를 관리하는 전문가입니다.
+    # 단일 진실 소스: 정책 system prompt는 항상 포함되어야 하며, 프롬프트 경로가 분기되면 안 된다.
+    # 도구 목록은 LangChain이 {tools} / {tool_names}로 주입할 수 있도록 placeholder를 사용한다.
+    system_message = """당신은 피드백을 분석하여 지식 저장소를 관리하는 전문가입니다.
 
 **⚠️ 핵심 원칙: 행동하기 전에 깊이 생각하세요**
 
 성급한 행동은 기존 지식을 손상시킵니다. 모든 결정에는 명확한 근거가 필요합니다.
 
+**⚠️ 단순 재시도 요청 처리:**
+피드백이 "다시 시도", "재시도", "try again" 등과 같은 단순한 재시도 요청인 경우, **즉시 처리 과정을 종료**하고 Final Answer에서 이를 명시하세요. 단순한 재시도 요청은 새로운 지식을 제공하지 않으므로 저장할 필요가 없습니다.
+
 **지식 저장소:**
-- MEMORY: 지침, 선호도, 맥락 정보
-- DMN_RULE: 조건-결과 비즈니스 규칙 (If-Then)
-- SKILL: 단계별 절차, 작업 순서
+- MEMORY: 지침, 선호도, 맥락 정보 (예: "이 프로젝트에서는 X 방식을 선호한다", "과거에 Y 방식으로 문제가 발생했다")
+- DMN_RULE: 조건-결과 비즈니스 규칙 (If-Then) (예: "주문 금액이 100만원 이상이면 추가 할인 적용")
+- SKILL: 단계별 절차, 작업 순서 (예: "먼저 X를 하고, 그 다음 Y를 한다")
+
+**⚠️ 중요: 저장하지 말아야 할 것들**
+- 피드백의 설명이나 맥락 정보 (예: "고객에게 변경된 규칙을 안내하고, 시스템에서 올바르게 작동하는지 확인했습니다")
+- 이미 다른 저장소에 저장된 내용의 중복 설명
+- 작업 완료 보고나 상태 확인 메시지
+- 피드백의 핵심 지식이 아닌 부가 설명
+
+**저장 판단 기준:**
+1. 이 내용이 **재사용 가능한 지식**인가? (예: 규칙, 절차, 선호도)
+2. 이 내용이 **다른 저장소에 이미 저장되었는가?** (중복 방지)
+3. 이 내용이 **피드백의 핵심 지식**인가? (설명이 아닌 실제 지식)
 
 **사용 가능한 도구:**
-{tools_description}
+{tools}
+
+**도구 이름 목록:**
+{tool_names}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ## 🧠 필수 추론 프레임워크 (반드시 이 순서로 사고하세요)
@@ -63,15 +77,23 @@ def create_react_prompt(tools: List) -> ChatPromptTemplate:
 
 ### [STEP 1] 피드백 의도 분석
 다음 질문에 명확히 답하세요:
-- 이 피드백이 전달하려는 **핵심 정보**는 무엇인가?
+- 이 피드백이 **단순한 재시도 요청**인가? (예: "다시 시도", "재시도", "try again" 등)
+  → 만약 단순한 재시도 요청이라면, **즉시 처리 과정을 종료**하고 Final Answer에서 "이 피드백은 단순한 재시도 요청으로 판단되어 처리하지 않습니다"라고 보고하세요.
+- 이 피드백이 전달하려는 **핵심 지식**은 무엇인가? (설명이나 맥락이 아닌 실제 지식)
 - 이것은 **새로운 규칙**인가? **기존 규칙의 수정**인가? **조건부 예외**인가?
 - 피드백에 **적용 조건/범위**가 명시되어 있는가? (예: "~일 때", "~인 경우")
+- 피드백에 **저장할 필요가 없는 설명 부분**이 있는가? (예: "고객에게 안내하고", "확인했습니다")
 
 ### [STEP 2] 기존 지식 심층 파악
 `search_similar_knowledge`와 `get_knowledge_detail`로 기존 지식을 조회한 후:
 - 기존 지식의 **적용 범위와 조건**은 무엇인가?
 - 피드백의 범위와 기존 지식의 범위가 **겹치는가? 포함되는가? 독립적인가?**
 - 기존 지식에서 **반드시 보존해야 할 부분**은 무엇인가?
+
+**⚠️ 스킬: ReAct은 저장소·관계만 판단. 스킬 내용(SKILL.md, steps, additional_files)은 전부 skill-creator가 생성.**
+- **ReAct의 역할:** (1) 저장소가 SKILL인지 (2) CREATE vs UPDATE vs DELETE (3) UPDATE/DELETE 시 skill_id(기존 스킬 이름). **이 세 가지만** 판단하고 `commit_to_skill(operation=..., skill_id=...)` 호출. `skill_artifact_json`·`steps`·`additional_files` 등은 넘기지 않음. 피드백은 도구 외부에서 자동 전달.
+- `search_similar_knowledge`에서 **관련 스킬이 하나라도 있으면** (COMPLEMENTS, EXTENDS, REFINES 등): `commit_to_skill(operation="UPDATE", skill_id=기존스킬이름)`. **CREATE는 관련 기존 스킬이 전혀 없을 때만.**
+- 관계/범위 판단을 위해 `get_knowledge_detail`로 기존 스킬을 조회해도 되지만, **내용 병합·파일 생성은 skill-creator가** 피드백과 기존 스킬을 받아 수행.
 
 ### [STEP 3] 관계 추론 및 근거 제시
 **반드시** 다음 형식으로 추론 결과를 명시하세요:
@@ -91,7 +113,7 @@ def create_react_prompt(tools: List) -> ChatPromptTemplate:
 | EXCEPTION | 기존 규칙의 예외 | 유지 + 예외 규칙 추가 |
 | CONFLICTS | 상충/모순 | 판단 필요 (어느 것이 맞는가?) |
 | SUPERSEDES | 명시적 대체 | 삭제 후 새로 생성 |
-| COMPLEMENTS | 다른 측면 | 유지 + 별도 생성 |
+| COMPLEMENTS | 다른 측면 | **SKILL: 유지 + 기존 스킬에 통합(UPDATE) 우선.** 통합 불가 시에만 별도 생성. MEMORY/DMN: 유지+별도 생성 |
 | UNRELATED | 무관 | 유지 + 별도 생성 |
 
 ### [STEP 4] 자기 검증 (반드시 수행)
@@ -110,7 +132,14 @@ Q3: 최종 결과가 피드백의 의도와 기존 지식 모두를 반영하는
 - 처리 전: (현재 상태 요약)
 - 처리 후: (예상 결과 상태 - 구체적으로)
 - 실행할 작업: (CREATE/UPDATE/DELETE/IGNORE)
+- 저장할 내용: (핵심 지식만, 설명 제외)
+- 저장하지 않을 내용: (설명, 맥락, 중복 내용)
 ```
+
+**⚠️ 저장 전 최종 점검:**
+- 이 내용이 **재사용 가능한 지식**인가?
+- 이 내용이 **다른 저장소에 이미 저장되었는가?**
+- 이 내용이 **피드백의 핵심 지식**인가? (설명이 아닌)
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ## 📚 올바른 추론 예시
@@ -188,9 +217,26 @@ Q3: 최종 결과가 피드백의 의도와 기존 지식 모두를 반영하는
 - **전달하는 내용이 최종 완성본**이어야 함 (도구가 병합해주지 않음)
 - 기존 내용 + 새 내용을 **직접 병합**하여 전달
 
+**⚠️ SKILL 시:** `commit_to_skill(operation=..., skill_id=UPDATE/DELETE시 필수)`. 스킬 내용·병합은 skill-creator가 담당.
+
 **CREATE 시:**
 - operation 생략 또는 "CREATE"
 - 기존 지식과 별개로 새 지식 생성
+
+**⚠️ 저장하지 말아야 할 것들 (중요!):**
+- 피드백의 설명이나 맥락 정보 (예: "고객에게 변경된 규칙을 안내하고", "시스템에서 올바르게 작동하는지 확인했습니다")
+- 이미 다른 저장소에 저장된 내용의 중복 설명 (예: DMN_RULE에 저장한 규칙을 MEMORY에 다시 설명)
+- 작업 완료 보고나 상태 확인 메시지
+- 피드백의 핵심 지식이 아닌 부가 설명
+
+**저장 판단 기준 (commit 전 반드시 확인):**
+1. 이 내용이 **재사용 가능한 지식**인가? (규칙, 절차, 선호도)
+2. 이 내용이 **다른 저장소에 이미 저장되었는가?** (중복 방지)
+3. 이 내용이 **피드백의 핵심 지식**인가? (설명이 아닌 실제 지식)
+
+**예시:**
+- ❌ 저장하지 말 것: "고객에게 변경된 할인 규칙을 안내하고, 시스템에서 올바르게 작동하는지 확인했습니다"
+- ✅ 저장할 것: "주문 금액이 100만원 이상인 경우 등급에 상관없이 기본 할인율에 추가로 3% 할인 적용" (DMN_RULE에 저장)
 
 **DMN_RULE 예시:**
 ```
@@ -206,41 +252,56 @@ Q3: 최종 결과가 피드백의 의도와 기존 지식 모두를 반영하는
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 **"나는 [STEP 1~5]를 모두 수행했는가?"**
+**"이 피드백이 단순한 재시도 요청인가? (그렇다면 즉시 종료)"**
 **"최종 상태 선언이 피드백의 의도를 정확히 반영하는가?"**
-**"기존 지식에서 보존해야 할 부분을 보존했는가?"**"""
+**"기존 지식에서 보존해야 할 부분을 보존했는가?"**
+**"저장하려는 내용이 핵심 지식인가? (설명이나 중복이 아닌가?)"**
+**"이 내용이 다른 저장소에 이미 저장되었는가?"**
+**"스킬 CREATE/UPDATE 결론을 냈다면, Final Answer 전에 반드시 commit_to_skill을 호출했는가?"**"""
+
+    # ReAct output parser는 아래 형식을 엄격히 요구한다.
+    # 모델이 [STEP 1] 같은 임의 형식으로 출력하면 도구 호출 파싱이 매번 실패하므로,
+    # 정책은 유지하되 "출력 형식"만은 단일 규칙으로 강제한다.
+    output_format_guard = """
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+## ✅ 출력 형식 (절대 규칙)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+너의 출력은 반드시 아래 형식만 사용해야 한다. 다른 헤더/목록/마크다운 코드블록/임의 텍스트(예: [STEP 1])는 금지.
+(내부적으로는 STEP 프레임워크를 따라도 되지만, 출력에는 절대 쓰지 마라.)
+
+Thought: 내부 추론 (간결하게)
+Action: 사용할 도구 이름 (없으면 생략하고 Final Answer로 종료)
+Action Input: 도구 입력 (반드시 JSON 한 덩어리)
+Observation: 도구 실행 결과
+... (필요 시 Thought/Action/Action Input/Observation 반복)
+Final Answer: 최종 보고 (도구 호출 없이도 반드시 이 줄로 종료)
+
+중요:
+- Action은 반드시 tool_names 중 하나여야 한다.
+- Action Input은 반드시 유효한 JSON이어야 한다.
+- 도구를 쓰지 않을 때는 Action/Action Input을 출력하지 말고 Final Answer로 바로 종료한다.
+- 한 번의 출력에서 Action과 Final Answer를 동시에 쓰지 마라. (둘 중 하나만)
+- 도구가 필요하면: Thought/Action/Action Input까지만 출력하고 멈춰라. (Final Answer 금지)
+- 최종 결론이면: Final Answer만 출력하고 멈춰라. (Action 금지)
+
+저장(Commit) 규칙 (필수):
+- 최종 결론이 CREATE/UPDATE/DELETE 이면, **반드시** 그에 맞는 commit 도구를 **먼저** 호출하고, Observation을 받은 **뒤에만** Final Answer를 쓴다.
+  · MEMORY → commit_to_memory
+  · DMN_RULE → commit_to_dmn_rule
+  · SKILL → commit_to_skill  (스킬 관련 시 MCP를 통해 기존 스킬을 갱신하려면 반드시 이 도구 호출)
+- **commit 도구를 호출하지 않고** 저장/생성/수정/삭제 결론만 Final Answer에 적으면 **처리 실패(no_commit)** 로 간주된다.
+- IGNORE(저장하지 않음)인 경우에만 commit 도구 호출 없이 Final Answer로 종료할 수 있다.
+"""
 
     # ReAct 프롬프트 템플릿 (LangChain 표준 형식)
     # create_react_agent는 tools와 tool_names 변수를 자동으로 채워줍니다
+    # create_react_agent 경로에서는 agent_scratchpad가 "문자열"로 주입되는 경우가 많다.
+    # MessagesPlaceholder는 list[BaseMessage]를 요구하므로 타입 충돌을 피하기 위해 문자열 메시지 슬롯을 사용한다.
     prompt = ChatPromptTemplate.from_messages([
-        ("system", system_message),
-        ("human", """다음 피드백을 처리해주세요:
-
-**피드백 내용:**
-{feedback_content}
-
-**에이전트 정보:**
-{agent_info}
-
-**작업 지시사항:**
-{task_description}
-
-**사용 가능한 도구:**
-{tools}
-
-**도구 이름 목록:**
-{tool_names}
-
-위 정보를 바탕으로 Thought → Action → Observation 사이클을 반복하여 피드백을 처리하세요.
-최종적으로 Final Answer로 처리 결과를 보고하세요.
-
-사용 가능한 도구를 사용할 때는 다음 형식을 따르세요:
-Thought: [생각 과정]
-Action: [도구 이름]
-Action Input: [도구 입력 (JSON 형식)]
-Observation: [도구 실행 결과]
-... (필요하면 반복)
-Final Answer: [최종 답변]"""),
-        MessagesPlaceholder(variable_name="agent_scratchpad"),
+        ("system", system_message + output_format_guard),
+        ("human", "{input}"),
+        ("assistant", "{agent_scratchpad}"),
     ])
     
     return prompt
@@ -250,12 +311,13 @@ Final Answer: [최종 답변]"""),
 # ReAct 에이전트 생성
 # ============================================================================
 
-def create_feedback_react_agent(agent_id: str) -> AgentExecutor:
+def create_feedback_react_agent(agent_id: str, feedback_content: Optional[str] = None) -> AgentExecutor:
     """
     피드백 처리용 ReAct 에이전트 생성
     
     Args:
         agent_id: 에이전트 ID
+        feedback_content: 원본 피드백 내용 (commit_to_skill의 record_knowledge_history용, 선택)
     
     Returns:
         AgentExecutor 인스턴스
@@ -265,28 +327,15 @@ def create_feedback_react_agent(agent_id: str) -> AgentExecutor:
         llm = create_llm(model="gpt-4o", streaming=False, temperature=0)
         
         # 도구 생성
-        tools = create_react_tools(agent_id)
+        tools = create_react_tools(agent_id, feedback_content=feedback_content)
         
-        # 프롬프트 생성 (tools를 전달하여 tool_names 생성)
+        # 프롬프트 생성: 정책 프롬프트 단일 경로
         prompt = create_react_prompt(tools)
         
         # ReAct 에이전트 생성
         if create_react_agent is not None:
-            # LangChain의 표준 ReAct 프롬프트 사용
-            # 커스텀 프롬프트 대신 기본 프롬프트를 사용하고,
-            # 시스템 메시지는 AgentExecutor의 input_variables에 추가
-            try:
-                from langchain import hub
-                # LangChain Hub에서 표준 ReAct 프롬프트 가져오기
-                react_prompt = hub.pull("hwchase17/react")
-                log("✅ LangChain Hub에서 표준 ReAct 프롬프트 로드 완료")
-            except Exception as e:
-                log(f"⚠️ LangChain Hub 사용 불가, 기본 프롬프트 사용: {e}")
-                # Hub를 사용할 수 없으면 None을 전달하여 기본 프롬프트 사용
-                react_prompt = None
-            
-            # ReAct 에이전트 생성
-            agent = create_react_agent(llm, tools, react_prompt)
+            # ReAct 에이전트 생성: 커스텀 정책 프롬프트를 명시적으로 사용 (분기/중복 경로 제거)
+            agent = create_react_agent(llm, tools, prompt)
         else:
             # 최신 LangChain 방식: tool calling agent 사용
             agent = create_tool_calling_agent(llm, tools, prompt)
@@ -301,6 +350,16 @@ def create_feedback_react_agent(agent_id: str) -> AgentExecutor:
             # ValidationError인 경우 더 명확한 메시지
             if "validation error" in error_str.lower() or "Field required" in error_str:
                 return f"도구 호출 형식이 잘못되었습니다. 모든 필수 파라미터를 제공해야 합니다. 에러: {error_str[:300]}"
+
+            # ReAct 파서가 "Action과 Final Answer를 동시에 출력"했다고 판단한 경우
+            if "both a final answer and a parse-able action" in error_str.lower():
+                return (
+                    "출력 형식 오류: 한 번의 출력에서 Action과 Final Answer를 동시에 쓰면 안 됩니다.\n"
+                    "다음 중 하나로만 다시 출력하세요:\n"
+                    "- 도구가 필요하면: Thought/Action/Action Input (Final Answer 금지)\n"
+                    "- 최종 결론이면: Final Answer만 (Action 금지)\n"
+                    "또한 Action Input은 반드시 JSON 한 덩어리여야 합니다."
+                )
             
             return f"도구 호출 파싱 실패: {error_str[:300]}. 올바른 형식으로 다시 시도하세요."
         
@@ -330,7 +389,8 @@ async def process_feedback_with_react(
     agent_id: str,
     agent_info: Dict,
     feedback_content: str,
-    task_description: str = ""
+    task_description: str = "",
+    events: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict:
     """
     ReAct 에이전트를 사용하여 피드백을 처리하고 저장
@@ -356,8 +416,30 @@ async def process_feedback_with_react(
         )
         
         # ReAct 에이전트 생성
-        agent_executor = create_feedback_react_agent(agent_id)
+        agent_executor = create_feedback_react_agent(agent_id, feedback_content=feedback_content)
         
+        # 이벤트 로그를 사람이 읽을 수 있는 요약 문자열로 변환
+        events_summary = "없음"
+        if events:
+            lines = []
+            for ev in events[:50]:  # ReAct 단계에는 조금 더 많은 이벤트를 허용
+                ev_type = ev.get("event_type", "")
+                status = ev.get("status", "")
+                crew_type = ev.get("crew_type", "")
+                ts = ev.get("timestamp", "")
+                data_str = ""
+                try:
+                    data = ev.get("data", {})
+                    data_str = json.dumps(data, ensure_ascii=False)
+                    if len(data_str) > 300:
+                        data_str = data_str[:300] + "...(truncated)"
+                except Exception:
+                    data_str = str(ev.get("data", ""))[:300]
+                lines.append(
+                    f"- time={ts}, type={ev_type}, status={status}, crew_type={crew_type}, data={data_str}"
+                )
+            events_summary = "\n".join(lines)
+
         # 입력 데이터 포맷팅 (표준 ReAct 프롬프트는 'input' 변수를 사용)
         input_text = f"""다음 피드백을 처리해주세요:
 
@@ -369,6 +451,9 @@ async def process_feedback_with_react(
 
 **작업 지시사항:**
 {task_description}
+
+**해당 작업의 이벤트 로그 (시간순, 실제 스킬/도구 사용 내역):**
+{events_summary}
 
 위 정보를 바탕으로 Thought → Action → Observation 사이클을 반복하여 피드백을 처리하세요.
 최종적으로 Final Answer로 처리 결과를 보고하세요."""
@@ -396,6 +481,82 @@ async def process_feedback_with_react(
         # 결과 처리
         output = result.get("output", "")
         intermediate_steps = result.get("intermediate_steps", [])
+
+        # ✅ 실행 결과가 "말로만 결론"이고 실제 commit이 없는 경우를 실패로 처리
+        committed_tools = {"commit_to_memory", "commit_to_dmn_rule", "commit_to_skill"}
+        used_tools = []
+        commit_failures: List[str] = []
+        commit_successes: List[str] = []
+        for step in intermediate_steps or []:
+            action = step[0] if isinstance(step, (list, tuple)) and len(step) > 0 else None
+            tool_name = getattr(action, "tool", None) if action else None
+            if tool_name:
+                used_tools.append(str(tool_name))
+
+            # commit 도구 결과가 ❌이면 "변경 이력 없음 = 실패"로 처리해야 한다.
+            if tool_name in committed_tools:
+                observation = step[1] if isinstance(step, (list, tuple)) and len(step) > 1 else None
+                obs_text = str(observation) if observation is not None else ""
+                if "❌" in obs_text:
+                    commit_failures.append(f"{tool_name}: {obs_text[:200]}")
+                elif "✅" in obs_text:
+                    commit_successes.append(str(tool_name))
+
+        did_commit = len(commit_successes) > 0
+        # heuristic: output이 저장/생성/수정/삭제를 말하고 있는데 commit이 없으면 실패
+        output_lower = (output or "").lower()
+        claims_mutation = any(
+            kw in output_lower
+            for kw in [
+                "create",
+                "update",
+                "delete",
+                "저장",
+                "생성",
+                "수정",
+                "삭제",
+                "업데이트",
+                "커밋",
+            ]
+        )
+        claims_ignore = any(
+            kw in output_lower
+            for kw in [
+                "ignore",
+                "무시",
+                "저장하지",
+                "처리하지",
+            ]
+        )
+        if (not did_commit) and claims_mutation and (not claims_ignore):
+            err = (
+                "ReAct 에이전트가 저장/수정/삭제 결론을 냈지만 commit 도구를 호출하지 않아 "
+                "실제 변경이 저장되지 않았습니다. (no_commit)"
+            )
+            log(f"❌ {err}")
+            return {
+                "output": output,
+                "intermediate_steps": intermediate_steps,
+                "agent_id": agent_id,
+                "error": err,
+                "used_tools": used_tools,
+            }
+
+        # commit 도구를 호출했지만 실패(❌)한 경우: 변경 이력 미기록이므로 무조건 실패
+        if commit_failures:
+            err = (
+                "commit 도구 호출이 실패하여 변경 이력이 저장되지 않았습니다. (commit_failed) "
+                + " | ".join(commit_failures[:2])
+            )
+            log(f"❌ {err}")
+            return {
+                "output": output,
+                "intermediate_steps": intermediate_steps,
+                "agent_id": agent_id,
+                "error": err,
+                "used_tools": used_tools,
+                "commit_failures": commit_failures,
+            }
         
         log(f"✅ ReAct 에이전트 처리 완료")
         log(f"   최종 출력: {output[:200]}...")
@@ -411,7 +572,10 @@ async def process_feedback_with_react(
         return {
             "output": output,
             "intermediate_steps": intermediate_steps,
-            "agent_id": agent_id
+            "agent_id": agent_id,
+            "used_tools": used_tools,
+            "did_commit": did_commit,
+            "commit_successes": commit_successes,
         }
         
     except Exception as e:

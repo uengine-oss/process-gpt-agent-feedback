@@ -6,7 +6,7 @@
 
 import json
 from typing import Dict, List, Optional
-from llm_factory import create_llm
+from core.llm import create_llm
 from utils.logger import log, handle_error
 
 

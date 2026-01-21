@@ -315,10 +315,27 @@ def check_skill_exists(skill_name: str) -> bool:
         # URL 인코딩을 명시적으로 수행 (다른 함수들과 일관성 유지)
         encoded_skill_name = quote(skill_name)
         endpoint = f"/skills/check?name={encoded_skill_name}"
-        response = _make_request("GET", endpoint)
-        return response.get("exists", False)
+        url = f"{_get_base_url()}{endpoint}"
+        
+        # 직접 요청하여 404를 정상 응답으로 처리
+        response = requests.get(url, timeout=30)
+        if response.status_code == 404:
+            # 404는 스킬이 존재하지 않음을 의미 (정상 응답)
+            return False
+        response.raise_for_status()
+        
+        # JSON 응답 파싱
+        if response.headers.get("content-type", "").startswith("application/json"):
+            data = response.json()
+            return data.get("exists", False)
+        return False
+    except requests.exceptions.HTTPError as e:
+        # 404가 아닌 다른 HTTP 에러인 경우만 로깅
+        if e.response.status_code != 404:
+            log(f"⚠️ 스킬 존재 확인 실패 (HTTP {e.response.status_code}): {skill_name}")
+        return False
     except Exception as e:
-        log(f"⚠️ 스킬 존재 확인 실패: {e}")
+        log(f"⚠️ 스킬 존재 확인 실패: {str(e)[:200]}...")
         return False
 
 

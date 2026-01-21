@@ -1,11 +1,17 @@
 """
 Skill 커밋 모듈
-Claude Skill을 저장하는 로직 (HTTP API를 통해 구현)
+Claude Skill을 저장하는 로직 (HTTP API를 통해 구현).
+USE_SKILL_CREATOR_WORKFLOW=true이고 COMPUTER_USE_MCP_URL이 있으면 CREATE/UPDATE 시
+computer-use + skill-creator 경로를 사용.
 """
 
 from typing import Dict, List, Optional
 from utils.logger import log, handle_error
 from core.database import update_agent_and_tenant_skills, _get_agent_by_id, record_knowledge_history
+from core.mcp_client import (
+    USE_SKILL_CREATOR_WORKFLOW,
+    COMPUTER_USE_MCP_URL,
+)
 from core.skill_api_client import (
     upload_skill,
     update_skill_file,
@@ -17,50 +23,61 @@ from core.skill_api_client import (
 )
 
 
-async def commit_to_skill(agent_id: str, skill_artifact: Dict, operation: str = "CREATE", skill_id: str = None, feedback_content: Optional[str] = None):
+async def commit_to_skill(
+    agent_id: str,
+    skill_artifact: Optional[Dict] = None,
+    operation: str = "CREATE",
+    skill_id: str = None,
+    feedback_content: Optional[str] = None,
+    merge_mode: Optional[str] = None,
+    relationship_analysis: Optional[str] = None,
+):
     """
-    Skill로 CRUD 작업 수행 (HTTP API를 통해)
-    
+    Skill로 CRUD 작업 수행. ReAct 경로에서는 skill_artifact=None이고, 스킬 내용은 skill-creator가 생성.
+    learning_committer 등에서는 skill_artifact를 넘길 수 있으며, skill-creator 경로일 때는 그대로 반영.
+
     Args:
-        agent_id: 에이전트 ID (tenant_id로 사용)
-        skill_artifact: Skill 정보 {
-            "name": "스킬 이름 (선택적)",
-            "description": "스킬 설명 (frontmatter용, 선택적)",
-            "overview": "스킬 개요 (본문에 표시, 선택적)",
-            "usage": "사용법 (선택적)",
-            "steps": ["1단계", "2단계", ...],
-            "additional_files": {  # 선택적
-                "path": "content",
-                "scripts/helper.py": "# Python 코드",
-                ...
-            }
-        }
+        agent_id: 에이전트 ID
+        skill_artifact: Skill 정보 (name, steps, description, overview, usage, additional_files). ReAct 경로에서는 None.
         operation: "CREATE" | "UPDATE" | "DELETE"
-        skill_id: UPDATE/DELETE 시 기존 스킬 이름 (필수)
-                   CREATE 시 skill_artifact의 name 또는 skill_id 사용
-        feedback_content: 원본 피드백 내용 (변경 이력 기록용, 선택적)
-    
-    Raises:
-        Exception: 작업 실패 시
+        skill_id: UPDATE/DELETE 시 기존 스킬 이름 (필수). CREATE 시 비움 (skill-creator가 이름 생성).
+        feedback_content: 원본 피드백. skill-creator가 내용 생성할 때 필수.
+        merge_mode: UPDATE 시 MERGE | REPLACE.
+        relationship_analysis: search_similar_knowledge 결과(관계 유형 분포·상세 분석). EXTENDS/COMPLEMENTS 시 기존 내용 보존에 활용.
     """
     try:
-        # skill_id가 있으면 우선 사용, 없으면 skill_artifact에서 가져오기
-        skill_name = skill_id or skill_artifact.get("name", "피드백 기반 스킬")
-        steps = skill_artifact.get("steps", [])
-        additional_files = skill_artifact.get("additional_files", {})
-        # SKILL.md frontmatter용 설명: 명시적으로 주어진 description을 우선 사용하고,
-        # 없으면 기본 설명을 자동 생성하여 항상 description 필드를 채웁니다.
-        description = skill_artifact.get(
-            "description",
-            f"{skill_name} 작업을 수행하기 위한 단계별 절차입니다.",
-        )
-        # 개요와 사용법 추출 (선택적)
-        overview = skill_artifact.get("overview")
-        usage = skill_artifact.get("usage")
-        
-        # 에이전트 정보 조회 (tenant_id 필요)
         agent_info = _get_agent_by_id(agent_id)
         tenant_id = agent_info.get("tenant_id") if agent_info else None
+
+        # ----- skill-creator 경로 (CREATE/UPDATE, MCP 있음). 스킬 내용은 모두 skill-creator가 담당. -----
+        if USE_SKILL_CREATOR_WORKFLOW and operation in ("CREATE", "UPDATE") and COMPUTER_USE_MCP_URL:
+            try:
+                from core.skill_creator_committer import commit_to_skill_via_skill_creator
+                await commit_to_skill_via_skill_creator(
+                    agent_id=agent_id,
+                    operation=operation,
+                    skill_id=skill_id,
+                    feedback_content=feedback_content or "",
+                    merge_mode=merge_mode,
+                    skill_artifact=skill_artifact,
+                    relationship_analysis=relationship_analysis,
+                )
+                return
+            except Exception as e:
+                log(f"   ❌ skill-creator 실패: {e}")
+                raise
+        if USE_SKILL_CREATOR_WORKFLOW and operation in ("CREATE", "UPDATE") and not COMPUTER_USE_MCP_URL:
+            log("   USE_SKILL_CREATOR_WORKFLOW=true 이지만 COMPUTER_USE_MCP_URL 없음 → 기존 HTTP 사용")
+
+        # ----- HTTP 경로 (DELETE 또는 skill-creator 미사용 시). skill_artifact 사용. -----
+        if operation in ("CREATE", "UPDATE") and skill_artifact is None:
+            raise ValueError("CREATE/UPDATE를 HTTP로 수행할 때는 skill_artifact가 필요합니다. (skill-creator 경로는 feedback_content로 생성)")
+        skill_name = skill_id or (skill_artifact.get("name", "피드백 기반 스킬") if skill_artifact else None)
+        steps = (skill_artifact or {}).get("steps", [])
+        additional_files = (skill_artifact or {}).get("additional_files", {})
+        description = (skill_artifact or {}).get("description", f"{skill_name or '스킬'} 작업을 수행하기 위한 단계별 절차입니다.")
+        overview = (skill_artifact or {}).get("overview")
+        usage = (skill_artifact or {}).get("usage")
         
         if operation == "DELETE":
             if not skill_name:

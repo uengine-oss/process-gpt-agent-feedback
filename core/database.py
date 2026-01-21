@@ -1,9 +1,11 @@
 import os
 import socket
+import hashlib
+import json
 from typing import Optional, Dict, Any, List
 from dotenv import load_dotenv
 from supabase import create_client, Client
-from utils.logger import handle_error
+from utils.logger import handle_error, log
 
 # ============================================================================
 # DB 설정 및 초기화
@@ -62,6 +64,34 @@ async def fetch_feedback_task_by_id(todo_id: str) -> Optional[Dict[str, Any]]:
     except Exception as e:
         handle_error("특정피드백작업조회", e)
         return None
+
+
+# ============================================================================
+# 이벤트 로그 조회 (특정 TODO 기준)
+# ============================================================================
+
+async def fetch_events_by_todo_id(todo_id: str) -> List[Dict[str, Any]]:
+    """
+    특정 TODO(ID)와 연관된 이벤트 로그를 시간순으로 조회
+
+    - events 테이블 스키마
+      id, job_id, todo_id, proc_inst_id, event_type, status, crew_type, data(jsonb), timestamp
+    - 피드백 처리 시, 해당 워크아이템(todo_id)의 실제 스킬 사용 이력을 LLM에 제공하기 위해 사용
+    """
+    try:
+        supabase = get_db_client()
+        resp = (
+            supabase
+            .table("events")
+            .select("*")
+            .eq("todo_id", todo_id)
+            .order("timestamp", desc=False)
+            .execute()
+        )
+        return resp.data or []
+    except Exception as e:
+        handle_error("이벤트로그조회", e)
+        return []
 
 
 # ============================================================================
@@ -235,8 +265,9 @@ def record_knowledge_history(
     knowledge_name: Optional[str] = None,  # DMN_RULE: rule name, SKILL: skill name
     moved_from_storage: Optional[str] = None,  # MOVE인 경우
     moved_to_storage: Optional[str] = None,  # MOVE인 경우
-    batch_job_id: Optional[str] = None  # 배치 작업 ID
-) -> None:
+    batch_job_id: Optional[str] = None,  # 배치 작업 ID
+    version_uuid: Optional[str] = None  # DMN_RULE 버전 UUID (프론트엔드에서 버전 정보 조회용)
+) -> Optional[str]:
     """
     에이전트 지식 변경 이력을 데이터베이스에 기록 (통합)
     
@@ -253,6 +284,10 @@ def record_knowledge_history(
         moved_from_storage: 이동 전 저장소 (MOVE인 경우)
         moved_to_storage: 이동 후 저장소 (MOVE인 경우)
         batch_job_id: 배치 작업 ID (배치 작업으로 변경된 경우)
+        version_uuid: DMN_RULE 버전 UUID (프론트엔드에서 버전 정보 조회용, DMN_RULE인 경우만)
+    
+    Returns:
+        생성된 변경 이력의 UUID (version_uuid가 제공된 경우 해당 UUID 반환)
     """
     from utils.logger import log  # 순환 import 방지용 내부 import
     
@@ -276,6 +311,12 @@ def record_knowledge_history(
             else:
                 new_content_str = str(new_content)
         
+        # version_uuid가 제공된 경우 해당 UUID를 사용, 아니면 자동 생성
+        history_id = version_uuid if version_uuid else None
+        
+        # version_uuid가 제공된 경우 해당 UUID를 사용, 아니면 자동 생성
+        history_id = version_uuid if version_uuid else None
+        
         record = {
             "knowledge_type": knowledge_type.upper(),
             "knowledge_id": knowledge_id,
@@ -294,12 +335,247 @@ def record_knowledge_history(
         # None 값 제거 (데이터베이스에 NULL로 저장되도록)
         record = {k: v for k, v in record.items() if v is not None}
         
-        supabase.table("agent_knowledge_history").insert(record).execute()
-        log(f"📝 지식 변경 이력 기록 완료: type={knowledge_type}, id={knowledge_id}, operation={operation}")
+        # version_uuid가 제공된 경우 id로 지정하여 삽입 (변경 이력 UUID = 버전 UUID)
+        if history_id:
+            record["id"] = history_id
+        
+        resp = supabase.table("agent_knowledge_history").insert(record).execute()
+        
+        # 생성된 UUID 반환
+        result_uuid = None
+        if resp.data and len(resp.data) > 0:
+            result_uuid = resp.data[0].get("id")
+        elif history_id:
+            result_uuid = history_id
+        
+        log(f"📝 지식 변경 이력 기록 완료: type={knowledge_type}, id={knowledge_id}, operation={operation}, history_uuid={result_uuid}")
+        
+        return result_uuid
         
     except Exception as e:
         # 변경 이력 기록 실패는 로그만 남기고 계속 진행 (작업 자체는 성공했을 수 있음)
         import traceback
         log(f"⚠️ 지식 변경 이력 기록 실패 (무시하고 계속 진행): {e}")
         log(f"   상세 에러: {traceback.format_exc()}")
+
+
+# ============================================================================
+# 에이전트 지식 레지스트리 관리
+# ============================================================================
+
+def _hash_content(content: str) -> str:
+    """지식 내용의 해시 생성 (변경 감지용)"""
+    return hashlib.sha256(content.encode('utf-8')).hexdigest()
+
+
+def register_knowledge(
+    agent_id: str,
+    tenant_id: Optional[str],
+    knowledge_type: str,
+    knowledge_id: str,
+    knowledge_name: Optional[str] = None,
+    content_summary: Optional[str] = None,
+    content: Optional[str] = None
+) -> bool:
+    """
+    에이전트 지식 레지스트리에 지식 등록/업데이트 (UPSERT)
+    
+    Args:
+        agent_id: 에이전트 ID
+        tenant_id: 테넌트 ID
+        knowledge_type: 지식 타입
+        knowledge_id: 지식 ID
+        knowledge_name: 지식 이름
+        content_summary: 지식 내용 요약
+        content: 지식 전체 내용 (해시 생성용)
+    
+    Returns:
+        저장 성공 여부
+    """
+    try:
+        supabase = get_db_client()
+        
+        content_hash = None
+        if content:
+            content_hash = _hash_content(content)
+        
+        record = {
+            'agent_id': agent_id,
+            'tenant_id': tenant_id,
+            'knowledge_type': knowledge_type.upper(),
+            'knowledge_id': knowledge_id,
+            'knowledge_name': knowledge_name,
+            'content_summary': content_summary,
+            'content_hash': content_hash
+        }
+        
+        # None 값 제거
+        record = {k: v for k, v in record.items() if v is not None}
+        
+        # UPSERT
+        resp = (
+            supabase
+            .table('agent_knowledge_registry')
+            .upsert(record, on_conflict='agent_id,knowledge_type,knowledge_id')
+            .execute()
+        )
+        
+        log(f"✅ 지식 레지스트리 등록: {knowledge_type}:{knowledge_id} (agent_id={agent_id})")
+        return True
+        
+    except Exception as e:
+        handle_error("지식레지스트리등록", e)
+        return False
+
+
+def unregister_knowledge(
+    agent_id: str,
+    knowledge_type: str,
+    knowledge_id: str
+) -> bool:
+    """
+    에이전트 지식 레지스트리에서 지식 제거
+    
+    Args:
+        agent_id: 에이전트 ID
+        knowledge_type: 지식 타입
+        knowledge_id: 지식 ID
+    
+    Returns:
+        삭제 성공 여부
+    """
+    try:
+        supabase = get_db_client()
+        
+        (
+            supabase
+            .table('agent_knowledge_registry')
+            .delete()
+            .eq('agent_id', agent_id)
+            .eq('knowledge_type', knowledge_type.upper())
+            .eq('knowledge_id', knowledge_id)
+            .execute()
+        )
+        
+        log(f"🗑️ 지식 레지스트리 제거: {knowledge_type}:{knowledge_id} (agent_id={agent_id})")
+        return True
+        
+    except Exception as e:
+        handle_error("지식레지스트리제거", e)
+        return False
+
+
+def get_agent_knowledge_list(
+    agent_id: str,
+    knowledge_type: Optional[str] = None,
+    limit: Optional[int] = None
+) -> List[Dict[str, Any]]:
+    """
+    에이전트가 가진 모든 지식 목록 조회
+    
+    Args:
+        agent_id: 에이전트 ID
+        knowledge_type: 지식 타입 필터 (None이면 모든 타입)
+        limit: 조회 제한 수 (None이면 제한 없음)
+    
+    Returns:
+        지식 목록
+    """
+    try:
+        supabase = get_db_client()
+        
+        query = (
+            supabase
+            .table('agent_knowledge_registry')
+            .select('*')
+            .eq('agent_id', agent_id)
+            .order('updated_at', desc=True)
+        )
+        
+        if knowledge_type:
+            query = query.eq('knowledge_type', knowledge_type.upper())
+        
+        if limit:
+            query = query.limit(limit)
+        
+        resp = query.execute()
+        return resp.data if resp.data else []
+        
+    except Exception as e:
+        handle_error("지식목록조회", e)
+        return []
+
+
+def check_knowledge_exists(
+    agent_id: str,
+    knowledge_type: str,
+    knowledge_id: str
+) -> bool:
+    """
+    특정 지식이 레지스트리에 존재하는지 확인
+    
+    Args:
+        agent_id: 에이전트 ID
+        knowledge_type: 지식 타입
+        knowledge_id: 지식 ID
+    
+    Returns:
+        존재 여부
+    """
+    try:
+        supabase = get_db_client()
+        
+        resp = (
+            supabase
+            .table('agent_knowledge_registry')
+            .select('id')
+            .eq('agent_id', agent_id)
+            .eq('knowledge_type', knowledge_type.upper())
+            .eq('knowledge_id', knowledge_id)
+            .limit(1)
+            .execute()
+        )
+        
+        return len(resp.data) > 0 if resp.data else False
+        
+    except Exception as e:
+        handle_error("지식존재확인", e)
+        return False
+
+
+def update_knowledge_access_time(
+    agent_id: str,
+    knowledge_type: str,
+    knowledge_id: str
+) -> bool:
+    """
+    지식의 마지막 접근 시간 업데이트
+    
+    Args:
+        agent_id: 에이전트 ID
+        knowledge_type: 지식 타입
+        knowledge_id: 지식 ID
+    
+    Returns:
+        업데이트 성공 여부
+    """
+    try:
+        supabase = get_db_client()
+        
+        (
+            supabase
+            .table('agent_knowledge_registry')
+            .update({'last_accessed_at': 'now()'})
+            .eq('agent_id', agent_id)
+            .eq('knowledge_type', knowledge_type.upper())
+            .eq('knowledge_id', knowledge_id)
+            .execute()
+        )
+        
+        return True
+        
+    except Exception as e:
+        handle_error("접근시간업데이트", e)
+        return False
+
 

@@ -9,15 +9,17 @@
 - LLM이 직접 추론하고 판단하여 CRUD 작업 수행
 - Chain 방식 폴백 제거, ReAct 전용
 
-### 2. 에이전트 중심 추론
+### 2. 에이전트 중심 추론 + 하이브리드 병합
 - **도구는 정보 제공**, 최종 판단은 에이전트
 - 유사도 점수에 의존하지 않고 **의미와 맥락** 분석
 - 다층적 관계 분석 (DUPLICATE, EXTENDS, REFINES, CONFLICTS, EXCEPTION, SUPERSEDES, COMPLEMENTS, UNRELATED)
+- **하이브리드 접근**: 에이전트가 `merge_mode`를 선택하면 도구가 안전하게 병합 처리
 
-### 3. Committer는 순수 CRUD 실행기
-- 비즈니스 로직 없음
-- 에이전트가 전달한 내용 그대로 저장
-- 자동 병합/확장 로직 없음
+### 3. 도구의 안전한 병합 지원
+- `merge_mode` 파라미터로 에이전트의 의도 명시
+- **EXTEND**: 기존 내용 자동 보존 + 새 내용 추가 (도구가 병합)
+- **REFINE**: 기존 내용 참조 후 일부 수정
+- **REPLACE**: 완전 대체 (기존 동작)
 
 ---
 
@@ -87,18 +89,20 @@ Q3: 최종 결과가 피드백 의도와 기존 지식 모두를 반영하는가
 
 ---
 
-## 관계 유형 및 처리 방법
+## 관계 유형 → merge_mode 매핑 (핵심!)
 
-| 유형 | 정의 | 기존 지식 처리 |
-|------|------|---------------|
-| **DUPLICATE** | 표현만 다른 동일 내용 | 유지 (IGNORE) |
-| **EXTENDS** | 새 조건/케이스 추가 | 유지 + 새 내용 추가 (UPDATE with merge) |
-| **REFINES** | 기존 값/세부사항 변경 | 해당 부분만 수정 (UPDATE) |
-| **EXCEPTION** | 기존 규칙의 예외 | 유지 + 예외 규칙 추가 (UPDATE with merge) |
-| **CONFLICTS** | 상충/모순 | 판단 필요 |
-| **SUPERSEDES** | 명시적 대체 | 삭제 후 새로 생성 (DELETE + CREATE) |
-| **COMPLEMENTS** | 다른 측면 | 유지 + 별도 생성 (CREATE) |
-| **UNRELATED** | 무관 | 유지 + 별도 생성 (CREATE) |
+| 유형 | 정의 | merge_mode | 기존 지식 처리 |
+|------|------|------------|---------------|
+| **DUPLICATE** | 표현만 다른 동일 내용 | (작업 안함) | 유지 |
+| **EXTENDS** | 새 조건/케이스 추가 | `EXTEND` ✅ | 자동 보존 + 새 내용 추가 |
+| **REFINES** | 기존 값/세부사항 변경 | `REFINE` | 해당 부분만 수정 |
+| **EXCEPTION** | 기존 규칙의 예외 | `EXTEND` ✅ | 자동 보존 + 예외 규칙 추가 |
+| **CONFLICTS** | 상충/모순 | 판단 필요 | 판단 필요 |
+| **SUPERSEDES** | 명시적 대체 | `REPLACE` | 삭제 후 새로 생성 |
+| **COMPLEMENTS** | 다른 측면 | `REPLACE` | 유지 + 별도 생성 (새 CREATE) |
+| **UNRELATED** | 무관 | `REPLACE` | 유지 + 별도 생성 (새 CREATE) |
+
+**✅ = 도구가 자동으로 기존 내용 조회 및 병합**
 
 ---
 
@@ -115,31 +119,57 @@ Q3: 최종 결과가 피드백 의도와 기존 지식 모두를 반영하는가
 - `verify_knowledge_duplicate`: 중복 여부 확인
 - `determine_operation`: 작업 결정 지원 (정보 제공)
 
-### 저장 도구
+### 저장 도구 (하이브리드 접근)
 - `commit_to_memory`: MEMORY CRUD
+  - `merge_mode`: REPLACE | EXTEND | REFINE
 - `commit_to_dmn_rule`: DMN_RULE CRUD
+  - `merge_mode`: REPLACE | EXTEND | REFINE
+  - EXTEND 시 LLM으로 기존 XML + 새 규칙 자동 병합
 - `commit_to_skill`: SKILL CRUD
+  - `merge_mode`: REPLACE | EXTEND | REFINE
+  - EXTEND 시 기존 steps + 새 steps 자동 병합
 
 ---
 
-## 주요 수정 사항 (2026-01-08)
+## 주요 수정 사항
 
-### 1. 프롬프트 재설계
+### 2026-01-08 (v2): 하이브리드 접근 도입
+
+#### 1. merge_mode 파라미터 추가 (핵심 변경)
+- 모든 commit 도구에 `merge_mode` 파라미터 추가
+- **EXTEND**: 기존 내용 자동 보존 + 새 내용 추가 (도구가 병합)
+- **REFINE**: 기존 내용 참조 후 일부 수정
+- **REPLACE**: 완전 대체 (기존 동작)
+
+#### 2. 도구 내 안전한 병합 구현
+- `commit_to_dmn_rule`: EXTEND 시 `_extend_dmn_xml_llm` 호출하여 LLM으로 XML 병합
+- `commit_to_memory`: EXTEND 시 기존 내용 + 새 내용 연결
+- `commit_to_skill`: EXTEND 시 기존 steps + 새 steps 병합
+
+#### 3. 프롬프트 업데이트
+- 관계 유형 → merge_mode 매핑 테이블 추가
+- 예시에 merge_mode 사용법 반영
+
+---
+
+### 2026-01-08 (v1): 초기 ReAct 구현
+
+#### 1. 프롬프트 재설계
 - 5단계 필수 추론 프레임워크 적용
 - 자기 검증 단계 추가
 - 최종 상태 선언 필수화
 - 다양한 추론 예시 (EXTENDS, REFINES, SUPERSEDES) 포함
 
-### 2. 도구 입력 파싱 강화
+#### 2. 도구 입력 파싱 강화
 - kwargs 형식 입력 자동 파싱 (`knowledge_type="DMN_RULE", knowledge_id="..."`)
 - 중첩 JSON brace counting 파싱 (nested objects 처리)
 
-### 3. Committer 순수화
+#### 3. Committer 순수화
 - `dmn_committer`: 자동 병합/확장 로직 제거
 - `skill_committer`: 자동 CREATE→UPDATE 전환 로직 제거
 - 에이전트가 최종 완성본을 직접 구성하여 전달
 
-### 4. MEMORY 조회 오류 수정
+#### 4. MEMORY 조회 오류 수정
 - 빈 쿼리로 semantic search 시 OpenAI API 오류 발생
 - `get_knowledge_detail`에서 MEMORY 조회 시 직접 DB 조회로 변경
 
@@ -173,21 +203,28 @@ OPENAI_API_KEY=your_openai_api_key
 
 ## 주의사항
 
-### UPDATE 작업 시
-- 반드시 `operation="UPDATE"` + 기존 ID 전달
-- **전달하는 내용이 최종 완성본**이어야 함
-- 도구가 자동으로 병합해주지 않음
-- 기존 내용 + 새 내용을 **에이전트가 직접 병합**하여 전달
+### merge_mode 선택이 핵심!
+에이전트는 관계 유형을 파악한 후 적절한 `merge_mode`를 선택해야 합니다:
 
-### EXTENDS/EXCEPTION 관계 처리
-- 기존 지식을 조회하여 내용 파악
-- 기존 내용 + 새 내용을 합친 최종 결과 구성
-- UPDATE로 전체 내용 전달
+```
+EXTENDS 관계 → merge_mode="EXTEND" (권장!)
+REFINES 관계 → merge_mode="REFINE"
+SUPERSEDES 관계 → merge_mode="REPLACE"
+```
+
+### EXTEND 모드 사용 시 (권장)
+- **기존 ID 필수** (rule_id, memory_id, skill_id)
+- **추가할 내용만 전달** (도구가 자동으로 기존 내용 조회 및 병합)
+- 기존 지식이 **자동으로 보존**됨
+
+### REPLACE 모드 사용 시
+- 새 지식 생성: operation="CREATE" (ID 불필요)
+- 기존 지식 대체: operation="UPDATE" + 기존 ID 필수
+- **전달하는 내용이 최종 완성본**이어야 함
 
 ---
 
 ## 참고 문서
 
-- `SETUP_GUIDE.md`: 배치 작업 시스템 설정 가이드
 - `readme.md`: 기본 설정 안내
 

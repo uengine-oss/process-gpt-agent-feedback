@@ -4,10 +4,29 @@ ReAct 에이전트용 도구 정의
 """
 
 import json
-from typing import Dict, List, Optional
+import re
+from typing import Dict, List, Optional, Any
 from pydantic import BaseModel, Field
 from langchain_core.tools import StructuredTool
 from utils.logger import log, handle_error
+
+# Pydantic v2 model_validator를 위한 import
+try:
+    from pydantic import model_validator
+except ImportError:
+    # Pydantic v1 호환성
+    try:
+        from pydantic import root_validator as model_validator
+        # v1에서는 mode 인자를 사용하지 않으므로 wrapper 함수 필요
+        def _model_validator_wrapper(mode='before'):
+            def decorator(func):
+                if mode == 'before':
+                    return model_validator(pre=True)(func)
+                return func
+            return decorator
+        model_validator = _model_validator_wrapper
+    except ImportError:
+        model_validator = None
 
 # 기존 모듈 import
 from core.knowledge_retriever import (
@@ -66,13 +85,32 @@ class CommitDmnRuleInput(BaseModel):
     operation: str = Field(default="CREATE", description="⚠️ 작업 타입 (CREATE | UPDATE | DELETE). 유사한 기존 규칙이 있으면 반드시 UPDATE를 사용하고 rule_id를 함께 전달하세요!")
     rule_id: Optional[str] = Field(default=None, description="⚠️ UPDATE/DELETE 시 필수! 기존 규칙 ID (search_similar_knowledge 또는 search_dmn_rules 결과에서 얻은 ID)")
     feedback_content: str = Field(default="", description="원본 피드백 내용 (선택적)")
+    merge_mode: Optional[str] = Field(default="REPLACE", description="병합 모드 (REPLACE | EXTEND | REFINE). EXTEND: 기존 규칙 보존 + 새 규칙 추가. REFINE: 기존 규칙 참조 후 일부 수정. REPLACE: 완전 대체 (기본값)")
 
 
 class CommitSkillInput(BaseModel):
-    """Skill 저장 도구 입력"""
-    skill_artifact_json: str = Field(..., description="Skill 정보를 JSON 문자열로 전달. 필수 필드: description (frontmatter용), overview (본문 개요), steps (단계별 절차). 선택 필드: usage (사용법), additional_files (scripts/ 폴더에 Python 파일 포함 시). 예: '{\"name\": \"스킬 이름\", \"description\": \"간단한 설명\", \"overview\": \"상세 개요\", \"steps\": [\"1단계\", \"2단계\", ...], \"usage\": \"사용법\", \"additional_files\": {\"scripts/helper.py\": \"코드\"}}'")
-    operation: str = Field(default="CREATE", description="작업 타입 (CREATE | UPDATE | DELETE)")
-    skill_id: Optional[str] = Field(default=None, description="UPDATE/DELETE 시 기존 스킬 ID")
+    """Skill 저장 도구 입력
+
+    ReAct은 **어떤 지식 저장소에(SKILL)**·**기존 지식과의 관계(CREATE/UPDATE/DELETE, skill_id)**만 판단합니다.
+    스킬 마크다운·steps·additional_files 등 **스킬 내용 생성은 전부 skill-creator 스킬**이 수행합니다.
+    피드백(feedback_content)은 도구 외부에서 자동 전달됩니다.
+    """
+    operation: str = Field(
+        default="CREATE",
+        description="작업 타입 (CREATE | UPDATE | DELETE). 관련 스킬이 있으면 UPDATE, 없으면 CREATE."
+    )
+    skill_id: Optional[str] = Field(
+        default=None,
+        description="UPDATE/DELETE 시 필수. 기존 스킬 이름(id). CREATE 시에는 비워둠."
+    )
+    merge_mode: Optional[str] = Field(
+        default="MERGE",
+        description="UPDATE 시 병합 모드 (MERGE | REPLACE). MERGE: 기존 보존+변경 반영. REPLACE: 전체 교체.",
+    )
+    relationship_analysis: Optional[str] = Field(
+        default=None,
+        description="search_similar_knowledge 결과(관계 유형 분포·상세 분석)를 그대로 전달. EXTENDS/COMPLEMENTS 시 기존 내용 보존에 활용. 있으면 반드시 전달하세요.",
+    )
 
 
 # ============================================================================
@@ -106,12 +144,51 @@ class DetermineOperationInput(BaseModel):
     """작업 결정 도구 입력 (단순화)"""
     content: str = Field(..., description="저장하려는 새로운 지식 내용")
     knowledge_type: str = Field(..., description="지식 타입 (MEMORY | DMN_RULE | SKILL)")
+    
+    if model_validator:
+        @model_validator(mode='before')
+        @classmethod
+        def parse_kwargs_input(cls, data):
+            """kwargs 형식 입력을 처리하는 validator"""
+            if isinstance(data, dict):
+                # content 필드에 kwargs 형식 문자열이 들어있는 경우 파싱
+                if 'content' in data and isinstance(data['content'], str):
+                    content_value = data['content']
+                    if 'knowledge_type=' in content_value:
+                        log(f"🔧 DetermineOperationInput: kwargs 형식 입력 감지, 파싱 시도...")
+                        log(f"   입력값: {content_value[:200]}...")
+                        
+                        # content 추출
+                        content_match = re.search(r'content\s*=\s*["\']([^"\']*)["\']', content_value)
+                        if content_match:
+                            data['content'] = content_match.group(1)
+                            log(f"   추출된 content: {data['content'][:100]}...")
+                        else:
+                            # content=...knowledge_type= 형태에서 content 부분만 추출
+                            content_end = content_value.find('knowledge_type=')
+                            if content_end > 0:
+                                content_part = content_value[:content_end].strip()
+                                if content_part.startswith('content='):
+                                    data['content'] = content_part[8:].strip().strip("'\"")
+                                    log(f"   추출된 content (후처리): {data['content'][:100]}...")
+                        
+                        # knowledge_type 추출 (이미 딕셔너리에 있으면 덮어쓰지 않음)
+                        if 'knowledge_type' not in data or not data.get('knowledge_type'):
+                            type_match = re.search(r'knowledge_type\s*=\s*["\']?([^"\'",\s]+)["\']?', content_value)
+                            if type_match:
+                                data['knowledge_type'] = type_match.group(1)
+                                log(f"   추출된 knowledge_type: {data['knowledge_type']}")
+            
+            return data
 
 
 class GetKnowledgeDetailInput(BaseModel):
     """기존 지식 상세 조회 도구 입력"""
-    knowledge_type: str = Field(..., description="지식 타입 (MEMORY | DMN_RULE | SKILL)")
-    knowledge_id: str = Field(default="", description="조회할 지식 ID (필수)")
+    knowledge_type: str = Field(
+        default="AUTO",
+        description="지식 타입 (MEMORY | DMN_RULE | SKILL | AUTO). AUTO면 ID로 모든 타입에서 조회를 시도합니다.",
+    )
+    knowledge_id: str = Field(default="", description="조회할 지식 ID/이름 (필수). ReAct 텍스트 에이전트의 경우 JSON이 문자열로 들어올 수 있어 도구에서 복구합니다.")
 
 
 # ============================================================================
@@ -312,7 +389,8 @@ async def _commit_dmn_rule_tool(
     dmn_artifact: Dict,
     operation: str = "CREATE",
     rule_id: Optional[str] = None,
-    feedback_content: str = ""
+    feedback_content: str = "",
+    merge_mode: str = "REPLACE"
 ) -> str:
     """
     DMN 규칙을 저장/수정/삭제합니다.
@@ -323,6 +401,7 @@ async def _commit_dmn_rule_tool(
         operation: CREATE | UPDATE | DELETE
         rule_id: UPDATE/DELETE 시 기존 규칙 ID
         feedback_content: 원본 피드백 내용 (선택적)
+        merge_mode: REPLACE | EXTEND | REFINE (기본값: REPLACE)
     
     Returns:
         작업 결과 메시지
@@ -333,7 +412,8 @@ async def _commit_dmn_rule_tool(
             dmn_artifact=dmn_artifact,
             feedback_content=feedback_content,
             operation=operation,
-            rule_id=rule_id
+            rule_id=rule_id,
+            merge_mode=merge_mode
         )
         
         rule_name = dmn_artifact.get("name", "Unknown")
@@ -352,255 +432,44 @@ async def _commit_dmn_rule_tool(
 
 async def _commit_skill_tool(
     agent_id: str,
-    skill_artifact: Dict,
     operation: str = "CREATE",
-    skill_id: Optional[str] = None
+    skill_id: Optional[str] = None,
+    merge_mode: str = "MERGE",
+    feedback_content: Optional[str] = None,
+    relationship_analysis: Optional[str] = None,
 ) -> str:
     """
-    Skill을 저장/수정/삭제합니다.
-    
-    CREATE 작업 시 기존 스킬을 확인하여 중복되면 UPDATE로 전환하고,
-    중복된 스킬이 있으면 삭제합니다.
-    
-    Args:
-        agent_id: 에이전트 ID
-        skill_artifact: Skill 정보 (name, steps 포함)
-        operation: CREATE | UPDATE | DELETE
-        skill_id: UPDATE/DELETE 시 기존 스킬 ID
-    
-    Returns:
-        작업 결과 메시지
+    Skill을 저장/수정/삭제합니다. ReAct은 저장소·관계(operation, skill_id)만 판단하고,
+    스킬 내용(SKILL.md, steps, additional_files)은 skill-creator가 생성합니다.
     """
     try:
-        skill_name = skill_artifact.get("name", skill_id or "피드백 기반 스킬")
-        
-        # CREATE 작업 시 기존 스킬 확인 및 중복 처리
-        if operation == "CREATE":
-            # 기존 스킬 조회
-            from core.database import _get_agent_by_id, update_agent_and_tenant_skills
-            from core.skill_api_client import delete_skill
-            
-            agent_info = _get_agent_by_id(agent_id)
-            tenant_id = agent_info.get("tenant_id") if agent_info else None
-            agent_skills = agent_info.get("skills") if agent_info else None
-            
-            # 스킬 이름으로 기존 스킬 검색
-            existing_skills_all = await retrieve_existing_skills(
-                agent_id, 
-                skill_name, 
-                top_k=20, 
-                tenant_id=tenant_id, 
-                agent_skills=agent_skills
-            )
-            
-            # 업로드된 스킬만 필터링 (기본 내장 스킬 제외, HTTP API로 검증된 스킬만 사용)
-            existing_skills = [
-                skill for skill in existing_skills_all 
-                if not skill.get("is_builtin", False) and skill.get("verified", False)
-            ]
-            
-            log(f"🔍 업로드된 스킬 검색 결과: {len(existing_skills)}개 (전체: {len(existing_skills_all)}개, 기본 내장 스킬 및 미검증 스킬 제외)")
-            
-            # 정확히 일치하는 스킬 이름 찾기
-            exact_match = None
-            duplicate_skills = []
-            
-            for existing_skill in existing_skills:
-                existing_name = existing_skill.get("name", existing_skill.get("skill_name", ""))
-                existing_id = existing_skill.get("id", existing_name)
-                
-                # 정확히 일치하는 경우
-                if existing_name == skill_name or existing_id == skill_name:
-                    exact_match = existing_skill
-                    log(f"🔍 기존 스킬 발견 (정확히 일치): {existing_name} (ID: {existing_id})")
-                    break
-                
-                # 유사한 이름 (공백 제거 후 비교)
-                if existing_name.replace(" ", "") == skill_name.replace(" ", ""):
-                    if exact_match is None:
-                        exact_match = existing_skill
-                    else:
-                        duplicate_skills.append(existing_skill)
-                    log(f"🔍 기존 스킬 발견 (유사한 이름): {existing_name} (ID: {existing_id})")
-            
-            # 정확히 일치하는 스킬이 있으면 UPDATE로 전환 (HTTP API로 존재 여부 재확인)
-            if exact_match:
-                matched_id = exact_match.get("id", exact_match.get("name", skill_name))
-                
-                # HTTP API로 실제 존재 여부 확인 (업로드된 스킬만 UPDATE 가능)
-                from core.skill_api_client import check_skill_exists
-                try:
-                    if not check_skill_exists(matched_id):
-                        log(f"   ⚠️ 스킬이 HTTP API에 존재하지 않음 (이미 삭제되었을 수 있음): {matched_id}")
-                        # 존재하지 않으면 CREATE로 전환
-                        exact_match = None
-                    else:
-                        log(f"📝 기존 스킬 발견 (HTTP API 검증 완료): {matched_id}. UPDATE 작업으로 전환합니다.")
-                        operation = "UPDATE"
-                        skill_id = matched_id
-                except Exception as e:
-                    log(f"   ⚠️ HTTP API 스킬 존재 확인 실패 ({matched_id}): {e}")
-                    # 확인 실패 시에도 UPDATE 시도 (이미 verified=True로 필터링했으므로)
-                    log(f"📝 기존 스킬 발견: {matched_id}. UPDATE 작업으로 전환합니다.")
-                    operation = "UPDATE"
-                    skill_id = matched_id
-            
-            # exact_match가 없어진 경우 (HTTP API에서 존재하지 않음)
-            if not exact_match and operation == "UPDATE":
-                operation = "CREATE"
-                skill_id = None
-                log(f"   ℹ️ HTTP API에서 스킬을 찾을 수 없어 CREATE로 전환")
-            else:
-                # 유사한 스킬이 있는지 충돌 분석 수행 (업로드된 스킬만 대상)
-                if existing_skills:
-                    new_knowledge = {"skill": skill_artifact}
-                    existing_knowledge = {"skills": existing_skills}
-                    conflict_result = await analyze_knowledge_conflict(
-                        new_knowledge, 
-                        existing_knowledge, 
-                        "SKILL"
-                    )
-                    
-                    conflict_operation = conflict_result.get("operation", "CREATE")
-                    matched_item = conflict_result.get("matched_item")
-                    
-                    log(f"🔍 스킬 충돌 분석 결과: operation={conflict_operation}, conflict_level={conflict_result.get('conflict_level')}")
-                    
-                    if conflict_operation == "UPDATE" and matched_item:
-                        matched_id = matched_item.get("id")
-                        if matched_id:
-                            # HTTP API로 실제 존재 여부 확인
-                            from core.skill_api_client import check_skill_exists
-                            try:
-                                if not check_skill_exists(matched_id):
-                                    log(f"   ⚠️ 충돌 분석에서 매칭된 스킬이 HTTP API에 존재하지 않음: {matched_id}")
-                                    # 존재하지 않으면 CREATE로 유지
-                                else:
-                                    log(f"📝 충돌 분석 결과 UPDATE (HTTP API 검증 완료): {matched_id}")
-                                    operation = "UPDATE"
-                                    skill_id = matched_id
-                                    
-                                    # UPDATE로 전환된 경우, 매칭된 스킬을 exact_match로 설정
-                                    for skill in existing_skills:
-                                        if skill.get("id") == matched_id or skill.get("name") == matched_id:
-                                            exact_match = skill
-                                            break
-                            except Exception as e:
-                                log(f"   ⚠️ HTTP API 스킬 존재 확인 실패 ({matched_id}): {e}")
-                                # 확인 실패 시에도 UPDATE 시도
-                                log(f"📝 충돌 분석 결과 UPDATE: {matched_id}")
-                                operation = "UPDATE"
-                                skill_id = matched_id
-                                
-                                for skill in existing_skills:
-                                    if skill.get("id") == matched_id or skill.get("name") == matched_id:
-                                        exact_match = skill
-                                        break
-                    elif conflict_operation == "IGNORE":
-                        log(f"⏭️ 충돌 분석 결과 IGNORE: {conflict_result.get('action_description')}")
-                        return f"⏭️ 스킬이 무시되었습니다. (이유: {conflict_result.get('conflict_reason', '중복된 스킬')})"
-            
-            # 중복된 스킬들 처리
-            # 1. 정확히 일치하는 스킬과 이름이 같은 다른 스킬들 삭제
-            # 2. 충돌 분석 결과 UPDATE로 전환된 경우, 유사한 다른 스킬들도 삭제
-            skills_to_delete = []
-            
-            if exact_match:
-                exact_name = exact_match.get("name", exact_match.get("skill_name", ""))
-                exact_id = exact_match.get("id", exact_name)
-                
-                for existing_skill in existing_skills:
-                    existing_name = existing_skill.get("name", existing_skill.get("skill_name", ""))
-                    existing_id = existing_skill.get("id", existing_name)
-                    
-                    # 정확히 일치하는 스킬과 이름이 같지만 ID가 다른 경우 (중복)
-                    if (existing_name == exact_name or existing_name == skill_name) and existing_id != exact_id:
-                        skills_to_delete.append(existing_skill)
-            
-            # 충돌 분석에서 UPDATE로 전환된 경우, 유사한 다른 스킬들도 확인
-            if operation == "UPDATE" and skill_id:
-                # 매칭된 스킬의 내용과 유사한 다른 스킬들 찾기
-                matched_skill_content = ""
-                if exact_match:
-                    matched_skill_content = (
-                        exact_match.get("content", "") + " " +
-                        exact_match.get("description", "") + " " +
-                        " ".join(exact_match.get("steps", []))
-                    )
-                
-                # 새 스킬 내용
-                new_skill_content = (
-                    skill_artifact.get("description", "") + " " +
-                    skill_artifact.get("overview", "") + " " +
-                    " ".join(skill_artifact.get("steps", []))
-                )
-                
-                # 유사한 스킬 찾기 (간단한 키워드 기반 비교)
-                for existing_skill in existing_skills:
-                    existing_id = existing_skill.get("id", existing_skill.get("name", ""))
-                    if existing_id == skill_id:
-                        continue
-                    
-                    existing_content = (
-                        existing_skill.get("content", "") + " " +
-                        existing_skill.get("description", "") + " " +
-                        " ".join(existing_skill.get("steps", []))
-                    )
-                    
-                    # 간단한 유사도 체크: 공통 키워드가 많으면 유사한 것으로 간주
-                    new_keywords = set(new_skill_content.lower().split())
-                    existing_keywords = set(existing_content.lower().split())
-                    matched_keywords = set(matched_skill_content.lower().split()) if matched_skill_content else set()
-                    
-                    # 새 스킬과 기존 스킬의 키워드 유사도
-                    if new_keywords and existing_keywords:
-                        similarity = len(new_keywords & existing_keywords) / max(len(new_keywords), len(existing_keywords))
-                        # 유사도가 0.5 이상이면 중복으로 간주
-                        if similarity >= 0.5:
-                            skills_to_delete.append(existing_skill)
-                            log(f"🔍 유사한 스킬 발견 (유사도: {similarity:.2f}): {existing_id}")
-            
-            # 중복 스킬 삭제 (HTTP API로 실제 존재 여부 확인 후 삭제)
-            from core.skill_api_client import check_skill_exists
-            for duplicate_skill in skills_to_delete:
-                duplicate_id = duplicate_skill.get("id", duplicate_skill.get("name", ""))
-                duplicate_name = duplicate_skill.get("name", duplicate_skill.get("skill_name", ""))
-                
-                # HTTP API로 실제 존재 여부 확인 (업로드된 스킬만 삭제 가능)
-                try:
-                    if not check_skill_exists(duplicate_id):
-                        log(f"   ⚠️ 스킬이 HTTP API에 존재하지 않음 (이미 삭제되었거나 기본 내장 스킬): {duplicate_id}")
-                        # 데이터베이스에서만 제거
-                        try:
-                            update_agent_and_tenant_skills(agent_id, duplicate_id, "DELETE")
-                        except Exception as e:
-                            log(f"   ⚠️ 데이터베이스 동기화 실패 ({duplicate_id}): {e}")
-                        continue
-                    
-                    log(f"🗑️ 중복 스킬 삭제: {duplicate_id} (이름: {duplicate_name})")
-                    delete_result = delete_skill(duplicate_id)
-                    log(f"   ✅ 중복 스킬 삭제 완료: {delete_result.get('message', 'Success')}")
-                    # 데이터베이스 동기화
-                    update_agent_and_tenant_skills(agent_id, duplicate_id, "DELETE")
-                except Exception as e:
-                    log(f"   ⚠️ 중복 스킬 삭제 실패 ({duplicate_id}): {e}")
-        
-        # 실제 CRUD 작업 수행
+        if operation == "DELETE":
+            if not skill_id or not str(skill_id).strip():
+                return "❌ DELETE에는 skill_id(기존 스킬 이름)가 필요합니다."
+        elif operation == "UPDATE":
+            if not skill_id or not str(skill_id).strip():
+                return "❌ UPDATE에는 skill_id(기존 스킬 이름)가 필요합니다."
+        elif operation == "CREATE":
+            if not feedback_content or not str(feedback_content).strip():
+                return "❌ CREATE에는 피드백이 필요합니다. (skill-creator가 피드백을 바탕으로 스킬을 생성합니다.)"
+
         await commit_to_skill(
             agent_id=agent_id,
-            skill_artifact=skill_artifact,
+            skill_artifact=None,
             operation=operation,
-            skill_id=skill_id
+            skill_id=skill_id,
+            merge_mode=merge_mode,
+            feedback_content=feedback_content or "",
+            relationship_analysis=relationship_analysis,
         )
-        
+
         if operation == "CREATE":
-            return f"✅ Skill이 성공적으로 저장되었습니다. (이름: {skill_name}, 에이전트: {agent_id})"
-        elif operation == "UPDATE":
-            return f"✅ Skill이 성공적으로 수정되었습니다. (ID: {skill_id}, 이름: {skill_name}, 에이전트: {agent_id})"
-        elif operation == "DELETE":
+            return f"✅ Skill이 성공적으로 저장되었습니다. (skill-creator가 생성, 에이전트: {agent_id})"
+        if operation == "UPDATE":
+            return f"✅ Skill이 성공적으로 수정되었습니다. (ID: {skill_id}, 에이전트: {agent_id})"
+        if operation == "DELETE":
             return f"✅ Skill이 성공적으로 삭제되었습니다. (ID: {skill_id}, 에이전트: {agent_id})"
-        else:
-            return f"⚠️ 알 수 없는 작업: {operation}"
+        return f"⚠️ 알 수 없는 작업: {operation}"
     except Exception as e:
         handle_error("commit_skill_tool", e)
         return f"❌ Skill 저장 실패: {str(e)}"
@@ -618,6 +487,7 @@ async def _search_similar_knowledge_tool(
 ) -> str:
     """
     모든 저장소에서 의미적으로 유사한 지식을 검색합니다.
+    레지스트리를 먼저 조회하고, 없으면 기존 방식으로 계산 후 저장합니다.
     
     Args:
         agent_id: 에이전트 ID
@@ -629,7 +499,13 @@ async def _search_similar_knowledge_tool(
         유사 지식 검색 결과 (포맷된 텍스트)
     """
     try:
-        from core.database import _get_agent_by_id
+        from core.database import (
+            _get_agent_by_id,
+            get_agent_knowledge_list,
+            register_knowledge,
+            update_knowledge_access_time
+        )
+        from utils.logger import log
         
         # 에이전트 정보 조회
         agent_info = _get_agent_by_id(agent_id)
@@ -644,6 +520,7 @@ async def _search_similar_knowledge_tool(
         search_dmn = knowledge_type in ["ALL", "DMN_RULE"]
         search_skill = knowledge_type in ["ALL", "SKILL"]
         
+        # 1단계: 피드백과 직접 유사한 지식 찾기
         # MEMORY 검색
         if search_memory:
             memories = await retrieve_existing_memories(agent_id, content, limit=20)
@@ -653,7 +530,22 @@ async def _search_similar_knowledge_tool(
                 )
                 for item in similar_memories:
                     item["storage_type"] = "MEMORY"
-                results.extend(similar_memories)
+                    results.append(item)
+                    
+                    # 레지스트리에 등록 및 접근 시간 업데이트
+                    try:
+                        register_knowledge(
+                            agent_id=agent_id,
+                            tenant_id=tenant_id,
+                            knowledge_type="MEMORY",
+                            knowledge_id=item.get("id", ""),
+                            knowledge_name=item.get("name", ""),
+                            content_summary=item.get("content_summary", ""),
+                            content=item.get("full_content", "")
+                        )
+                        update_knowledge_access_time(agent_id, "MEMORY", item.get("id", ""))
+                    except Exception as e:
+                        log(f"⚠️ 레지스트리 등록 실패 (무시하고 계속 진행): {e}")
         
         # DMN_RULE 검색
         if search_dmn:
@@ -664,7 +556,21 @@ async def _search_similar_knowledge_tool(
                 )
                 for item in similar_dmn:
                     item["storage_type"] = "DMN_RULE"
-                results.extend(similar_dmn)
+                    results.append(item)
+                    
+                    # 레지스트리에 등록 및 접근 시간 업데이트
+                    try:
+                        register_knowledge(
+                            agent_id=agent_id,
+                            tenant_id=tenant_id,
+                            knowledge_type="DMN_RULE",
+                            knowledge_id=item.get("id", ""),
+                            knowledge_name=item.get("name", ""),
+                            content_summary=item.get("content_summary", "")
+                        )
+                        update_knowledge_access_time(agent_id, "DMN_RULE", item.get("id", ""))
+                    except Exception as e:
+                        log(f"⚠️ 레지스트리 등록 실패 (무시하고 계속 진행): {e}")
         
         # SKILL 검색
         if search_skill:
@@ -678,7 +584,57 @@ async def _search_similar_knowledge_tool(
                 )
                 for item in similar_skills:
                     item["storage_type"] = "SKILL"
-                results.extend(similar_skills)
+                    results.append(item)
+                    
+                    # 레지스트리에 등록 및 접근 시간 업데이트
+                    try:
+                        register_knowledge(
+                            agent_id=agent_id,
+                            tenant_id=tenant_id,
+                            knowledge_type="SKILL",
+                            knowledge_id=item.get("id", ""),
+                            knowledge_name=item.get("name", ""),
+                            content_summary=item.get("content_summary", "")
+                        )
+                        update_knowledge_access_time(agent_id, "SKILL", item.get("id", ""))
+                    except Exception as e:
+                        log(f"⚠️ 레지스트리 등록 실패 (무시하고 계속 진행): {e}")
+        
+        # 2단계: 레지스트리에서 관련 지식 추가 조회 (선택적)
+        # 찾은 지식이 적을 경우 레지스트리에서 유사한 지식 이름으로 검색
+        if len(results) < 5:
+            try:
+                registry_knowledge = get_agent_knowledge_list(
+                    agent_id=agent_id,
+                    knowledge_type=knowledge_type if knowledge_type != "ALL" else None,
+                    limit=50
+                )
+                
+                # 레지스트리의 지식 이름이나 요약에서 피드백 내용과 유사한 것 찾기
+                for reg_item in registry_knowledge:
+                    reg_name = reg_item.get("knowledge_name", "")
+                    reg_summary = reg_item.get("content_summary", "")
+                    
+                    # 간단한 키워드 매칭 (더 정교한 검색은 필요시 추가)
+                    if reg_name and content.lower() in reg_name.lower():
+                        # 이미 결과에 있는지 확인
+                        existing = any(
+                            r.get("storage_type") == reg_item.get("knowledge_type") and
+                            r.get("id") == reg_item.get("knowledge_id")
+                            for r in results
+                        )
+                        if not existing:
+                            results.append({
+                                "id": reg_item.get("knowledge_id", ""),
+                                "name": reg_item.get("knowledge_name", ""),
+                                "storage_type": reg_item.get("knowledge_type", ""),
+                                "similarity_score": 0.6,  # 레지스트리에서 찾은 경우 기본 점수
+                                "relationship": "RELATED",
+                                "relationship_reason": "레지스트리에서 이름 매칭으로 발견",
+                                "from_registry": True
+                            })
+            except Exception as e:
+                log(f"⚠️ 레지스트리 추가 조회 실패 (무시하고 계속 진행): {e}")
         
         if not results:
             return f"""관련된 기존 지식이 없습니다. (검색 임계값: {threshold})
@@ -981,6 +937,19 @@ async def _get_knowledge_detail_tool(
         
         output_lines = [f"📄 {knowledge_type} 상세 조회 결과:\n"]
         
+        if knowledge_type == "AUTO":
+            # AUTO: 순차적으로 조회 시도 (가장 흔한 SKILL → DMN_RULE → MEMORY)
+            for t in ["SKILL", "DMN_RULE", "MEMORY"]:
+                try:
+                    result = await _get_knowledge_detail_tool(agent_id, t, knowledge_id)
+                    # "찾을 수 없습니다"인 경우만 다음 타입으로
+                    if "찾을 수 없습니다" in result:
+                        continue
+                    return result
+                except Exception:
+                    continue
+            return f"❌ ID/이름이 '{knowledge_id}'인 지식을 찾을 수 없습니다. (AUTO 조회)"
+
         if knowledge_type == "MEMORY":
             # 빈 쿼리로 semantic search하면 OpenAI API 오류 발생
             # 대신 DB에서 직접 조회
@@ -1035,7 +1004,8 @@ async def _get_knowledge_detail_tool(
             if not target:
                 return f"❌ ID/이름이 '{knowledge_id}'인 스킬을 찾을 수 없습니다."
             
-            output_lines.append(f"🔑 ID/이름: {target.get('name', target.get('id'))}")
+            skill_name = target.get('name', target.get('id'))
+            output_lines.append(f"🔑 ID/이름: {skill_name}")
             output_lines.append(f"📝 설명: {target.get('description', '')}")
             
             content = target.get("content", "")
@@ -1050,15 +1020,80 @@ async def _get_knowledge_detail_tool(
                 output_lines.append(f"\n📋 단계별 절차 ({len(steps)}단계):")
                 for idx, step in enumerate(steps, start=1):
                     output_lines.append(f"   {idx}. {step}")
+            
+            # 스킬의 모든 파일 내용 조회 (업로드된 스킬인 경우)
+            try:
+                from core.skill_api_client import get_skill_files, check_skill_exists, get_skill_file_content
+                if check_skill_exists(skill_name):
+                    skill_files = get_skill_files(skill_name)
+                    if skill_files:
+                        output_lines.append(f"\n📁 스킬 디렉토리 파일 ({len(skill_files)}개):")
+                        
+                        # 모든 텍스트 파일의 내용 조회
+                        text_files_found = 0
+                        for file_info in skill_files:
+                            file_path = file_info.get("path", "")
+                            file_size = file_info.get("size", 0)
+                            
+                            try:
+                                # 파일 내용 조회 (텍스트 파일만)
+                                file_content_info = get_skill_file_content(skill_name, file_path)
+                                file_type = file_content_info.get("type", "")
+                                file_content = file_content_info.get("content", "")
+                                
+                                if file_type == "text" and file_content:
+                                    text_files_found += 1
+                                    # 파일 확장자에 따라 코드블록 언어 결정
+                                    file_ext = file_path.split(".")[-1].lower() if "." in file_path else ""
+                                    lang_map = {
+                                        "py": "python",
+                                        "md": "markdown",
+                                        "json": "json",
+                                        "yaml": "yaml",
+                                        "yml": "yaml",
+                                        "txt": "text",
+                                        "sh": "bash",
+                                        "js": "javascript",
+                                        "ts": "typescript",
+                                        "html": "html",
+                                        "css": "css",
+                                    }
+                                    lang = lang_map.get(file_ext, "text")
+                                    
+                                    output_lines.append(f"\n📄 {file_path} ({file_size} bytes):")
+                                    output_lines.append(f"```{lang}")
+                                    output_lines.append(file_content)
+                                    output_lines.append("```")
+                                else:
+                                    # 바이너리 파일이거나 내용이 없는 경우
+                                    output_lines.append(f"\n📄 {file_path} ({file_size} bytes, {file_type} file)")
+                            except Exception as e:
+                                # 파일 조회 실패 시 경로만 표시
+                                log(f"   ⚠️ 파일 내용 조회 실패 ({file_path}): {e}")
+                                output_lines.append(f"\n📄 {file_path} ({file_size} bytes, 조회 실패)")
+                        
+                        if text_files_found > 0:
+                            output_lines.append(f"\n💡 총 {text_files_found}개의 텍스트 파일 내용을 확인했습니다.")
+                            output_lines.append("💡 파일을 수정하려면 commit_skill 도구의 additional_files 파라미터에 파일 경로와 수정된 내용을 포함하세요.")
+            except Exception as e:
+                log(f"   ⚠️ 스킬 파일 조회 실패: {e}")
         
         else:
             return f"❌ 지원하지 않는 지식 타입: {knowledge_type}"
         
         output_lines.append("")
         output_lines.append("━" * 50)
-        output_lines.append("🧠 이 내용을 바탕으로 피드백과 비교하여 처리 방법을 결정하세요.")
-        output_lines.append("   - 병합이 필요하면 기존 내용 + 새 내용을 직접 구성하세요.")
-        output_lines.append("   - 수정이 필요하면 변경된 전체 내용을 구성하세요.")
+        if knowledge_type == "SKILL":
+            output_lines.append("🧠 스킬의 모든 파일 내용을 검토하여 피드백과 비교하세요:")
+            output_lines.append("   - 피드백이 어떤 파일과 관련되어 있는가? (SKILL.md, scripts/, references/ 등)")
+            output_lines.append("   - 어떤 파일을 수정해야 하는가?")
+            output_lines.append("   - 새 파일을 추가해야 하는가?")
+            output_lines.append("   - 병합/수정이 필요하면 commit_skill 도구의 additional_files에 파일 경로와 수정된 내용을 포함하세요.")
+            output_lines.append("   - 피드백이 기존 스킬에 통합 가능하면 CREATE보다 UPDATE를 우선 고려하세요.")
+        else:
+            output_lines.append("🧠 이 내용을 바탕으로 피드백과 비교하여 처리 방법을 결정하세요.")
+            output_lines.append("   - 병합이 필요하면 기존 내용 + 새 내용을 직접 구성하세요.")
+            output_lines.append("   - 수정이 필요하면 변경된 전체 내용을 구성하세요.")
         
         return "\n".join(output_lines)
         
@@ -1071,51 +1106,33 @@ async def _get_knowledge_detail_tool(
 # LangChain Tool 생성
 # ============================================================================
 
-def create_react_tools(agent_id: str) -> List[StructuredTool]:
+def create_react_tools(agent_id: str, feedback_content: Optional[str] = None) -> List[StructuredTool]:
     """
     ReAct 에이전트용 도구 목록 생성
     
     Args:
         agent_id: 에이전트 ID (도구에 기본값으로 사용)
+        feedback_content: 원본 피드백 내용 (commit_to_skill의 record_knowledge_history용, 선택)
     
     Returns:
         LangChain Tool 목록
     """
     
-    # agent_id를 클로저로 캡처하는 래퍼 함수들
-    def search_memory_wrapper(query: str, limit: int = 10) -> str:
-        """메모리 검색 도구 (동기 래퍼)"""
-        import asyncio
-        try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-        return loop.run_until_complete(_search_memory_tool(agent_id, query, limit))
+    # agent_id, feedback_content를 클로저로 캡처하는 래퍼 함수들 (완전 async)
+    async def search_memory_wrapper(query: str, limit: int = 10) -> str:
+        """메모리 검색 도구 (async)"""
+        return await _search_memory_tool(agent_id, query, limit)
     
-    def search_dmn_rules_wrapper(search_text: str = "") -> str:
-        """DMN 규칙 검색 도구 (동기 래퍼)"""
-        import asyncio
-        try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-        return loop.run_until_complete(_search_dmn_rules_tool(agent_id, search_text))
+    async def search_dmn_rules_wrapper(search_text: str = "") -> str:
+        """DMN 규칙 검색 도구 (async)"""
+        return await _search_dmn_rules_tool(agent_id, search_text)
     
-    def search_skills_wrapper(search_text: str = "", top_k: int = 10) -> str:
-        """Skills 검색 도구 (동기 래퍼)"""
-        import asyncio
-        try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-        return loop.run_until_complete(_search_skills_tool(agent_id, search_text, top_k))
+    async def search_skills_wrapper(search_text: str = "", top_k: int = 10) -> str:
+        """Skills 검색 도구 (async)"""
+        return await _search_skills_tool(agent_id, search_text, top_k)
     
-    def analyze_conflict_wrapper(new_knowledge_json: str, existing_knowledge_json: str, target_type: str) -> str:
-        """충돌 분석 도구 (동기 래퍼) - JSON 문자열을 파싱하여 딕셔너리로 변환"""
-        import asyncio
+    async def analyze_conflict_wrapper(new_knowledge_json: str, existing_knowledge_json: str, target_type: str) -> str:
+        """충돌 분석 도구 (async) - JSON 문자열을 파싱하여 딕셔너리로 변환"""
         import json
         
         def parse_json_input(input_data):
@@ -1141,79 +1158,98 @@ def create_react_tools(agent_id: str) -> List[StructuredTool]:
             # JSON 문자열을 딕셔너리로 파싱
             new_knowledge = parse_json_input(new_knowledge_json)
             existing_knowledge = parse_json_input(existing_knowledge_json)
-            
-            try:
-                loop = asyncio.get_event_loop()
-            except RuntimeError:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-            return loop.run_until_complete(_analyze_conflict_tool(new_knowledge, existing_knowledge, target_type))
+
+            return await _analyze_conflict_tool(new_knowledge, existing_knowledge, target_type)
         except (json.JSONDecodeError, ValueError) as e:
             return f"❌ JSON 파싱 실패: {str(e)}\n입력된 new_knowledge_json (첫 500자): {str(new_knowledge_json)[:500]}...\n입력된 existing_knowledge_json (첫 500자): {str(existing_knowledge_json)[:500]}..."
         except Exception as e:
             return f"❌ 충돌 분석 실패: {str(e)}"
     
-    def get_knowledge_detail_wrapper(knowledge_type: str, knowledge_id: str = "") -> str:
-        """기존 지식 상세 조회 도구 (동기 래퍼) - kwargs 형식 입력 처리"""
-        import asyncio
+    async def get_knowledge_detail_wrapper(knowledge_type: str, knowledge_id: str = "") -> str:
+        """기존 지식 상세 조회 도구 (async) - kwargs 형식 입력 처리"""
         import re
+        import json
         
         actual_knowledge_type = knowledge_type
         actual_knowledge_id = knowledge_id
         
-        # 에이전트가 kwargs 형식으로 전달한 경우 파싱
-        # 예: knowledge_type="DMN_RULE", knowledge_id="customer_benefit_decision"
+        # ReAct(text) 에이전트는 Action Input(JSON)을 문자열로 넘길 수 있어,
+        # 이 경우 knowledge_type 파라미터에 JSON 문자열이 통째로 들어온다.
         if isinstance(knowledge_type, str):
             input_str = knowledge_type.strip()
-            
-            # kwargs 형식인지 확인
-            if 'knowledge_type=' in input_str or 'knowledge_id=' in input_str:
+
+            # 1) JSON 문자열로 들어온 경우 복구 ({"skill_id": "..."} / {"knowledge_id": "..."} / {"knowledge_type": "...", ...})
+            if input_str.startswith("{") and input_str.endswith("}"):
+                try:
+                    parsed = json.loads(input_str)
+                    if isinstance(parsed, dict):
+                        # skill_id만 주는 실수를 흔히 함 → SKILL로 간주
+                        if not actual_knowledge_id and parsed.get("skill_id"):
+                            actual_knowledge_type = "SKILL"
+                            actual_knowledge_id = str(parsed.get("skill_id"))
+                        # knowledge_id만 준 경우 → AUTO로 조회
+                        if not actual_knowledge_id and parsed.get("knowledge_id"):
+                            actual_knowledge_type = parsed.get("knowledge_type") or "AUTO"
+                            actual_knowledge_id = str(parsed.get("knowledge_id"))
+                        # 정상 케이스
+                        if parsed.get("knowledge_type"):
+                            actual_knowledge_type = str(parsed.get("knowledge_type"))
+                        if parsed.get("knowledge_id"):
+                            actual_knowledge_id = str(parsed.get("knowledge_id"))
+                except Exception:
+                    pass
+
+            # 2) kwargs 형식 문자열인 경우 복구
+            if 'knowledge_type=' in input_str or 'knowledge_id=' in input_str or 'skill_id=' in input_str:
                 log(f"🔧 get_knowledge_detail: kwargs 형식 입력 감지, 파싱 시도...")
                 log(f"   입력값: {input_str}")
-                
+
                 # knowledge_type 추출
                 type_match = re.search(r'knowledge_type\s*=\s*["\']?([^"\'",\s]+)["\']?', input_str)
                 if type_match:
                     actual_knowledge_type = type_match.group(1)
                     log(f"   추출된 knowledge_type: {actual_knowledge_type}")
-                
+
                 # knowledge_id 추출
                 id_match = re.search(r'knowledge_id\s*=\s*["\']?([^"\'",\s]+)["\']?', input_str)
                 if id_match:
                     actual_knowledge_id = id_match.group(1)
                     log(f"   추출된 knowledge_id: {actual_knowledge_id}")
+
+                # skill_id 추출 → SKILL로 간주
+                sid_match = re.search(r'skill_id\s*=\s*["\']?([^"\'",\s]+)["\']?', input_str)
+                if sid_match and not actual_knowledge_id:
+                    actual_knowledge_type = "SKILL"
+                    actual_knowledge_id = sid_match.group(1)
+                    log(f"   추출된 skill_id → knowledge_id: {actual_knowledge_id}")
         
         # knowledge_id가 없으면 에러
         if not actual_knowledge_id:
             return f"❌ knowledge_id가 필요합니다. 입력값: knowledge_type={actual_knowledge_type}"
-        
-        try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-        return loop.run_until_complete(_get_knowledge_detail_tool(agent_id, actual_knowledge_type, actual_knowledge_id))
+
+        # knowledge_type이 비정상/누락이면 AUTO로 복구
+        if not actual_knowledge_type or (isinstance(actual_knowledge_type, str) and actual_knowledge_type.strip() == ""):
+            actual_knowledge_type = "AUTO"
+        actual_knowledge_type = str(actual_knowledge_type).upper().strip()
+        if actual_knowledge_type not in ["MEMORY", "DMN_RULE", "SKILL", "AUTO"]:
+            actual_knowledge_type = "AUTO"
+
+        return await _get_knowledge_detail_tool(agent_id, actual_knowledge_type, actual_knowledge_id)
     
-    def commit_memory_wrapper(content: str, operation: str = "CREATE", memory_id: Optional[str] = None) -> str:
-        """메모리 저장 도구 (동기 래퍼)"""
-        import asyncio
-        try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-        return loop.run_until_complete(_commit_memory_tool(agent_id, content, operation, memory_id))
+    async def commit_memory_wrapper(content: str, operation: str = "CREATE", memory_id: Optional[str] = None) -> str:
+        """메모리 저장 도구 (async)"""
+        return await _commit_memory_tool(agent_id, content, operation, memory_id)
     
-    def commit_dmn_rule_wrapper(dmn_artifact_json: str, operation: str = "CREATE", rule_id: Optional[str] = None, feedback_content: str = "") -> str:
-        """DMN 규칙 저장 도구 (동기 래퍼) - JSON 문자열을 파싱하여 딕셔너리로 변환"""
-        import asyncio
+    async def commit_dmn_rule_wrapper(dmn_artifact_json: str, operation: str = "CREATE", rule_id: Optional[str] = None, feedback_content: str = "", merge_mode: Optional[str] = "REPLACE") -> str:
+        """DMN 규칙 저장 도구 (async) - JSON 문자열을 파싱하여 딕셔너리로 변환"""
         import json
         import re
         
         # 에이전트가 kwargs 형식으로 전달한 경우 파싱
-        # 예: dmn_artifact_json='{"name": "..."}', operation="UPDATE", rule_id="..."
+        # 예: dmn_artifact_json='{"name": "..."}', operation="UPDATE", rule_id="...", merge_mode="EXTEND"
         actual_operation = operation
         actual_rule_id = rule_id
+        actual_merge_mode = merge_mode
         actual_json = dmn_artifact_json
         
         if isinstance(dmn_artifact_json, str):
@@ -1234,6 +1270,12 @@ def create_react_tools(agent_id: str) -> List[StructuredTool]:
                 if rid_match:
                     actual_rule_id = rid_match.group(1)
                     log(f"   추출된 rule_id: {actual_rule_id}")
+                
+                # merge_mode 추출
+                mm_match = re.search(r'merge_mode\s*=\s*["\']?(\w+)["\']?', input_str)
+                if mm_match:
+                    actual_merge_mode = mm_match.group(1)
+                    log(f"   추출된 merge_mode: {actual_merge_mode}")
                 
                 # JSON 부분 추출 (중첩 중괄호 처리를 위한 brace counting)
                 # 먼저 시작 위치 찾기 (따옴표 포함 가능)
@@ -1310,28 +1352,58 @@ def create_react_tools(agent_id: str) -> List[StructuredTool]:
             else:
                 return f"❌ 지원하지 않는 입력 타입: {type(actual_json).__name__}\n입력된 값: {str(actual_json)[:200]}..."
             
-            # rules 배열이 있으면 첫 번째 규칙을 사용하거나, 여러 규칙을 하나로 병합
+            # rules 배열이 있으면 처리
+            # 단, 최상위 레벨의 condition과 action이 이미 있으면 우선 유지
             if "rules" in dmn_artifact and isinstance(dmn_artifact["rules"], list):
                 rules = dmn_artifact["rules"]
                 if len(rules) > 0:
-                    # 첫 번째 규칙의 condition과 action 사용
-                    first_rule = rules[0]
-                    dmn_artifact = {
-                        "name": dmn_artifact.get("name", "피드백 기반 규칙"),
-                        "condition": first_rule.get("condition", ""),
-                        "action": first_rule.get("action", "")
-                    }
-                    # 여러 규칙이 있으면 조건과 액션을 병합
-                    if len(rules) > 1:
-                        conditions = [r.get("condition", "") for r in rules if r.get("condition")]
-                        actions = [r.get("action", "") for r in rules if r.get("action")]
+                    # 최상위 레벨에 condition과 action이 이미 있는지 확인
+                    top_level_condition = dmn_artifact.get("condition", "")
+                    top_level_action = dmn_artifact.get("action", "")
+                    
+                    if top_level_condition and top_level_action:
+                        # 최상위 레벨의 condition과 action이 있으면 유지
+                        # rules 배열은 무시 (이미 최상위에 정의되어 있음)
+                        log(f"ℹ️ 최상위 레벨의 condition/action 사용, rules 배열 무시 (병합 모드: {actual_merge_mode})")
+                        # rules 배열 제거 (병합 시 혼동 방지)
+                        dmn_artifact = {
+                            "name": dmn_artifact.get("name", "피드백 기반 규칙"),
+                            "condition": top_level_condition,
+                            "action": top_level_action
+                        }
+                    else:
+                        # 최상위 레벨에 condition/action이 없으면 rules 배열에서 변환
+                        # rules 배열의 각 항목이 input/output 형식인지 확인
+                        first_rule = rules[0]
+                        
+                        # condition/action 형식인지 input/output 형식인지 확인
+                        if "input" in first_rule or "output" in first_rule:
+                            # input/output 형식이면 변환
+                            conditions = [r.get("input", "") for r in rules if r.get("input")]
+                            actions = [r.get("output", "") for r in rules if r.get("output")]
+                        else:
+                            # condition/action 형식이면 그대로 사용
+                            conditions = [r.get("condition", "") for r in rules if r.get("condition")]
+                            actions = [r.get("action", "") for r in rules if r.get("action")]
+                        
+                        # 조건과 액션 병합
                         if conditions:
-                            # 여러 조건을 OR로 연결
-                            dmn_artifact["condition"] = " 또는 ".join([f"({c})" for c in conditions if c])
+                            if len(conditions) > 1:
+                                # 여러 조건을 OR로 연결
+                                dmn_artifact["condition"] = " 또는 ".join([f"({c})" for c in conditions if c])
+                            else:
+                                dmn_artifact["condition"] = conditions[0]
+                        
                         if actions:
-                            # 여러 액션을 세미콜론으로 연결
-                            dmn_artifact["action"] = "; ".join(actions)
-                    log(f"⚠️ rules 배열에서 변환: {len(rules)}개 규칙을 하나로 병합")
+                            if len(actions) > 1:
+                                # 여러 액션을 세미콜론으로 연결
+                                dmn_artifact["action"] = "; ".join(actions)
+                            else:
+                                dmn_artifact["action"] = actions[0]
+                        
+                        # name은 유지
+                        dmn_artifact["name"] = dmn_artifact.get("name", "피드백 기반 규칙")
+                        log(f"⚠️ rules 배열에서 변환: {len(rules)}개 규칙을 하나로 병합")
                 else:
                     return "❌ rules 배열이 비어있습니다."
             
@@ -1341,112 +1413,153 @@ def create_react_tools(agent_id: str) -> List[StructuredTool]:
             
             # 추출된 operation/rule_id 로깅
             log(f"📋 DMN 규칙 저장 호출: operation={actual_operation}, rule_id={actual_rule_id}")
-            
-            try:
-                loop = asyncio.get_event_loop()
-            except RuntimeError:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-            
-            # ⚠️ 자동 확장 로직 제거: 에이전트가 직접 판단하여 완성된 내용을 전달해야 함
-            # 병합이 필요하면 에이전트가 get_knowledge_detail로 기존 내용을 조회하고 직접 구성
-            return loop.run_until_complete(_commit_dmn_rule_tool(agent_id, dmn_artifact, actual_operation, actual_rule_id, feedback_content))
+
+            # merge_mode에 따라 도구가 안전하게 병합 처리
+            return await _commit_dmn_rule_tool(agent_id, dmn_artifact, actual_operation, actual_rule_id, feedback_content, actual_merge_mode)
         except json.JSONDecodeError as e:
             return f"❌ JSON 파싱 실패: {str(e)}\n입력된 dmn_artifact_json: {actual_json[:200] if isinstance(actual_json, str) else str(actual_json)[:200]}..."
         except Exception as e:
             return f"❌ DMN 규칙 저장 실패: {str(e)}"
     
-    def commit_skill_wrapper(skill_artifact_json: str, operation: str = "CREATE", skill_id: Optional[str] = None) -> str:
-        """Skill 저장 도구 (동기 래퍼) - JSON 문자열을 파싱하여 딕셔너리로 변환"""
-        import asyncio
-        import json
-        
-        try:
-            # 입력 타입에 따라 처리
-            if isinstance(skill_artifact_json, dict):
-                skill_artifact = skill_artifact_json
-            elif isinstance(skill_artifact_json, str):
-                skill_artifact_json = skill_artifact_json.strip()
-                if not skill_artifact_json:
-                    return "❌ skill_artifact_json이 비어있습니다."
-                
-                # 따옴표로 감싸진 문자열인 경우 처리
-                if (skill_artifact_json.startswith("'") and skill_artifact_json.endswith("'")) or \
-                   (skill_artifact_json.startswith('"') and skill_artifact_json.endswith('"')):
-                    skill_artifact_json = skill_artifact_json[1:-1]
-                    skill_artifact_json = skill_artifact_json.replace("\\'", "'").replace('\\"', '"')
-                
-                try:
-                    skill_artifact = json.loads(skill_artifact_json)
-                except json.JSONDecodeError as e:
-                    return f"❌ JSON 파싱 실패: {str(e)}\n입력된 skill_artifact_json (첫 500자): {skill_artifact_json[:500]}..."
-            else:
-                return f"❌ 지원하지 않는 입력 타입: {type(skill_artifact_json).__name__}"
-            
+    async def commit_skill_wrapper(
+        operation: str = "CREATE",
+        skill_id: Optional[str] = None,
+        merge_mode: str = "MERGE",
+        relationship_analysis: Optional[str] = None,
+    ) -> str:
+        """Skill 저장 도구 (async). 스킬 내용(SKILL.md, steps, additional_files)은 skill-creator가 생성. feedback_content는 자동 전달."""
+        import json as _json
+        actual_op = operation
+        actual_sid = skill_id
+        actual_mm = merge_mode or "MERGE"
+        actual_ra = relationship_analysis
+        # ReAct이 Action Input에 {"operation":"UPDATE","skill_id":"x",...} 전체를 넘기면, 첫 파라미터(operation)에 그대로 들어올 수 있음. 언랩.
+        def _unwrap(obj: dict) -> None:
+            nonlocal actual_op, actual_sid, actual_mm, actual_ra
+            if isinstance(obj, dict):
+                if obj.get("operation") is not None:
+                    actual_op = str(obj.get("operation", "CREATE")).strip().upper()
+                if obj.get("skill_id") is not None:
+                    actual_sid = obj.get("skill_id") or actual_sid
+                if obj.get("merge_mode") is not None:
+                    actual_mm = str(obj.get("merge_mode", "MERGE")).strip()
+                if obj.get("relationship_analysis") is not None:
+                    actual_ra = (obj.get("relationship_analysis") or "").strip() or None
+
+        if isinstance(operation, dict):
+            _unwrap(operation)
+            log(f"🔧 commit_to_skill: dict 언랩 → operation={actual_op}, skill_id={actual_sid}, merge_mode={actual_mm}")
+        elif isinstance(operation, str) and operation.strip().startswith("{"):
             try:
-                loop = asyncio.get_event_loop()
-            except RuntimeError:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-            return loop.run_until_complete(_commit_skill_tool(agent_id, skill_artifact, operation, skill_id))
-        except json.JSONDecodeError as e:
-            return f"❌ JSON 파싱 실패: {str(e)}\n입력된 skill_artifact_json: {skill_artifact_json[:200]}..."
+                o = _json.loads(operation)
+                if isinstance(o, dict):
+                    _unwrap(o)
+                    log(f"🔧 commit_to_skill: JSON 문자열 언랩 → operation={actual_op}, skill_id={actual_sid}, merge_mode={actual_mm}")
+            except _json.JSONDecodeError:
+                pass
+        if isinstance(actual_op, str) and actual_op.upper() not in ("CREATE", "UPDATE", "DELETE"):
+            s = str(actual_op).strip()
+            if s.startswith("{"):
+                try:
+                    o = _json.loads(s)
+                    if isinstance(o, dict):
+                        _unwrap(o)
+                        log(f"🔧 commit_to_skill: operation 필드 JSON 재파싱 → operation={actual_op}, skill_id={actual_sid}")
+                except _json.JSONDecodeError:
+                    pass
+        try:
+            log(f"📋 commit_to_skill: operation={actual_op}, skill_id={actual_sid}, merge_mode={actual_mm}")
+            return await _commit_skill_tool(
+                agent_id=agent_id,
+                operation=actual_op,
+                skill_id=actual_sid,
+                merge_mode=actual_mm,
+                feedback_content=feedback_content or "",
+                relationship_analysis=actual_ra,
+            )
         except Exception as e:
             return f"❌ Skill 저장 실패: {str(e)}"
     
     # 새로운 통합 도구 래퍼 함수들
-    def search_similar_knowledge_wrapper(content: str, knowledge_type: str = "ALL", threshold: float = 0.7) -> str:
-        """유사 지식 검색 도구 (동기 래퍼)"""
-        import asyncio
-        try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-        return loop.run_until_complete(_search_similar_knowledge_tool(agent_id, content, knowledge_type, threshold))
+    async def search_similar_knowledge_wrapper(content: str, knowledge_type: str = "ALL", threshold: float = 0.7) -> str:
+        """유사 지식 검색 도구 (async)"""
+        return await _search_similar_knowledge_tool(agent_id, content, knowledge_type, threshold)
     
-    def check_duplicate_wrapper(content: str, knowledge_type: str, candidate_id: Optional[str] = None) -> str:
-        """중복 확인 도구 (동기 래퍼)"""
-        import asyncio
-        try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-        return loop.run_until_complete(_check_duplicate_tool(agent_id, content, knowledge_type, candidate_id))
+    async def check_duplicate_wrapper(content: str, knowledge_type: str, candidate_id: Optional[str] = None) -> str:
+        """중복 확인 도구 (async)"""
+        return await _check_duplicate_tool(agent_id, content, knowledge_type, candidate_id)
     
-    def determine_operation_wrapper(content: str, knowledge_type: str) -> str:
-        """작업 결정 도구 (동기 래퍼)"""
-        import asyncio
-        try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-        return loop.run_until_complete(_determine_operation_tool(agent_id, content, knowledge_type))
+    async def determine_operation_wrapper(content: str, knowledge_type: str = "") -> str:
+        """작업 결정 도구 (async) - kwargs 형식 입력 처리"""
+        import re
+        
+        actual_content = content
+        actual_knowledge_type = knowledge_type
+        
+        # 에이전트가 kwargs 형식으로 전달한 경우 파싱
+        # 예: content="some content", knowledge_type="DMN"
+        # 또는 content='content=...knowledge_type='DMN''
+        if isinstance(content, str):
+            input_str = content.strip()
+            
+            # kwargs 형식인지 확인 (content= 또는 knowledge_type= 포함)
+            if 'knowledge_type=' in input_str or (not knowledge_type and ('content=' in input_str or 'knowledge_type=' in input_str)):
+                log(f"🔧 determine_operation: kwargs 형식 입력 감지, 파싱 시도...")
+                log(f"   입력값: {input_str}")
+                
+                # content 추출
+                # content='...' 또는 content="..." 형태
+                content_match = re.search(r'content\s*=\s*["\']([^"\']*)["\']', input_str)
+                if content_match:
+                    actual_content = content_match.group(1)
+                    log(f"   추출된 content: {actual_content[:100]}...")
+                else:
+                    # content=...knowledge_type= 형태에서 content 부분만 추출
+                    content_end = input_str.find('knowledge_type=')
+                    if content_end > 0:
+                        content_part = input_str[:content_end].strip()
+                        if content_part.startswith('content='):
+                            actual_content = content_part[8:].strip().strip("'\"")
+                            log(f"   추출된 content (후처리): {actual_content[:100]}...")
+                
+                # knowledge_type 추출
+                type_match = re.search(r'knowledge_type\s*=\s*["\']?([^"\'",\s]+)["\']?', input_str)
+                if type_match:
+                    actual_knowledge_type = type_match.group(1)
+                    log(f"   추출된 knowledge_type: {actual_knowledge_type}")
+        
+        # knowledge_type이 없으면 에러
+        if not actual_knowledge_type:
+            return f"❌ knowledge_type이 필요합니다. 입력값: content={actual_content[:100]}..."
+        
+        # content가 비어있으면 에러
+        if not actual_content:
+            return f"❌ content가 필요합니다. 입력값: knowledge_type={actual_knowledge_type}"
+
+        return await _determine_operation_tool(agent_id, actual_content, actual_knowledge_type)
     
     tools = [
         StructuredTool.from_function(
-            func=search_memory_wrapper,
+            coroutine=search_memory_wrapper,
             name="search_memory",
             description="mem0에서 관련 메모리를 검색합니다. 피드백 내용과 유사한 기존 지식을 찾을 때 사용합니다.",
             args_schema=SearchMemoryInput
         ),
         StructuredTool.from_function(
-            func=search_dmn_rules_wrapper,
+            coroutine=search_dmn_rules_wrapper,
             name="search_dmn_rules",
             description="DMN 규칙을 검색합니다. 조건-결과 형태의 비즈니스 판단 규칙을 찾을 때 사용합니다.",
             args_schema=SearchDmnRulesInput
         ),
         StructuredTool.from_function(
-            func=search_skills_wrapper,
+            coroutine=search_skills_wrapper,
             name="search_skills",
             description="Skills를 검색합니다. 반복 가능한 절차나 작업 순서를 찾을 때 사용합니다.",
             args_schema=SearchSkillsInput
         ),
         # 새로운 통합 도구들 (의미적 유사도 기반)
         StructuredTool.from_function(
-            func=search_similar_knowledge_wrapper,
+            coroutine=search_similar_knowledge_wrapper,
             name="search_similar_knowledge",
             description="""모든 저장소에서 의미적으로 유사한 기존 지식을 검색하고 관계를 분석합니다.
 피드백을 저장하기 전에 반드시 이 도구를 먼저 사용하세요.
@@ -1455,14 +1568,14 @@ def create_react_tools(agent_id: str) -> List[StructuredTool]:
             args_schema=SearchSimilarKnowledgeInput
         ),
         StructuredTool.from_function(
-            func=check_duplicate_wrapper,
+            coroutine=check_duplicate_wrapper,
             name="check_duplicate",
             description="""특정 지식이 기존 지식과 중복인지 상세 확인합니다.
 search_similar_knowledge로 유사한 지식을 찾은 후, 정확한 중복 여부를 확인할 때 사용합니다.""",
             args_schema=CheckDuplicateInput
         ),
         StructuredTool.from_function(
-            func=determine_operation_wrapper,
+            coroutine=determine_operation_wrapper,
             name="determine_operation",
             description="""새 지식과 기존 지식의 관계를 분석하여 정보를 제공합니다.
 관계 유형(DUPLICATE, EXTENDS, REFINES, CONFLICTS 등)과 상세 분석 결과를 반환합니다.
@@ -1470,7 +1583,7 @@ search_similar_knowledge로 유사한 지식을 찾은 후, 정확한 중복 여
             args_schema=DetermineOperationInput
         ),
         StructuredTool.from_function(
-            func=get_knowledge_detail_wrapper,
+            coroutine=get_knowledge_detail_wrapper,
             name="get_knowledge_detail",
             description="""기존 지식의 전체 상세 내용을 조회합니다.
 기존 지식과 새 피드백을 직접 비교하여 병합/수정 방법을 결정할 때 사용합니다.
@@ -1479,13 +1592,13 @@ DMN 규칙의 경우 전체 XML을, SKILL의 경우 전체 steps를 반환합니
             args_schema=GetKnowledgeDetailInput
         ),
         StructuredTool.from_function(
-            func=commit_memory_wrapper,
+            coroutine=commit_memory_wrapper,
             name="commit_to_memory",
             description="mem0에 메모리를 저장/수정/삭제합니다. 지침, 선호도, 맥락 정보를 저장할 때 사용합니다.",
             args_schema=CommitMemoryInput
         ),
         StructuredTool.from_function(
-            func=commit_dmn_rule_wrapper,
+            coroutine=commit_dmn_rule_wrapper,
             name="commit_to_dmn_rule",
             description="""DMN 규칙을 저장/수정/삭제합니다.
 
@@ -1494,14 +1607,25 @@ DMN 규칙의 경우 전체 XML을, SKILL의 경우 전체 steps를 반환합니
 - UPDATE: 기존 규칙 수정. 반드시 rule_id 필수!
 - DELETE: 기존 규칙 삭제. 반드시 rule_id 필수!
 
-예시 (UPDATE): dmn_artifact_json='{"name": "규칙명", "condition": "조건", "action": "결과"}', operation="UPDATE", rule_id="기존_규칙_ID"
+merge_mode 파라미터 (UPDATE 시 중요):
+- REPLACE (기본값): 완전 대체. 기존 구조 변경 가능. 에이전트가 전달한 내용이 최종 완성본.
+- EXTEND: 기존 규칙 보존 + 새 규칙 추가. 도구가 자동으로 기존 XML 조회 및 병합.
+- REFINE: 기존 규칙 참조 후 일부 수정 (현재는 REPLACE와 동일하게 처리).
+
+관계 유형 → merge_mode 매핑:
+- EXTENDS 관계 → merge_mode="EXTEND" (권장!)
+- REFINES 관계 → merge_mode="REFINE"
+- SUPERSEDES 관계 → merge_mode="REPLACE"
+
+예시 (UPDATE + EXTEND): dmn_artifact_json='{"name": "규칙명", "condition": "조건", "action": "결과"}', operation="UPDATE", rule_id="기존_규칙_ID", merge_mode="EXTEND"
+예시 (UPDATE + REPLACE): dmn_artifact_json='{"name": "규칙명", "condition": "조건", "action": "결과"}', operation="UPDATE", rule_id="기존_규칙_ID", merge_mode="REPLACE"
 예시 (CREATE): dmn_artifact_json='{"name": "규칙명", "condition": "조건", "action": "결과"}'""",
             args_schema=CommitDmnRuleInput
         ),
         StructuredTool.from_function(
-            func=commit_skill_wrapper,
+            coroutine=commit_skill_wrapper,
             name="commit_to_skill",
-            description="Skill을 저장/수정/삭제합니다. 반복 가능한 절차나 작업 순서를 저장할 때 사용합니다. skill_artifact_json은 JSON 문자열 형식으로 전달해야 합니다 (예: '{\"name\": \"스킬 이름\", \"steps\": [\"1단계\", \"2단계\", ...]}').",
+            description="Skill을 저장/수정/삭제합니다. **ReAct은 저장소(SKILL)·기존과의 관계(operation, skill_id)만 판단합니다.** 스킬 내용(SKILL.md, steps, additional_files)은 skill-creator가 생성. 관련 스킬이 있으면 operation=UPDATE, skill_id=기존스킬이름. 없으면 operation=CREATE, skill_id 생략. DELETE 시 skill_id 필수. **search_similar_knowledge 결과가 있으면 relationship_analysis에 그대로 전달**하면 EXTENDS/COMPLEMENTS 시 기존 내용 보존에 활용됩니다.",
             args_schema=CommitSkillInput
         ),
     ]

@@ -17,4 +17,3 @@ vecs>=0.1.0
 pytest>=8.0.0
 pytest-asyncio>=0.21.0
 mem0ai>=0.1.94
-process-gpt-llm-factory==1.0.2
