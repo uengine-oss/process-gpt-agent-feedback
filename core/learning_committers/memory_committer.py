@@ -3,6 +3,7 @@ MEMORY 커밋 모듈
 mem0에 저장하는 로직
 """
 
+import json
 import os
 from datetime import datetime
 from typing import Optional
@@ -50,6 +51,30 @@ def _get_memory_instance() -> Memory:
     return Memory.from_config(config_dict=config)
 
 
+def _extract_memory_content(content: str) -> str:
+    """
+    content가 JSON 문자열이면 저장할 문장만 추출, 아니면 그대로 반환.
+    - 'memory' 또는 'content' 키 값만 사용 (메모리 본문만 저장).
+    - 예: '{"operation": "CREATE", "memory": "..."}' 또는
+          '{"memory_id": "...", "content": "명확하고 공손한 소통을 선호한다", "operation": "CREATE"}'
+      -> "명확하고 공손한 소통을 선호한다"
+    """
+    if not content or not content.strip():
+        return content
+    text = content.strip()
+    if text.startswith("{") and text.endswith("}"):
+        try:
+            data = json.loads(content)
+            if isinstance(data, dict):
+                # memory 우선, 없으면 content (저장 결과 형식 대응)
+                value = data.get("memory") or data.get("content")
+                if value is not None and isinstance(value, str):
+                    return value
+        except (json.JSONDecodeError, TypeError):
+            pass
+    return content
+
+
 async def commit_to_memory(agent_id: str, content: str, source_type: str = "feedback", operation: str = "CREATE", memory_id: str = None) -> Optional[str]:
     """
     mem0에 CRUD 작업 수행
@@ -66,7 +91,8 @@ async def commit_to_memory(agent_id: str, content: str, source_type: str = "feed
     """
     try:
         memory = _get_memory_instance()
-        
+        content = _extract_memory_content(content)
+
         if operation == "DELETE":
             if not memory_id:
                 log(f"⚠️ DELETE 작업인데 memory_id가 없음")

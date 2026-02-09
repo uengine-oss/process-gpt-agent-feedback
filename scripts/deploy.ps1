@@ -4,7 +4,7 @@
 # Usage:
 #   .\scripts\deploy.ps1              # build only
 #   .\scripts\deploy.ps1 -Push        # build + push to GHCR (requires: docker login ghcr.io)
-#   .\scripts\deploy.ps1 -Apply       # build + kubectl apply -f k8s/deployment.yaml
+#   .\scripts\deploy.ps1 -Apply       # build + kubectl apply -f k8s/service.yaml, k8s/deployment.yaml
 #   .\scripts\deploy.ps1 -Push -Apply # build + push + apply
 
 param(
@@ -29,7 +29,9 @@ if ($Push) {
 }
 
 if ($Apply) {
-    Write-Host "==> Applying k8s/deployment.yaml" -ForegroundColor Cyan
+    Write-Host "==> Applying k8s/service.yaml and k8s/deployment.yaml" -ForegroundColor Cyan
+    kubectl apply -f k8s/service.yaml
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     kubectl apply -f k8s/deployment.yaml
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 }

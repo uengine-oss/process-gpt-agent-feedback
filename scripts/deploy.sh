@@ -5,7 +5,7 @@
 # Usage:
 #   ./scripts/deploy.sh              # build only
 #   ./scripts/deploy.sh --push       # build + push to GHCR (requires: docker login ghcr.io)
-#   ./scripts/deploy.sh --apply      # build + kubectl apply -f k8s/deployment.yaml
+#   ./scripts/deploy.sh --apply      # build + kubectl apply -f k8s/service.yaml, k8s/deployment.yaml
 #   ./scripts/deploy.sh --push --apply
 
 set -e
@@ -23,7 +23,8 @@ for arg in "$@"; do
       docker push "$IMAGE"
       ;;
     --apply)
-      echo "==> Applying k8s/deployment.yaml"
+      echo "==> Applying k8s/service.yaml and k8s/deployment.yaml"
+      kubectl apply -f k8s/service.yaml
       kubectl apply -f k8s/deployment.yaml
       ;;
   esac

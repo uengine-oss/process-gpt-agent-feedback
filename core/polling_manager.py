@@ -9,9 +9,11 @@ from core.database import (
     _get_agent_by_id,
     update_feedback_status,
     fetch_events_by_todo_id,
+    fetch_agents_needing_setup,
+    insert_agent_knowledge_setup_log,
 )
 from core.feedback_processor import match_feedback_to_agents
-from core.react_agent import process_feedback_with_react
+from core.react_agent import process_feedback_with_react, process_agent_knowledge_setup_with_react
 
 def initialize_connections():
     """데이터베이스 연결 초기화"""
@@ -226,6 +228,45 @@ async def process_feedback_task(row: Dict):
         # 에러를 다시 발생시키지 않음 (폴링이 계속되도록)
 
 # ============================================================================
+# 에이전트 초기 지식 셋팅 처리
+# ============================================================================
+
+async def process_agent_setup_task(agent_info: Dict):
+    """에이전트 초기 지식 셋팅 처리 (MEMORY, DMN_RULE, SKILL 생성)"""
+    agent_id = agent_info.get('id')
+    agent_name = agent_info.get('name') or agent_info.get('username', 'Unknown')
+    goal = agent_info.get('goal')
+    persona = agent_info.get('persona')
+
+    if not agent_id:
+        log("⚠️ 에이전트 ID가 없어 초기 지식 셋팅 건너뜀")
+        return
+    if not goal:
+        log(f"⚠️ 에이전트 {agent_name}에 goal이 없어 초기 지식 셋팅 건너뜀")
+        insert_agent_knowledge_setup_log(agent_id, agent_info.get('tenant_id'), status='FAILED')
+        return
+
+    try:
+        log(f"🤖 에이전트 초기 지식 셋팅 시작: {agent_name} (agent_id={agent_id})")
+        result = await process_agent_knowledge_setup_with_react(
+            agent_id=str(agent_id),
+            agent_info=agent_info,
+            goal=goal,
+            persona=persona,
+        )
+        status = 'FAILED' if result.get('error') else 'DONE'
+        insert_agent_knowledge_setup_log(agent_id, agent_info.get('tenant_id'), status=status)
+        if result.get('error'):
+            log(f"⚠️ 에이전트 초기 지식 셋팅 실패 (로그 기록됨): {result.get('error')[:200]}...")
+        else:
+            log(f"✅ 에이전트 초기 지식 셋팅 완료: {agent_name}")
+    except Exception as e:
+        log(f"⚠️ 에이전트 초기 지식 셋팅 중 예외 (로그 기록함): {str(e)[:200]}...")
+        handle_error("에이전트초기지식셋팅", e)
+        insert_agent_knowledge_setup_log(agent_id, agent_info.get('tenant_id'), status='FAILED')
+
+
+# ============================================================================
 # 폴링 실행
 # ============================================================================
 
@@ -235,12 +276,17 @@ async def start_feedback_polling(interval: int = 7):
     
     while True:
         try:
+            # 1. 피드백 작업 처리
             row = await fetch_feedback_task()
             if row:
                 await process_feedback_task(row)
-            else:
-                # 작업이 없으면 잠시 대기 후 계속
-                log(f"처리할 피드백 작업이 없음 (대기 중...)")
+
+            # 2. 에이전트 초기 지식 셋팅 대상 처리 (한 번에 1건)
+            agents = await fetch_agents_needing_setup(limit=1)
+            if agents:
+                await process_agent_setup_task(agents[0])
+            elif not row:
+                log(f"처리할 피드백/에이전트 셋팅 작업이 없음 (대기 중...)")
                 
         except KeyboardInterrupt:
             # Ctrl+C 등으로 중단된 경우

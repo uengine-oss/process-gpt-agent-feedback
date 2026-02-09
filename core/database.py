@@ -157,6 +157,48 @@ def get_all_agents() -> List[Dict[str, Any]]:
 
 
 # ============================================================================
+# 에이전트 초기 지식 셋팅 로그
+# ============================================================================
+
+async def fetch_agents_needing_setup(limit: int = 1) -> List[Dict[str, Any]]:
+    """
+    초기 지식 셋팅이 아직 되지 않은 에이전트 조회.
+    users에서 is_agent=true, agent_type='agent', goal 있음 & agent_knowledge_setup_log에 없음.
+    """
+    try:
+        supabase = get_db_client()
+        resp = supabase.rpc('agent_needing_knowledge_setup', {'p_limit': limit}).execute()
+        rows = resp.data or []
+        agents = []
+        for agent in rows:
+            agent['name'] = agent.get('username', '')
+            agents.append(agent)
+        return agents
+    except Exception as e:
+        handle_error("에이전트셋팅대상조회", e)
+        return []
+
+
+def insert_agent_knowledge_setup_log(
+    agent_id: str,
+    tenant_id: Optional[str] = None,
+    status: str = 'DONE'
+) -> bool:
+    """에이전트 초기 지식 셋팅 완료 로그 INSERT"""
+    try:
+        supabase = get_db_client()
+        supabase.table('agent_knowledge_setup_log').insert({
+            'agent_id': agent_id,
+            'tenant_id': tenant_id,
+            'status': status
+        }).execute()
+        return True
+    except Exception as e:
+        handle_error("에이전트셋팅로그기록", e)
+        return False
+
+
+# ============================================================================
 # 스킬 동기화 (users / tenants 테이블)
 # ============================================================================
 
@@ -247,6 +289,29 @@ def update_agent_and_tenant_skills(agent_id: str, skill_name: str, operation: st
     ).eq("id", tenant_id).execute()
 
     log(f"tenants.skills 업데이트 완료: tenant_id={tenant_id}, skills={tenant_skills_list}")
+
+    # 4) agent_skills 테이블 동기화 (user_id, tenant_id, skill_name)
+    if tenant_id:
+        try:
+            if operation_upper == "CREATE":
+                supabase.table("agent_skills").upsert(
+                    {"user_id": agent_id, "tenant_id": tenant_id, "skill_name": skill_name},
+                    on_conflict="user_id,tenant_id,skill_name",
+                ).execute()
+                log(f"agent_skills INSERT 완료: agent_id={agent_id}, skill_name={skill_name}")
+            elif operation_upper == "DELETE":
+                (
+                    supabase.table("agent_skills")
+                    .delete()
+                    .eq("user_id", agent_id)
+                    .eq("tenant_id", tenant_id)
+                    .eq("skill_name", skill_name)
+                    .execute()
+                )
+                log(f"agent_skills DELETE 완료: agent_id={agent_id}, skill_name={skill_name}")
+        except Exception as e:
+            log(f"⚠️ agent_skills 동기화 실패 (무시하고 계속 진행): {e}")
+            handle_error("agent_skills동기화", e)
 
 
 # ============================================================================
