@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 from typing import Dict, List, Any, Optional
 from utils.logger import log, handle_error
@@ -52,7 +53,6 @@ async def get_agents_info(user_ids: str, assignees: Optional[Any] = None) -> Lis
     # 2. user_id로 에이전트를 찾지 못한 경우, assignees에서 찾기
     if not agent_list and assignees:
         try:
-            import json
             # assignees가 문자열인 경우 JSON 파싱
             if isinstance(assignees, str):
                 assignees_data = json.loads(assignees)
@@ -88,8 +88,39 @@ async def process_feedback_task(row: Dict):
     todo_id = row['id']
     user_ids = row.get('user_id', '')
     assignees = row.get('assignees', None)  # assignees 컬럼 추가
-    feedback = row.get('feedback', '')
+    feedback_raw = row.get('feedback', '')
     description = row.get('description', '')  # 작업지시사항 추가
+    
+    # feedback이 배열인 경우 최신순으로 정렬하여 가장 최근 피드백만 가져오기
+    feedback = ''
+    if isinstance(feedback_raw, list):
+        # 배열인 경우: time 기준으로 최신순 정렬 후 가장 최근 피드백만 사용
+        try:
+            if len(feedback_raw) > 0:
+                # time 기준으로 내림차순 정렬 (최신이 먼저)
+                sorted_feedback = sorted(
+                    feedback_raw,
+                    key=lambda x: x.get('time', ''),
+                    reverse=True
+                )
+                # 가장 최근 피드백의 content만 사용
+                latest_feedback = sorted_feedback[0]
+                if isinstance(latest_feedback, dict):
+                    feedback = latest_feedback.get('content', '')
+                    if not feedback:
+                        log(f"⚠️ 최신 피드백의 content가 비어있음: {latest_feedback}")
+                else:
+                    feedback = str(latest_feedback)
+        except Exception as e:
+            log(f"⚠️ 피드백 배열 처리 중 에러 발생: {str(e)[:200]}...")
+            # 에러 발생 시 빈 문자열로 처리
+            feedback = ''
+    elif isinstance(feedback_raw, str):
+        # 이미 문자열인 경우 그대로 사용
+        feedback = feedback_raw
+    elif feedback_raw:
+        # 다른 타입인 경우 문자열로 변환
+        feedback = str(feedback_raw)
     
     try:
         # 피드백 처리 시작 - 상태를 PROCESSING으로 변경

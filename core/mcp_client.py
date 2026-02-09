@@ -10,7 +10,6 @@ import sys
 import traceback
 from types import ModuleType
 from typing import List, Optional, Any, TypedDict, Literal, NotRequired
-
 from dotenv import load_dotenv
 from utils.logger import log, handle_error
 
@@ -98,7 +97,7 @@ except Exception:
 
 # langchain_mcp_adapters 및 그 하위 의존성이 없을 수 있으므로 안전하게 로드한다.
 try:  # pragma: no cover - 환경에 따라 분기
-    from langchain_mcp_adapters.client import MultiServerMCPClient, load_mcp_tools  # type: ignore
+    from langchain_mcp_adapters.client import MultiServerMCPClient  # type: ignore
     _MCP_LIB_AVAILABLE = True
 except Exception as e:
     # 일부 환경에서는 langchain_mcp_adapters 자체나 내부에서 참조하는 langchain_core 가
@@ -108,10 +107,6 @@ except Exception as e:
     log(f"   상세 정보: {str(e)}")
     log(f"   Traceback:\n{''.join(traceback.format_exception(type(e), e, e.__traceback__))}")
     MultiServerMCPClient = Any  # type: ignore
-
-    def load_mcp_tools(*args, **kwargs):  # type: ignore[override]
-        raise RuntimeError("langchain_mcp_adapters 가 설치되지 않아 MCP 도구를 로드할 수 없습니다.")
-
     _MCP_LIB_AVAILABLE = False
 
 load_dotenv()
@@ -151,26 +146,40 @@ def get_mcp_client() -> Optional[MultiServerMCPClient]:
     if _mcp_client is None:
         try:
             log(f"🔌 MCP 클라이언트 초기화: server_name={MCP_SERVER_NAME}, url={MCP_SERVER_URL}")
-            # URL에서 transport 타입 자동 감지
+            # URL에서 transport 타입 자동 감지 (streamable-http는 /mcp, transport="http")
             transport = "http"
             if MCP_SERVER_URL.startswith("ws://") or MCP_SERVER_URL.startswith("wss://"):
                 transport = "websocket"
             elif MCP_SERVER_URL.endswith("/sse"):
                 transport = "sse"
-            
-            connections = {
-                MCP_SERVER_NAME: {
-                    "url": MCP_SERVER_URL,
-                    "transport": transport,
-                }
-            }
+
+            # streamable-http(/mcp)용: HTTP/2 끔, keepalive 끔 (K8s 내부에서 421 등 완화)
+            # 421이 계속 나면 claude-skills 쪽 TrustedHostMiddleware/allowed_hosts 에
+            # claude-skills, claude-skills:8765, claude-skills.<ns>.svc.cluster.local 등 포함 여부 확인
+            def _httpx_client_factory_no_http2(**kwargs):
+                import httpx
+                kwargs.pop("http2", None)
+                kwargs.pop("limits", None)
+                return httpx.AsyncClient(
+                    http2=False,
+                    limits=httpx.Limits(max_keepalive_connections=0),
+                    **kwargs,
+                )
+
+            def _conn(url: str, t: str) -> dict:
+                c: dict = {"url": url, "transport": t}
+                if t == "http":
+                    c["httpx_client_factory"] = _httpx_client_factory_no_http2
+                return c
+
+            connections = {MCP_SERVER_NAME: _conn(MCP_SERVER_URL, transport)}
             if COMPUTER_USE_MCP_URL:
                 cu_transport = "http"
                 if COMPUTER_USE_MCP_URL.startswith("ws://") or COMPUTER_USE_MCP_URL.startswith("wss://"):
                     cu_transport = "websocket"
                 elif COMPUTER_USE_MCP_URL.endswith("/sse"):
                     cu_transport = "sse"
-                connections["computer-use"] = {"url": COMPUTER_USE_MCP_URL, "transport": cu_transport}
+                connections["computer-use"] = _conn(COMPUTER_USE_MCP_URL, cu_transport)
                 log(f"   computer-use MCP 추가: url={COMPUTER_USE_MCP_URL[:50]}...")
             
             _mcp_client = MultiServerMCPClient(connections=connections)

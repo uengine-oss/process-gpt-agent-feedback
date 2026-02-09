@@ -407,9 +407,87 @@ async def _commit_dmn_rule_tool(
         작업 결과 메시지
     """
     try:
+        # dmn_artifact를 완전히 정규화하는 함수 (재귀적으로 condition/action 추출)
+        def normalize_dmn_artifact(obj):
+            """dmn_artifact를 정규화하여 condition, action, name을 확실히 추출"""
+            if not isinstance(obj, dict):
+                return obj
+            
+            # 이미 condition과 action이 최상위에 있으면 그대로 사용
+            if "condition" in obj and "action" in obj:
+                condition = obj.get("condition", "")
+                action = obj.get("action", "")
+                if condition and action and isinstance(condition, str) and condition.strip() and isinstance(action, str) and action.strip():
+                    return {
+                        # 이름이 없으면 나중 단계에서 안전하게 기본값을 적용
+                        "name": obj.get("name"),
+                        "condition": condition,
+                        "action": action
+                    }
+            
+            # 중첩된 dmn_artifact_json에서 찾기
+            if "dmn_artifact_json" in obj:
+                nested = normalize_dmn_artifact(obj["dmn_artifact_json"])
+                if isinstance(nested, dict) and "condition" in nested and "action" in nested:
+                    return nested
+            
+            # rules 배열에서 찾기
+            if "rules" in obj and isinstance(obj.get("rules"), list):
+                rules = obj["rules"]
+                if len(rules) > 0:
+                    first_rule = rules[0] if isinstance(rules[0], dict) else {}
+                    condition = first_rule.get("condition") or first_rule.get("input", "")
+                    action = first_rule.get("action") or first_rule.get("output", "")
+                    if condition and action:
+                        # 여러 규칙이 있으면 병합
+                        if len(rules) > 1:
+                            conditions = []
+                            actions = []
+                            for r in rules:
+                                if isinstance(r, dict):
+                                    c = r.get("condition") or r.get("input", "")
+                                    a = r.get("action") or r.get("output", "")
+                                    if c:
+                                        conditions.append(c)
+                                    if a:
+                                        actions.append(a)
+                            if conditions and actions:
+                                merged_condition = " 또는 ".join([f"({c})" for c in conditions if c])
+                                merged_action = "; ".join([a for a in actions if a])
+                                return {
+                                    "name": obj.get("name"),
+                                    "condition": merged_condition,
+                                    "action": merged_action
+                                }
+                        if condition and action:
+                            return {
+                                "name": obj.get("name"),
+                                "condition": condition,
+                                "action": action
+                            }
+            
+            # 그 외의 경우 원본 반환 (하지만 condition/action이 없으면 문제)
+            return obj
+        
+        # dmn_artifact 정규화
+        normalized_artifact = normalize_dmn_artifact(dmn_artifact)
+        
+        # 정규화 후에도 condition과 action이 없으면 에러
+        if not isinstance(normalized_artifact, dict) or not normalized_artifact.get("condition") or not normalized_artifact.get("action"):
+            log(f"⚠️ _commit_dmn_rule_tool: 정규화 후에도 condition/action을 찾을 수 없음")
+            try:
+                log(f"   원본 dmn_artifact: {json.dumps(dmn_artifact, ensure_ascii=False, indent=2)}")
+                log(f"   정규화된 artifact: {json.dumps(normalized_artifact, ensure_ascii=False, indent=2)}")
+            except Exception:
+                log(f"   원본 dmn_artifact: {str(dmn_artifact)[:500]}")
+                log(f"   정규화된 artifact: {str(normalized_artifact)[:500]}")
+            return f"❌ DMN 규칙 저장 실패: condition과 action을 추출할 수 없습니다. 전달된 데이터 구조를 확인해주세요."
+        
+        log(f"✅ _commit_dmn_rule_tool: 정규화 완료 - condition={normalized_artifact.get('condition', '')[:50]}..., action={normalized_artifact.get('action', '')[:50]}...")
+        
         await commit_to_dmn_rule(
             agent_id=agent_id,
-            dmn_artifact=dmn_artifact,
+            dmn_artifact=normalized_artifact,
             feedback_content=feedback_content,
             operation=operation,
             rule_id=rule_id,
@@ -1250,9 +1328,79 @@ def create_react_tools(agent_id: str, feedback_content: Optional[str] = None) ->
         actual_operation = operation
         actual_rule_id = rule_id
         actual_merge_mode = merge_mode
-        actual_json = dmn_artifact_json
+        actual_json = dmn_artifact_json  # 초기값 설정
         
-        if isinstance(dmn_artifact_json, str):
+        log(f"🔍 commit_dmn_rule_wrapper 시작: operation={operation}, rule_id={rule_id}, merge_mode={merge_mode}")
+        log(f"   dmn_artifact_json 타입: {type(dmn_artifact_json).__name__}")
+        
+        # LangChain이 딕셔너리를 직접 전달할 수 있으므로 처리
+        if isinstance(dmn_artifact_json, dict):
+            # 이미 딕셔너리인 경우 그대로 사용하고 JSON 파싱 단계 건너뛰기
+            log(f"ℹ️ dmn_artifact_json이 이미 딕셔너리로 전달됨: {list(dmn_artifact_json.keys())}")
+            log(f"   딕셔너리 내용: {json.dumps(dmn_artifact_json, ensure_ascii=False)[:500]}")
+            
+            # ⚠️ 중요: 딕셔너리에서 operation, rule_id, merge_mode를 먼저 추출 (중첩 구조 처리 전에)
+            # LangChain이 딕셔너리를 전달할 때, 다른 파라미터들이 기본값으로 설정될 수 있으므로
+            # dmn_artifact_json 딕셔너리 내부에서 메타데이터를 추출해야 함
+            if "operation" in dmn_artifact_json:
+                extracted_op = dmn_artifact_json.get("operation")
+                log(f"   🔍 operation 키 발견: {repr(extracted_op)} (타입: {type(extracted_op).__name__})")
+                if extracted_op and str(extracted_op).strip():
+                    actual_operation = str(extracted_op).strip().upper()  # 대문자로 정규화
+                    log(f"   ✅ 딕셔너리에서 operation 추출: {actual_operation} (함수 파라미터: {operation})")
+                else:
+                    log(f"   ⚠️ operation 값이 비어있음: {repr(extracted_op)}")
+            else:
+                log(f"   ⚠️ operation 키가 딕셔너리에 없음")
+            
+            if "rule_id" in dmn_artifact_json:
+                extracted_rid = dmn_artifact_json.get("rule_id")
+                log(f"   🔍 rule_id 키 발견: {repr(extracted_rid)} (타입: {type(extracted_rid).__name__})")
+                if extracted_rid and str(extracted_rid).strip():
+                    actual_rule_id = str(extracted_rid).strip()
+                    log(f"   ✅ 딕셔너리에서 rule_id 추출: {actual_rule_id} (함수 파라미터: {rule_id})")
+                else:
+                    log(f"   ⚠️ rule_id 값이 비어있음: {repr(extracted_rid)}")
+            else:
+                log(f"   ⚠️ rule_id 키가 딕셔너리에 없음")
+            
+            if "merge_mode" in dmn_artifact_json:
+                extracted_mm = dmn_artifact_json.get("merge_mode")
+                log(f"   🔍 merge_mode 키 발견: {repr(extracted_mm)} (타입: {type(extracted_mm).__name__})")
+                if extracted_mm and str(extracted_mm).strip():
+                    actual_merge_mode = str(extracted_mm).strip().upper()  # 대문자로 정규화
+                    log(f"   ✅ 딕셔너리에서 merge_mode 추출: {actual_merge_mode} (함수 파라미터: {merge_mode})")
+                else:
+                    log(f"   ⚠️ merge_mode 값이 비어있음: {repr(extracted_mm)}")
+            else:
+                log(f"   ⚠️ merge_mode 키가 딕셔너리에 없음")
+            
+            log(f"   📊 추출 결과: actual_operation={actual_operation}, actual_rule_id={actual_rule_id}, actual_merge_mode={actual_merge_mode}")
+            
+            # 딕셔너리 안에 "dmn_artifact_json" 키가 있는지 확인 (중첩된 경우)
+            if "dmn_artifact_json" in dmn_artifact_json:
+                # 중첩된 구조: {"dmn_artifact_json": {...}, "operation": "CREATE"}
+                nested_artifact = dmn_artifact_json.get("dmn_artifact_json")
+                log(f"   중첩된 dmn_artifact_json 발견, 추출 중...")
+                
+                # 중첩된 dmn_artifact_json을 사용하되, 메타데이터(operation, rule_id, merge_mode)는 유지
+                if isinstance(nested_artifact, dict):
+                    # 중첩된 구조에 메타데이터를 추가하여 전달 (extract_nested_artifact에서 추출할 수 있도록)
+                    actual_json = {
+                        "dmn_artifact_json": nested_artifact,
+                        "operation": actual_operation,  # 이미 추출된 값 사용
+                        "rule_id": actual_rule_id,      # 이미 추출된 값 사용
+                        "merge_mode": actual_merge_mode # 이미 추출된 값 사용
+                    }
+                    log(f"   중첩 구조 + 메타데이터로 actual_json 구성: operation={actual_operation}, rule_id={actual_rule_id}")
+                elif isinstance(nested_artifact, str):
+                    actual_json = nested_artifact  # 문자열이면 나중에 파싱
+                else:
+                    actual_json = dmn_artifact_json  # 폴백
+            else:
+                # 일반 딕셔너리인 경우 그대로 사용 (메타데이터가 이미 포함되어 있음)
+                actual_json = dmn_artifact_json  # 딕셔너리로 유지하여 try 블록에서 처리
+        elif isinstance(dmn_artifact_json, str):
             input_str = dmn_artifact_json.strip()
             
             # kwargs 형식인지 확인 (dmn_artifact_json= 또는 operation= 포함)
@@ -1326,10 +1474,84 @@ def create_react_tools(agent_id: str, feedback_content: Optional[str] = None) ->
                         log(f"   추출된 JSON (brace counting): {actual_json[:100]}...")
         
         try:
+            # 메타데이터 및 중첩 artifact를 추출하는 공통 헬퍼
+            def _extract_meta_and_artifact_from_dict(obj: dict):
+                nonlocal actual_operation, actual_rule_id, actual_merge_mode
+
+                # ⚠️ 중요: 딕셔너리에서 operation, rule_id, merge_mode를 먼저 추출
+                if "operation" in obj:
+                    extracted_op = obj.get("operation")
+                    if extracted_op:
+                        actual_operation = extracted_op
+                        log(f"   actual_json에서 operation 추출: {actual_operation}")
+
+                if "rule_id" in obj:
+                    extracted_rid = obj.get("rule_id")
+                    if extracted_rid:
+                        actual_rule_id = extracted_rid
+                        log(f"   actual_json에서 rule_id 추출: {actual_rule_id}")
+
+                if "merge_mode" in obj:
+                    extracted_mm = obj.get("merge_mode")
+                    if extracted_mm:
+                        actual_merge_mode = extracted_mm
+                        log(f"   actual_json에서 merge_mode 추출: {actual_merge_mode}")
+
+                dmn_obj = obj
+
+                # 재귀적으로 중첩 구조를 처리하는 함수
+                def extract_nested_artifact(inner_obj, depth=0, max_depth=5):
+                    """중첩된 구조에서 실제 artifact를 재귀적으로 추출"""
+                    nonlocal actual_operation, actual_rule_id, actual_merge_mode
+
+                    if depth > max_depth:
+                        return inner_obj
+
+                    if not isinstance(inner_obj, dict):
+                        return inner_obj
+
+                    # operation, rule_id, merge_mode 등 메타데이터 추출 (추가 안전장치)
+                    if "operation" in inner_obj:
+                        extracted_op = inner_obj.get("operation")
+                        if extracted_op:
+                            actual_operation = extracted_op
+                            log(f"   extract_nested_artifact에서 operation 추출 (depth={depth}): {actual_operation}")
+                    if "rule_id" in inner_obj:
+                        extracted_rid = inner_obj.get("rule_id")
+                        if extracted_rid:
+                            actual_rule_id = extracted_rid
+                            log(f"   extract_nested_artifact에서 rule_id 추출 (depth={depth}): {actual_rule_id}")
+                    if "merge_mode" in inner_obj:
+                        extracted_mm = inner_obj.get("merge_mode")
+                        if extracted_mm:
+                            actual_merge_mode = extracted_mm
+                            log(f"   extract_nested_artifact에서 merge_mode 추출 (depth={depth}): {actual_merge_mode}")
+
+                    # "dmn_artifact_json" 키가 있으면 재귀적으로 추출
+                    if "dmn_artifact_json" in inner_obj:
+                        nested = inner_obj["dmn_artifact_json"]
+                        log(f"   중첩된 dmn_artifact_json 발견 (depth={depth}), 재귀 추출 중...")
+                        return extract_nested_artifact(nested, depth + 1, max_depth)
+
+                    # condition과 action이 직접 있는지 확인
+                    if "condition" in inner_obj and "action" in inner_obj:
+                        return inner_obj
+
+                    # rules 배열이 있는지 확인
+                    if "rules" in inner_obj and isinstance(inner_obj.get("rules"), list):
+                        return inner_obj
+
+                    # 그 외에는 그대로 반환
+                    return inner_obj
+
+                extracted = extract_nested_artifact(dmn_obj)
+                log(f"   최종 추출된 dmn_artifact 키: {list(extracted.keys()) if isinstance(extracted, dict) else 'N/A'}")
+                log(f"   최종 actual_operation={actual_operation}, actual_rule_id={actual_rule_id}, actual_merge_mode={actual_merge_mode}")
+                return extracted
+
             # 입력 타입에 따라 처리
             if isinstance(actual_json, dict):
-                # 이미 딕셔너리인 경우 그대로 사용
-                dmn_artifact = actual_json
+                dmn_artifact = _extract_meta_and_artifact_from_dict(actual_json)
             elif isinstance(actual_json, str):
                 # 문자열인 경우 파싱 시도
                 actual_json = actual_json.strip()
@@ -1345,77 +1567,117 @@ def create_react_tools(agent_id: str, feedback_content: Optional[str] = None) ->
                     actual_json = actual_json.replace("\\'", "'").replace('\\"', '"')
                 
                 try:
-                    dmn_artifact = json.loads(actual_json)
+                    # 문자열을 JSON으로 파싱한 뒤, 딕셔너리 처리 로직을 그대로 재사용
+                    parsed = json.loads(actual_json)
+                    if not isinstance(parsed, dict):
+                        return f"❌ dmn_artifact_json 파싱 결과가 dict가 아닙니다. type={type(parsed).__name__}"
+                    dmn_artifact = _extract_meta_and_artifact_from_dict(parsed)
                 except json.JSONDecodeError as e:
                     # 파싱 실패 시 더 자세한 에러 정보
                     return f"❌ JSON 파싱 실패: {str(e)}\n입력된 dmn_artifact_json (첫 500자): {actual_json[:500]}...\n입력 타입: {type(actual_json).__name__}"
             else:
                 return f"❌ 지원하지 않는 입력 타입: {type(actual_json).__name__}\n입력된 값: {str(actual_json)[:200]}..."
             
-            # rules 배열이 있으면 처리
-            # 단, 최상위 레벨의 condition과 action이 이미 있으면 우선 유지
-            if "rules" in dmn_artifact and isinstance(dmn_artifact["rules"], list):
-                rules = dmn_artifact["rules"]
-                if len(rules) > 0:
-                    # 최상위 레벨에 condition과 action이 이미 있는지 확인
-                    top_level_condition = dmn_artifact.get("condition", "")
-                    top_level_action = dmn_artifact.get("action", "")
-                    
-                    if top_level_condition and top_level_action:
-                        # 최상위 레벨의 condition과 action이 있으면 유지
-                        # rules 배열은 무시 (이미 최상위에 정의되어 있음)
-                        log(f"ℹ️ 최상위 레벨의 condition/action 사용, rules 배열 무시 (병합 모드: {actual_merge_mode})")
-                        # rules 배열 제거 (병합 시 혼동 방지)
-                        dmn_artifact = {
-                            "name": dmn_artifact.get("name", "피드백 기반 규칙"),
-                            "condition": top_level_condition,
-                            "action": top_level_action
-                        }
-                    else:
-                        # 최상위 레벨에 condition/action이 없으면 rules 배열에서 변환
-                        # rules 배열의 각 항목이 input/output 형식인지 확인
+            # condition과 action을 찾는 함수 (재귀적으로 탐색)
+            def find_condition_and_action(obj, depth=0, max_depth=5):
+                """재귀적으로 condition과 action을 찾기"""
+                if depth > max_depth or not isinstance(obj, dict):
+                    return None, None
+                
+                # 최상위 레벨에서 직접 찾기
+                condition = obj.get("condition")
+                action = obj.get("action")
+                if condition and action:
+                    # 빈 문자열이 아닌지 확인
+                    if isinstance(condition, str) and condition.strip() and isinstance(action, str) and action.strip():
+                        return condition, action
+                
+                # rules 배열에서 찾기
+                if "rules" in obj and isinstance(obj.get("rules"), list):
+                    rules = obj["rules"]
+                    if len(rules) > 0:
                         first_rule = rules[0]
-                        
-                        # condition/action 형식인지 input/output 형식인지 확인
-                        if "input" in first_rule or "output" in first_rule:
-                            # input/output 형식이면 변환
-                            conditions = [r.get("input", "") for r in rules if r.get("input")]
-                            actions = [r.get("output", "") for r in rules if r.get("output")]
-                        else:
-                            # condition/action 형식이면 그대로 사용
-                            conditions = [r.get("condition", "") for r in rules if r.get("condition")]
-                            actions = [r.get("action", "") for r in rules if r.get("action")]
-                        
-                        # 조건과 액션 병합
-                        if conditions:
-                            if len(conditions) > 1:
-                                # 여러 조건을 OR로 연결
-                                dmn_artifact["condition"] = " 또는 ".join([f"({c})" for c in conditions if c])
-                            else:
-                                dmn_artifact["condition"] = conditions[0]
-                        
-                        if actions:
-                            if len(actions) > 1:
-                                # 여러 액션을 세미콜론으로 연결
-                                dmn_artifact["action"] = "; ".join(actions)
-                            else:
-                                dmn_artifact["action"] = actions[0]
-                        
-                        # name은 유지
-                        dmn_artifact["name"] = dmn_artifact.get("name", "피드백 기반 규칙")
-                        log(f"⚠️ rules 배열에서 변환: {len(rules)}개 규칙을 하나로 병합")
-                else:
-                    return "❌ rules 배열이 비어있습니다."
+                        if isinstance(first_rule, dict):
+                            # condition/action 형식
+                            rule_condition = first_rule.get("condition")
+                            rule_action = first_rule.get("action")
+                            if rule_condition and rule_action:
+                                if isinstance(rule_condition, str) and rule_condition.strip() and isinstance(rule_action, str) and rule_action.strip():
+                                    # 여러 규칙이 있으면 병합
+                                    if len(rules) > 1:
+                                        conditions = [r.get("condition", "") for r in rules if isinstance(r, dict) and r.get("condition")]
+                                        actions = [r.get("action", "") for r in rules if isinstance(r, dict) and r.get("action")]
+                                        if conditions and actions:
+                                            merged_condition = " 또는 ".join([f"({c})" for c in conditions if c])
+                                            merged_action = "; ".join([a for a in actions if a])
+                                            return merged_condition, merged_action
+                                    return rule_condition, rule_action
+                            
+                            # input/output 형식
+                            rule_input = first_rule.get("input")
+                            rule_output = first_rule.get("output")
+                            if rule_input and rule_output:
+                                if isinstance(rule_input, str) and rule_input.strip() and isinstance(rule_output, str) and rule_output.strip():
+                                    if len(rules) > 1:
+                                        inputs = [r.get("input", "") for r in rules if isinstance(r, dict) and r.get("input")]
+                                        outputs = [r.get("output", "") for r in rules if isinstance(r, dict) and r.get("output")]
+                                        if inputs and outputs:
+                                            merged_condition = " 또는 ".join([f"({i})" for i in inputs if i])
+                                            merged_action = "; ".join([o for o in outputs if o])
+                                            return merged_condition, merged_action
+                                    return rule_input, rule_output
+                
+                # 중첩된 구조에서 재귀적으로 찾기
+                for key, value in obj.items():
+                    if key in ["dmn_artifact_json", "artifact", "rule", "data"] and isinstance(value, dict):
+                        nested_condition, nested_action = find_condition_and_action(value, depth + 1, max_depth)
+                        if nested_condition and nested_action:
+                            return nested_condition, nested_action
+                
+                return None, None
             
-            # condition과 action이 있는지 확인
-            if not dmn_artifact.get("condition") or not dmn_artifact.get("action"):
-                return f"❌ condition과 action이 필요합니다. 전달된 데이터: {json.dumps(dmn_artifact, ensure_ascii=False)[:200]}..."
+            # condition과 action 찾기 (재귀적으로 모든 구조 탐색)
+            condition, action = find_condition_and_action(dmn_artifact)
             
-            # 추출된 operation/rule_id 로깅
-            log(f"📋 DMN 규칙 저장 호출: operation={actual_operation}, rule_id={actual_rule_id}")
+            # 디버깅을 위한 상세 로그
+            log(f"🔍 DMN artifact 검증: condition={repr(condition)}, action={repr(action)}")
+            log(f"🔍 DMN artifact 전체: {json.dumps(dmn_artifact, ensure_ascii=False, indent=2)}")
+            
+            # condition과 action이 없거나 빈 문자열인지 확인
+            if not condition or (isinstance(condition, str) and not condition.strip()):
+                return f"❌ condition이 필요합니다 (비어있거나 None). 전달된 데이터: {json.dumps(dmn_artifact, ensure_ascii=False)[:500]}..."
+            
+            if not action or (isinstance(action, str) and not action.strip()):
+                return f"❌ action이 필요합니다 (비어있거나 None). 전달된 데이터: {json.dumps(dmn_artifact, ensure_ascii=False)[:500]}..."
+            
+            # condition과 action을 찾았으므로, dmn_artifact를 완전히 정규화된 형태로 재구성
+            # 중첩 구조를 제거하고 최상위에 condition, action, name만 있는 깔끔한 딕셔너리로 만듦
+            # 이름이 비어 있으면 여기서는 채우지 않고, commit_to_dmn_rule 단계에서 안전한 기본값을 적용한다.
+            normalized_dmn_artifact = {
+                "name": (dmn_artifact.get("name") or "").strip() or None,
+                "condition": condition,
+                "action": action
+            }
+            
+            log(f"✅ 최종 추출 완료: condition={condition[:50]}..., action={action[:50]}...")
+            log(f"✅ 정규화된 dmn_artifact: {json.dumps(normalized_dmn_artifact, ensure_ascii=False)}")
+            
+            # 추출된 operation/rule_id 로깅 및 최종 검증
+            log(f"📋 DMN 규칙 저장 호출: operation={actual_operation}, rule_id={actual_rule_id}, merge_mode={actual_merge_mode}")
+            
+            # ⚠️ 중요: rule_id가 있는데 operation이 CREATE이면 에러
+            if actual_rule_id and actual_rule_id.strip() and actual_operation == "CREATE":
+                log(f"⚠️ 경고: rule_id가 있는데 operation이 CREATE입니다. UPDATE로 변경합니다.")
+                actual_operation = "UPDATE"
+                log(f"   수정된 operation: {actual_operation}")
+            
+            # ⚠️ 중요: operation이 UPDATE인데 rule_id가 없으면 에러
+            if actual_operation == "UPDATE" and (not actual_rule_id or not actual_rule_id.strip()):
+                return f"❌ DMN 규칙 저장 실패: UPDATE 작업에는 rule_id가 필수입니다. rule_id를 제공해주세요. (현재: operation={actual_operation}, rule_id={actual_rule_id})"
 
             # merge_mode에 따라 도구가 안전하게 병합 처리
-            return await _commit_dmn_rule_tool(agent_id, dmn_artifact, actual_operation, actual_rule_id, feedback_content, actual_merge_mode)
+            # 정규화된 dmn_artifact를 전달 (중첩 구조 제거)
+            return await _commit_dmn_rule_tool(agent_id, normalized_dmn_artifact, actual_operation, actual_rule_id, feedback_content, actual_merge_mode)
         except json.JSONDecodeError as e:
             return f"❌ JSON 파싱 실패: {str(e)}\n입력된 dmn_artifact_json: {actual_json[:200] if isinstance(actual_json, str) else str(actual_json)[:200]}..."
         except Exception as e:
@@ -1594,7 +1856,7 @@ DMN 규칙의 경우 전체 XML을, SKILL의 경우 전체 steps를 반환합니
         StructuredTool.from_function(
             coroutine=commit_memory_wrapper,
             name="commit_to_memory",
-            description="mem0에 메모리를 저장/수정/삭제합니다. 지침, 선호도, 맥락 정보를 저장할 때 사용합니다.",
+            description="mem0에 메모리를 저장/수정/삭제합니다. 지침, 선호도, 맥락 정보를 저장할 때 사용합니다. ⚠️ 메모리 내용은 항상 입력 피드백과 동일한 언어로 작성하세요 (예: 피드백이 한국어이면 메모리도 한국어로). 번역하거나 임의로 영어로 바꾸지 마세요.",
             args_schema=CommitMemoryInput
         ),
         StructuredTool.from_function(

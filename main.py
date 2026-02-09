@@ -33,9 +33,13 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 # ============================================================================
 # FastAPI 애플리케이션 설정
 # ============================================================================
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import Optional
 from core.polling_manager import start_feedback_polling, initialize_connections
+from core.react_agent import process_agent_knowledge_setup_with_react
+from core.database import _get_agent_by_id
 from utils.logger import log
 
 @asynccontextmanager
@@ -73,6 +77,84 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ============================================================================
+# API 엔드포인트
+# ============================================================================
+
+class AgentKnowledgeSetupRequest(BaseModel):
+    """에이전트 초기 지식 셋팅 요청 모델"""
+    agent_id: str
+    goal: Optional[str] = None
+    persona: Optional[str] = None
+
+
+@app.post("/setup-agent-knowledge")
+async def setup_agent_knowledge(request: AgentKnowledgeSetupRequest):
+    """
+    에이전트 초기 지식 셋팅 API 엔드포인트
+    
+    에이전트의 goal과 persona를 기반으로 ReAct 에이전트가
+    기억(MEMORY), 규칙(DMN_RULE), 스킬(SKILL)을 생성/수정합니다.
+    
+    Args:
+        request: AgentKnowledgeSetupRequest 모델
+            - agent_id: 에이전트 고유 ID (필수)
+            - goal: 에이전트의 목표 (선택, 없으면 agent_info에서 가져옴)
+            - persona: 에이전트의 페르소나 (선택, 없으면 agent_info에서 가져옴)
+    
+    Returns:
+        처리 결과 (output, intermediate_steps, used_tools 등)
+    """
+    try:
+        log(f"📥 에이전트 초기 지식 셋팅 요청 수신: agent_id={request.agent_id}")
+        
+        # 에이전트 정보 조회
+        agent_info = _get_agent_by_id(request.agent_id)
+        if not agent_info:
+            raise HTTPException(
+                status_code=404,
+                detail=f"에이전트를 찾을 수 없습니다: {request.agent_id}"
+            )
+        
+        # goal과 persona 결정: 요청에 있으면 사용, 없으면 agent_info에서 가져오기
+        goal = request.goal or agent_info.get('goal')
+        persona = request.persona or agent_info.get('persona')
+        
+        if not goal:
+            raise HTTPException(
+                status_code=400,
+                detail="에이전트 정보에 goal이 없습니다."
+            )
+        
+        # ReAct 에이전트로 초기 지식 셋팅 처리
+        result = await process_agent_knowledge_setup_with_react(
+            agent_id=request.agent_id,
+            agent_info=agent_info,
+            goal=goal,
+            persona=persona,
+        )
+        
+        # 에러가 있으면 500 에러 반환
+        if result.get("error"):
+            log(f"❌ 에이전트 초기 지식 셋팅 실패: {result.get('error')}")
+            raise HTTPException(
+                status_code=500,
+                detail=result.get("error", "에이전트 초기 지식 셋팅 중 에러 발생")
+            )
+        
+        log(f"✅ 에이전트 초기 지식 셋팅 완료: agent_id={request.agent_id}")
+        return result
+        
+    except HTTPException:
+        # HTTPException은 그대로 전달
+        raise
+    except Exception as e:
+        log(f"❌ 에이전트 초기 지식 셋팅 API 에러: {str(e)[:300]}...")
+        raise HTTPException(
+            status_code=500,
+            detail=f"에이전트 초기 지식 셋팅 중 예상치 못한 에러 발생: {str(e)}"
+        )
 
 # ============================================================================
 # 서버 실행

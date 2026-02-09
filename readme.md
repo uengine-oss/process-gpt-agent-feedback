@@ -21,19 +21,28 @@
 - **Thought → Action → Observation** 패턴으로 피드백 분석
 - LLM이 직접 추론하고 판단하여 CRUD 작업 수행
 - 5단계 필수 추론 프레임워크로 안전한 지식 관리
+- 단순 재시도 요청 자동 필터링
 
-### 2. 지식 저장소 통합 관리
+### 2. 에이전트 초기 지식 셋팅
+- 에이전트의 **목표(goal)**와 **페르소나(persona)**를 분석하여 초기 지식 자동 생성
+- 목표/페르소나에서 구체적인 규칙(DMN_RULE), 절차(SKILL), 선호도(MEMORY) 추출
+- 기존 지식과의 관계 분석을 통한 스마트 병합
+
+### 3. 지식 저장소 통합 관리
 - **MEMORY**: 지침, 선호도, 맥락 정보 (mem0 벡터 저장소)
 - **DMN_RULE**: 조건-결과 비즈니스 규칙 (Supabase `proc_def` 테이블)
 - **SKILL**: 단계별 절차, 작업 순서 (HTTP API + MCP 서버)
+  - Skill Creator를 통한 자동 SKILL.md 및 부가 파일 생성
+  - 기존 스킬과의 관계 분석 및 스마트 병합
 
-### 3. 하이브리드 병합 시스템
+### 4. 하이브리드 병합 시스템
 - 에이전트 중심 추론 + 도구의 안전한 병합 지원
-- `merge_mode` 파라미터로 의도 명시 (EXTEND, REFINE, REPLACE)
+- 관계 유형 분석 (DUPLICATE, EXTENDS, REFINES, EXCEPTION, CONFLICTS, SUPERSEDES, COMPLEMENTS, UNRELATED)
 - 기존 지식 자동 보존 및 스마트 병합
 
-### 4. 변경 이력 관리
-- 모든 지식 변경 이력 통합 관리
+### 5. 변경 이력 관리
+- 모든 지식 변경 이력 통합 관리 (`agent_knowledge_history` 테이블)
+- 변경 전후 상태 추적 및 감사(audit) 지원
 
 ## 🏗️ 아키텍처
 
@@ -41,7 +50,8 @@
 
 1. **ReAct 에이전트 기반 처리**: Chain 방식 폴백 제거, ReAct 전용
 2. **에이전트 중심 추론**: 도구는 정보 제공, 최종 판단은 에이전트
-3. **하이브리드 병합**: 에이전트가 `merge_mode` 선택 → 도구가 안전하게 병합
+3. **하이브리드 병합**: 에이전트가 관계 유형 판단 → 도구가 안전하게 병합
+4. **Skill Creator 통합**: SKILL 생성 시 자동으로 SKILL.md 및 부가 파일 생성
 
 ### 지식 저장소
 
@@ -49,7 +59,12 @@
 |--------|------|-----------|
 | **MEMORY** | 지침, 선호도, 맥락 정보 | mem0 (Supabase vector store) |
 | **DMN_RULE** | 조건-결과 비즈니스 규칙 | Supabase `proc_def` 테이블 |
-| **SKILL** | 단계별 절차, 작업 순서 | HTTP API + MCP 서버 |
+| **SKILL** | 단계별 절차, 작업 순서 | HTTP API + MCP 서버 (claude-skills) |
+
+### 처리 워크플로우
+
+1. **피드백 처리**: Supabase 폴링 → 피드백 매칭 → ReAct 에이전트 분석 → 지식 저장
+2. **초기 지식 셋팅**: Goal/Persona 입력 → ReAct 에이전트 분석 → 지식 생성
 
 자세한 아키텍처 설명은 [FEEDBACK_PROCESSING_ARCHITECTURE.md](./FEEDBACK_PROCESSING_ARCHITECTURE.md)를 참조하세요.
 
@@ -61,7 +76,7 @@
 - [uv](https://github.com/astral-sh/uv) 패키지 관리자
 - Supabase 계정 및 데이터베이스
 - OpenAI API 키
-- MCP 서버 (SKILL 저장용)
+- MCP 서버 (claude-skills, SKILL 저장용)
 
 ### 설치
 
@@ -111,7 +126,7 @@ DB_HOST=your_db_host
 DB_PORT=5432
 DB_NAME=your_db_name
 
-# MCP 서버 설정
+# MCP 서버 설정 (claude-skills)
 MCP_SERVER_URL=http://your-mcp-server:8765/mcp
 
 # OpenAI API
@@ -119,6 +134,9 @@ OPENAI_API_KEY=your_openai_api_key
 
 # 서버 포트 (선택적, 기본값: 6789)
 PORT=6789
+
+# 디버그 모드 (선택적)
+DEBUG=false
 ```
 
 ## 📖 사용 방법
@@ -127,9 +145,57 @@ PORT=6789
 
 시스템은 자동으로 Supabase의 피드백 테이블을 폴링하여 처리합니다 (기본 간격: 7초).
 
+1. Supabase의 `agent_feedback_task` 테이블에 피드백 데이터 삽입
+2. 시스템이 자동으로 폴링하여 처리
+3. 처리 결과는 `agent_knowledge_history` 테이블에 기록
+
+### 에이전트 초기 지식 셋팅
+
+에이전트의 목표와 페르소나를 기반으로 초기 지식을 자동 생성합니다.
+
+**API 호출 예시:**
+```bash
+curl -X POST "http://localhost:6789/setup-agent-knowledge" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "agent_id": "agent-123",
+    "goal": "월별 자재 소요 예측 정확도를 95% 이상으로 유지",
+    "persona": "철저하고 꼼꼼한 성격으로, 데이터 기반 의사결정을 돕습니다"
+  }'
+```
+
+**처리 과정:**
+1. Goal/Persona 분석
+2. 기존 지식 조회 및 관계 분석
+3. DMN_RULE, SKILL, MEMORY 자동 생성/수정
+4. 변경 이력 기록
+
 ## 🔌 API 엔드포인트
 
-현재 기본 서버에서는 피드백 처리용 폴링/내부 로직만 사용합니다.
+### POST `/setup-agent-knowledge`
+
+에이전트 초기 지식 셋팅 API
+
+**요청 본문:**
+```json
+{
+  "agent_id": "string (필수)",
+  "goal": "string (선택, 없으면 agent_info에서 가져옴)",
+  "persona": "string (선택, 없으면 agent_info에서 가져옴)"
+}
+```
+
+**응답:**
+```json
+{
+  "output": "처리 결과 메시지",
+  "intermediate_steps": [...],
+  "agent_id": "agent-123",
+  "used_tools": ["commit_to_memory", "commit_to_dmn_rule", "commit_to_skill"],
+  "did_commit": true,
+  "commit_successes": ["commit_to_memory", "commit_to_dmn_rule"]
+}
+```
 
 ### API 문서
 
@@ -144,29 +210,39 @@ process-gpt-agent-feedback/
 │   ├── react_tools.py             # 에이전트 도구 정의
 │   ├── feedback_processor.py      # 피드백 처리 로직
 │   ├── polling_manager.py         # 피드백 폴링 및 처리
-│   ├── knowledge_retriever.py     # 지식 조회
+│   ├── knowledge_retriever.py    # 지식 조회
 │   ├── semantic_matcher.py        # 의미적 유사도 분석
 │   ├── learning_router.py         # 학습 라우팅
+│   ├── conflict_analyzer.py       # 충돌 분석
+│   ├── skill_creator_committer.py # Skill Creator 통합
+│   ├── skill_quick_validate.py    # Skill 검증
 │   ├── database.py                # 데이터베이스 연결
+│   ├── llm.py                     # LLM 유틸리티
 │   ├── mcp_client.py              # MCP 클라이언트
 │   ├── skill_api_client.py        # Skill API 클라이언트
-│   └── learning_committers/        # 지식 저장소 커밋터
+│   └── learning_committers/       # 지식 저장소 커밋터
 │       ├── memory_committer.py    # MEMORY CRUD
-│       ├── dmn_committer.py       # DMN_RULE CRUD
+│       ├── dmn_committer.py        # DMN_RULE CRUD
 │       └── skill_committer.py     # SKILL CRUD
 ├── tools/                          # 유틸리티 도구
 │   └── knowledge_manager.py
 ├── utils/                          # 유틸리티
 │   └── logger.py                   # 로깅 유틸리티
+├── docs/                           # 문서
+│   └── SKILL_CREATOR_WORKFLOW.md  # Skill Creator 워크플로우
 ├── tests/                          # 테스트
 │   ├── test_feedback_flow.py
 │   ├── test_learning_committers.py
 │   ├── test_mcp_integration.py
+│   ├── test_skill_format.py
 │   └── ...
 ├── k8s/                            # Kubernetes 배포 설정
 │   ├── deployment.yaml
 │   ├── service.yaml
 │   └── configmap.yaml.example
+├── scripts/                        # 배포 스크립트
+│   ├── deploy.ps1                 # Windows PowerShell
+│   └── deploy.sh                   # Linux/macOS
 ├── main.py                         # FastAPI 애플리케이션 진입점
 ├── docker-compose.yml              # Docker Compose 설정
 ├── Dockerfile                      # Docker 이미지 빌드
@@ -174,7 +250,7 @@ process-gpt-agent-feedback/
 ├── pyproject.toml                  # 프로젝트 메타데이터
 ├── function.sql                    # 데이터베이스 함수
 ├── FEEDBACK_PROCESSING_ARCHITECTURE.md  # 아키텍처 문서
-└── readme.md                       # 이 파일
+└── README.md                       # 이 파일
 ```
 
 ## 🧪 테스트
@@ -185,37 +261,61 @@ pytest tests/
 
 # 특정 테스트 실행
 pytest tests/test_feedback_flow.py
+pytest tests/test_learning_committers.py
+pytest tests/test_mcp_integration.py
 ```
 
 ## 🐳 배포
 
-### Docker 사용
+### 이미지: `ghcr.io/uengine-oss/agent-feedback:latest`
+
+### 스크립트로 빌드/푸시/배포
+
+```powershell
+# Windows PowerShell: 빌드만
+.\scripts\deploy.ps1
+
+# 빌드 + GHCR 푸시 (사전: docker login ghcr.io)
+.\scripts\deploy.ps1 -Push
+
+# 빌드 + k8s 배포
+.\scripts\deploy.ps1 -Apply
+
+# 빌드 + 푸시 + 배포
+.\scripts\deploy.ps1 -Push -Apply
+```
 
 ```bash
-# 이미지 빌드
-docker build -t agent-feedback .
+# Linux/macOS: 빌드만
+./scripts/deploy.sh
 
-# 컨테이너 실행
-docker-compose up -d
+# 빌드 + 푸시 + 배포
+./scripts/deploy.sh --push --apply
+```
+
+### 수동 Docker 빌드/푸시
+
+```bash
+docker build -t ghcr.io/uengine-oss/agent-feedback:latest .
+docker push ghcr.io/uengine-oss/agent-feedback:latest   # docker login ghcr.io 선행
 ```
 
 ### Kubernetes 배포
 
-```bash
-# ConfigMap 및 Secret 설정
-kubectl apply -f k8s/configmap.yaml
-kubectl apply -f k8s/secrets.yaml
+`k8s/deployment.yaml`은 이미 `ghcr.io/uengine-oss/agent-feedback:latest`를 사용합니다.
 
-# 배포
+```bash
+# ConfigMap/Secret 설정 후
 kubectl apply -f k8s/deployment.yaml
 kubectl apply -f k8s/service.yaml
 ```
 
-자세한 배포 설정은 `k8s/` 디렉토리의 파일들을 참조하세요.
+자세한 배포 설정은 `k8s/` 디렉토리를 참조하세요.
 
 ## 📚 참고 문서
 
 - [FEEDBACK_PROCESSING_ARCHITECTURE.md](./FEEDBACK_PROCESSING_ARCHITECTURE.md) - 상세 아키텍처 및 설계 원칙
+- [docs/SKILL_CREATOR_WORKFLOW.md](./docs/SKILL_CREATOR_WORKFLOW.md) - Skill Creator 워크플로우
 
 ## 🔧 개발 환경
 
@@ -244,6 +344,18 @@ uv pip install -r requirements.txt
 # 새 패키지 추가
 uv pip install <package-name>
 uv pip freeze > requirements.txt
+```
+
+### 디버그 모드
+
+```bash
+# 환경 변수 설정
+export DEBUG=true  # Linux/Mac
+# 또는
+set DEBUG=true     # Windows
+
+# 서버 실행 (자동 리로드 활성화)
+python main.py
 ```
 
 ## 📝 라이선스

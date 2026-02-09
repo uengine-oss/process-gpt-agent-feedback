@@ -862,6 +862,13 @@ async def commit_to_dmn_rule(agent_id: str, dmn_artifact: Dict, feedback_content
     """
     try:
         supabase = get_db_client()
+
+        # ⚠️ 방어 로직: rule_id가 있는데도 CREATE로 들어오면 실제로는 UPDATE로 처리
+        # 상위 래퍼(commit_dmn_rule_wrapper)나 LLM이 operation을 잘못 넣어도,
+        # 여기에서는 절대 새 규칙을 만들지 않고 기존 규칙을 수정하도록 강제한다.
+        if operation == "CREATE" and rule_id:
+            log(f"⚠️ DMN_RULE 커밋: operation='CREATE' 이지만 rule_id가 전달됨 → UPDATE로 강제 전환 (rule_id={rule_id})")
+            operation = "UPDATE"
         
         if operation == "DELETE":
             if not rule_id:
@@ -923,7 +930,9 @@ async def commit_to_dmn_rule(agent_id: str, dmn_artifact: Dict, feedback_content
         # CREATE 또는 UPDATE인 경우
         condition = dmn_artifact.get("condition", "")
         action = dmn_artifact.get("action", "")
-        rule_name = dmn_artifact.get("name", "피드백 기반 규칙")
+        # 기본 규칙 이름 (UPDATE의 경우 아래에서 기존 이름으로 override)
+        # 이름이 비어 있으면 "이름 없는 DMN 규칙"으로 저장 (LLM 기본값에 의존하지 않음)
+        rule_name = (dmn_artifact.get("name") or "").strip() or "이름 없는 DMN 규칙"
         
         if not condition or not action:
             log(f"⚠️ DMN_RULE 저장/수정 실패: condition이나 action이 비어있음")
@@ -963,6 +972,14 @@ async def commit_to_dmn_rule(agent_id: str, dmn_artifact: Dict, feedback_content
                     previous_content = rule_data.data.get("bpmn", "")
                     existing_xml = previous_content
                     current_version = rule_data.data.get("prod_version")
+
+                    # ⚠️ UPDATE 시 규칙 이름은 기본적으로 "기존 규칙 이름"을 유지한다.
+                    # LLM이 dmn_artifact.name에 임의의 기본값을 넣더라도
+                    # 기존 규칙명을 덮어쓰지 않도록 방어.
+                    existing_name = rule_data.data.get("name")
+                    if existing_name:
+                        log(f"🔧 DMN_RULE UPDATE: 기존 규칙 이름 유지 → '{existing_name}'")
+                        rule_name = existing_name
                     
                     # prod_version이 없거나 버전 테이블에 없는 경우 처리
                     if not current_version or current_version.strip() == "":

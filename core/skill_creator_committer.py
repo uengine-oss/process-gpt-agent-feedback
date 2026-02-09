@@ -252,6 +252,21 @@ async def _read_skill_document(skill_name: str, document_path: str) -> str:
     raise RuntimeError("read_skill_document MCP 도구를 찾을 수 없습니다. (claude-skills)")
 
 
+def _detect_feedback_language(text: str) -> str:
+    """
+    매우 간단한 휴리스틱으로 피드백의 주 사용 언어를 추정합니다.
+    - 한글(가-힣)이 하나라도 있으면 'ko'
+    - 아니면 'en' (기본값)
+    """
+    if not isinstance(text, str):
+        return "en"
+    for ch in text:
+        # 한글 완성형 범위
+        if "\uac00" <= ch <= "\ud7a3":
+            return "ko"
+    return "en"
+
+
 _SKILL_CREATOR_SYSTEM = """You implement the skill-creator workflow. Given user feedback and (for UPDATE) existing skill content, produce a JSON object that will become SKILL.md and bundled files. Follow skill-creator rules:
 - name: hyphen-case (e.g. my-investment-skill). For UPDATE use the provided existing name.
 - description: 1–2 sentences for frontmatter; include WHEN to use this skill.
@@ -267,6 +282,22 @@ _SKILL_CREATOR_SYSTEM = """You implement the skill-creator workflow. Given user 
 For UPDATE: preserve existing structure, sections, and files; integrate feedback as additions or refinements. Do not drop existing steps, overview, or files. Merge feedback into the existing content.
 When [관계 분석] indicates EXTENDS or COMPLEMENTS: **preserve all existing content**; only add or refine from feedback. Do not remove existing steps or files. For additional_files, include only new files or files you are actually changing—omit the rest.
 
+LANGUAGE RULES (CRITICAL):
+- Detect the primary language of the user feedback (Korean vs English).
+- **All human‑readable natural language text** in SKILL.md and any Markdown/reference files
+  MUST be written in the **same language as the feedback**.
+- When the feedback is in Korean, write all narrative text, headings, explanations,
+  overviews, and steps in clear, natural Korean. Do NOT translate them to English.
+- Skill identifiers MUST remain stable and English-friendly:
+  - `name` field: keep in hyphenated English (e.g. my-investment-skill).
+  - File and directory names under additional_files (e.g. scripts/*.py, references/*.md)
+    should be in English and snake_case / hyphen-case as appropriate.
+- Code inside scripts (Python, etc.) should use English identifiers and comments unless
+  the feedback explicitly requests Korean comments.
+
+If there is any conflict between previous instructions and these language rules,
+the language rules take precedence for natural-language content.
+
 Output only valid JSON. No markdown, no explanation. Example: {"name":"x","description":"...","overview":"...","steps":["a","b"],"usage":"","additional_files":{}}"""
 
 
@@ -281,7 +312,27 @@ async def _generate_skill_artifact_from_feedback(
     """skill-creator 가이드에 따라 피드백과(선택) 기존 스킬 내용으로부터 skill_artifact JSON을 생성."""
     from langchain_core.messages import SystemMessage, HumanMessage
 
-    user_parts = [f"피드백:\n{feedback_content}"]
+    # 입력 피드백 언어를 감지하여 skill-creator에게 명시적으로 전달
+    lang = _detect_feedback_language(feedback_content)
+    if lang == "ko":
+        lang_hint = (
+            "입력 피드백의 주요 언어는 **한국어**입니다.\n"
+            "- SKILL.md의 설명, 개요, 단계(steps), 사용법(usage)과 "
+            "추가 마크다운/레퍼런스 파일의 본문은 모두 자연스러운 한국어로 작성하세요.\n"
+            "- 스킬 이름(name)과 파일/디렉터리 경로, 코드(예: scripts/*.py)는 영어 식별자를 사용하세요.\n"
+            "- 사용자가 한국어로 작성했더라도, 스킬 이름과 코드 구조 자체를 영어로 번역/정규화해도 됩니다. "
+            "하지만 설명 텍스트를 영어로 바꾸면 안 됩니다."
+        )
+    else:
+        lang_hint = (
+            "The primary language of the feedback appears to be **English**.\n"
+            "- Write all human‑readable descriptions, overviews, steps, usage text, and "
+            "Markdown/reference file bodies in natural English.\n"
+            "- Skill `name` and file/directory paths should remain concise, English identifiers.\n"
+            "- Code inside scripts should use English identifiers and comments unless explicitly told otherwise."
+        )
+
+    user_parts = [lang_hint, f"\n피드백:\n{feedback_content}"]
     if relationship_analysis and str(relationship_analysis).strip():
         user_parts.append(f"\n[관계 분석 (EXTENDS/COMPLEMENTS 시 기존 내용 보존에 참고)]\n{relationship_analysis[:6000]}")
     if operation == "UPDATE" and skill_id:

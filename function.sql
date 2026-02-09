@@ -198,7 +198,44 @@ CREATE TRIGGER trigger_update_agent_knowledge_registry_updated_at
     EXECUTE FUNCTION update_agent_knowledge_registry_updated_at();
 
 
+-- ============================================================================
+-- 5. 에이전트 초기 지식 셋팅 로그 테이블
+-- 셋팅 완료 여부 추적 (users 테이블 확장 없이 별도 관리)
+-- ============================================================================
 
+CREATE TABLE IF NOT EXISTS public.agent_knowledge_setup_log (
+  agent_id UUID NOT NULL,
+  tenant_id TEXT,
+  status TEXT NOT NULL DEFAULT 'DONE',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (agent_id),
+  CONSTRAINT agent_knowledge_setup_log_user_fkey
+    FOREIGN KEY (agent_id, tenant_id) REFERENCES public.users (id, tenant_id) ON DELETE CASCADE
+);
+
+GRANT SELECT, INSERT ON public.agent_knowledge_setup_log TO anon;
+CREATE INDEX IF NOT EXISTS idx_agent_knowledge_setup_log_agent_id ON public.agent_knowledge_setup_log(agent_id);
+
+
+-- 에이전트 초기 지식 셋팅 대상 조회 (agent_knowledge_setup_log에 없는 에이전트)
+CREATE OR REPLACE FUNCTION public.agent_needing_knowledge_setup(p_limit integer DEFAULT 1)
+RETURNS SETOF users AS $$
+BEGIN
+  RETURN QUERY
+  SELECT u.*
+  FROM public.users u
+  LEFT JOIN public.agent_knowledge_setup_log s ON u.id = s.agent_id
+  WHERE u.is_agent = true
+    AND u.agent_type = 'agent'
+    AND u.goal IS NOT NULL
+    AND u.goal != ''
+    AND s.agent_id IS NULL
+  ORDER BY u.id ASC
+  LIMIT p_limit;
+END;
+$$ LANGUAGE plpgsql STABLE;
+
+GRANT EXECUTE ON FUNCTION public.agent_needing_knowledge_setup(integer) TO anon;
 
 
 -- ============================================================================

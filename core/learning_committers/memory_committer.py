@@ -195,7 +195,8 @@ async def commit_to_memory(agent_id: str, content: str, source_type: str = "feed
             result = memory.add(
                 content,
                 agent_id=agent_id,
-                metadata=metadata
+                metadata=metadata,
+                infer=False
             )
             
             # 생성된 메모리 ID 추출 (mem0 API 응답에서)

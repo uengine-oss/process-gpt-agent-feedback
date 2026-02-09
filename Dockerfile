@@ -3,7 +3,7 @@
 # ============================================================================
 # Build Stage
 # ============================================================================
-FROM python:3.11-slim AS builder
+FROM python:3.12-slim AS builder
 
 # Install build dependencies (required for pyroaring, psycopg2, etc.)
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -26,7 +26,7 @@ RUN python -m venv /app/.venv && \
 # ============================================================================
 # Runtime Stage
 # ============================================================================
-FROM python:3.11-slim AS runtime
+FROM python:3.12-slim AS runtime
 
 # Install runtime dependencies (required for psycopg2)
 RUN apt-get update && apt-get install -y --no-install-recommends \
