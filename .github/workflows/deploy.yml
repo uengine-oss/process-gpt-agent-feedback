@@ -48,7 +48,7 @@ jobs:
           cd gitops-repo
           
           # Update process-gpt-agent-feedback deployment image
-          yq eval '.spec.template.spec.containers[0].image = "'$IMAGE_NAME'"' -i dev/deployments/process-gpt-agent-feedback-deployment.yaml
+          yq eval '.spec.template.spec.containers[0].image = "'$IMAGE_NAME'"' -i deployments/agent-feedback-deployment.yaml
           
           echo "Updated image to: $IMAGE_NAME"
 
