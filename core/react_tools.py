@@ -33,7 +33,8 @@ from core.knowledge_retriever import (
     retrieve_existing_memories,
     retrieve_existing_dmn_rules,
     retrieve_existing_skills,
-    retrieve_all_existing_knowledge
+    retrieve_all_existing_knowledge,
+    SKILL_SEARCH_CONTEXT_CHARS,
 )
 from core.learning_committers import (
     commit_to_memory,
@@ -110,6 +111,10 @@ class CommitSkillInput(BaseModel):
     relationship_analysis: Optional[str] = Field(
         default=None,
         description="search_similar_knowledge 결과(관계 유형 분포·상세 분석)를 그대로 전달. EXTENDS/COMPLEMENTS 시 기존 내용 보존에 활용. 있으면 반드시 전달하세요.",
+    )
+    related_skill_ids: Optional[str] = Field(
+        default=None,
+        description="search_similar_knowledge에서 찾은 관련 스킬 이름/ID를 쉼표 구분 문자열로 전달 (예: 'skill-a, skill-b'). 있으면 전달하면 스킬 간 참조 생성에 활용됩니다.",
     )
 
 
@@ -515,6 +520,7 @@ async def _commit_skill_tool(
     merge_mode: str = "MERGE",
     feedback_content: Optional[str] = None,
     relationship_analysis: Optional[str] = None,
+    related_skill_ids: Optional[str] = None,
 ) -> str:
     """
     Skill을 저장/수정/삭제합니다. ReAct은 저장소·관계(operation, skill_id)만 판단하고,
@@ -539,6 +545,7 @@ async def _commit_skill_tool(
             merge_mode=merge_mode,
             feedback_content=feedback_content or "",
             relationship_analysis=relationship_analysis,
+            related_skill_ids=related_skill_ids,
         )
 
         if operation == "CREATE":
@@ -653,7 +660,7 @@ async def _search_similar_knowledge_tool(
         # SKILL 검색
         if search_skill:
             skills = await retrieve_existing_skills(
-                agent_id, content[:100], top_k=20,
+                agent_id, content[:SKILL_SEARCH_CONTEXT_CHARS], top_k=20,
                 tenant_id=tenant_id, agent_skills=agent_skills
             )
             if skills:
@@ -662,6 +669,16 @@ async def _search_similar_knowledge_tool(
                 )
                 for item in similar_skills:
                     item["storage_type"] = "SKILL"
+                    # 숫자/인덱스 형태 ID는 레지스트리에 등록하지 않음 (phantom SKILL:1 방지)
+                    skill_id = item.get("id", "")
+                    skill_name = item.get("name", "") or item.get("skill_name", "")
+                    if isinstance(skill_id, int) or (isinstance(skill_id, str) and skill_id.isdigit()) or (
+                        isinstance(skill_id, str) and skill_id.startswith("skill_") and len(skill_id) > 6 and skill_id[6:].isdigit()
+                    ):
+                        skill_id = skill_name or str(skill_id)
+                    if not skill_id:
+                        continue
+                    item["id"] = skill_id
                     results.append(item)
                     
                     # 레지스트리에 등록 및 접근 시간 업데이트
@@ -670,11 +687,11 @@ async def _search_similar_knowledge_tool(
                             agent_id=agent_id,
                             tenant_id=tenant_id,
                             knowledge_type="SKILL",
-                            knowledge_id=item.get("id", ""),
-                            knowledge_name=item.get("name", ""),
+                            knowledge_id=skill_id,
+                            knowledge_name=skill_name or skill_id,
                             content_summary=item.get("content_summary", "")
                         )
-                        update_knowledge_access_time(agent_id, "SKILL", item.get("id", ""))
+                        update_knowledge_access_time(agent_id, "SKILL", skill_id)
                     except Exception as e:
                         log(f"⚠️ 레지스트리 등록 실패 (무시하고 계속 진행): {e}")
         
@@ -740,12 +757,19 @@ async def _search_similar_knowledge_tool(
             output_lines.append(f"   - {rel_type}: {len(items)}개")
         output_lines.append("")
         
-        # 상세 정보
+        # 상세 정보 (SKILL은 표시용 ID가 숫자/인덱스 형태면 name 사용)
         output_lines.append("📋 상세 분석 결과:")
         for idx, item in enumerate(results[:10], start=1):  # 상위 10개
             storage = item.get("storage_type", "UNKNOWN")
             item_id = item.get("id", "Unknown")
             item_name = item.get("name", item_id)
+            if storage == "SKILL" and item_id != item_name:
+                sid = item_id
+                if isinstance(sid, int) or (isinstance(sid, str) and sid.isdigit()) or (
+                    isinstance(sid, str) and len(sid) > 6 and sid.startswith("skill_") and sid[6:].isdigit()
+                ):
+                    item_id = item_name or str(sid)
+                    item["id"] = item_id
             score = item.get("similarity_score", 0)
             relationship = item.get("relationship", "UNKNOWN")
             rel_reason = item.get("relationship_reason", "")
@@ -838,7 +862,7 @@ async def _check_duplicate_tool(
                 existing = await retrieve_existing_dmn_rules(agent_id, content[:100])
             elif knowledge_type == "SKILL":
                 existing = await retrieve_existing_skills(
-                    agent_id, content[:100], top_k=20,
+                    agent_id, content[:SKILL_SEARCH_CONTEXT_CHARS], top_k=20,
                     tenant_id=tenant_id, agent_skills=agent_skills
                 )
             
@@ -915,7 +939,7 @@ async def _determine_operation_tool(
             existing = await retrieve_existing_dmn_rules(agent_id, content[:100])
         elif knowledge_type == "SKILL":
             existing = await retrieve_existing_skills(
-                agent_id, content[:100], top_k=20,
+                agent_id, content[:SKILL_SEARCH_CONTEXT_CHARS], top_k=20,
                 tenant_id=tenant_id, agent_skills=agent_skills
             )
         
@@ -1688,6 +1712,7 @@ def create_react_tools(agent_id: str, feedback_content: Optional[str] = None) ->
         skill_id: Optional[str] = None,
         merge_mode: str = "MERGE",
         relationship_analysis: Optional[str] = None,
+        related_skill_ids: Optional[str] = None,
     ) -> str:
         """Skill 저장 도구 (async). 스킬 내용(SKILL.md, steps, additional_files)은 skill-creator가 생성. feedback_content는 자동 전달."""
         import json as _json
@@ -1695,9 +1720,10 @@ def create_react_tools(agent_id: str, feedback_content: Optional[str] = None) ->
         actual_sid = skill_id
         actual_mm = merge_mode or "MERGE"
         actual_ra = relationship_analysis
+        actual_related = related_skill_ids
         # ReAct이 Action Input에 {"operation":"UPDATE","skill_id":"x",...} 전체를 넘기면, 첫 파라미터(operation)에 그대로 들어올 수 있음. 언랩.
         def _unwrap(obj: dict) -> None:
-            nonlocal actual_op, actual_sid, actual_mm, actual_ra
+            nonlocal actual_op, actual_sid, actual_mm, actual_ra, actual_related
             if isinstance(obj, dict):
                 if obj.get("operation") is not None:
                     actual_op = str(obj.get("operation", "CREATE")).strip().upper()
@@ -1707,6 +1733,8 @@ def create_react_tools(agent_id: str, feedback_content: Optional[str] = None) ->
                     actual_mm = str(obj.get("merge_mode", "MERGE")).strip()
                 if obj.get("relationship_analysis") is not None:
                     actual_ra = (obj.get("relationship_analysis") or "").strip() or None
+                if obj.get("related_skill_ids") is not None:
+                    actual_related = (obj.get("related_skill_ids") or "").strip() or None
 
         if isinstance(operation, dict):
             _unwrap(operation)
@@ -1738,14 +1766,22 @@ def create_react_tools(agent_id: str, feedback_content: Optional[str] = None) ->
                 merge_mode=actual_mm,
                 feedback_content=feedback_content or "",
                 relationship_analysis=actual_ra,
+                related_skill_ids=actual_related,
             )
         except Exception as e:
             return f"❌ Skill 저장 실패: {str(e)}"
     
     # 새로운 통합 도구 래퍼 함수들
     async def search_similar_knowledge_wrapper(content: str, knowledge_type: str = "ALL", threshold: float = 0.7) -> str:
-        """유사 지식 검색 도구 (async)"""
-        return await _search_similar_knowledge_tool(agent_id, content, knowledge_type, threshold)
+        """유사 지식 검색 도구 (async). 초기 지식 셋팅 시 feedback_content가 있으면 목표+페르소나를 검색에 사용."""
+        actual_content = content
+        if feedback_content and str(feedback_content).strip():
+            # 에이전트가 목표만 넣었을 수 있음: content가 feedback_content보다 짧거나, '페르소나'를 포함하지 않으면 전체 문맥 사용
+            agent_content = (content or "").strip()
+            full_context = str(feedback_content).strip()
+            if len(agent_content) < len(full_context) or "페르소나" not in agent_content:
+                actual_content = full_context
+        return await _search_similar_knowledge_tool(agent_id, actual_content, knowledge_type, threshold)
     
     async def check_duplicate_wrapper(content: str, knowledge_type: str, candidate_id: Optional[str] = None) -> str:
         """중복 확인 도구 (async)"""
@@ -1887,7 +1923,7 @@ merge_mode 파라미터 (UPDATE 시 중요):
         StructuredTool.from_function(
             coroutine=commit_skill_wrapper,
             name="commit_to_skill",
-            description="Skill을 저장/수정/삭제합니다. **ReAct은 저장소(SKILL)·기존과의 관계(operation, skill_id)만 판단합니다.** 스킬 내용(SKILL.md, steps, additional_files)은 skill-creator가 생성. 관련 스킬이 있으면 operation=UPDATE, skill_id=기존스킬이름. 없으면 operation=CREATE, skill_id 생략. DELETE 시 skill_id 필수. **search_similar_knowledge 결과가 있으면 relationship_analysis에 그대로 전달**하면 EXTENDS/COMPLEMENTS 시 기존 내용 보존에 활용됩니다.",
+            description="Skill을 저장/수정/삭제합니다. **ReAct은 저장소(SKILL)·기존과의 관계(operation, skill_id)만 판단합니다.** 스킬 내용(SKILL.md, steps, additional_files)은 skill-creator가 생성. 기존 스킬을 **참조**하는 **새 스킬**을 만들 때는 operation=CREATE, related_skill_ids=기존스킬이름(쉼표 구분)으로 호출하세요. 동일 범위·동일 절차 수정 시에만 operation=UPDATE, skill_id=기존스킬이름. DELETE 시 skill_id 필수. **search_similar_knowledge 결과가 있으면 relationship_analysis에 그대로 전달**하면 EXTENDS/COMPLEMENTS 시 기존 내용 보존에 활용됩니다. **관련 스킬을 찾았으면 해당 스킬 이름/ID를 related_skill_ids에 쉼표 구분으로 전달**하면 스킬 간 참조 생성에 활용됩니다.",
             args_schema=CommitSkillInput
         ),
     ]

@@ -120,10 +120,55 @@ class TestSkillFormat:
         
         result = _format_skill_document(skill_name, steps, description)
         
-        # 단계별 실행 절차 섹션은 있어야 하지만 내용은 없어야 함
-        assert "## 단계별 실행 절차" in result
-        # 번호가 매겨진 단계가 없어야 함
-        assert "1. " not in result.split("## 단계별 실행 절차")[1]
+        # frontmatter와 개요는 있음 (빈 steps면 단계별 실행 절차 섹션 없음)
+        assert "---" in result
+        assert "## 개요" in result
+        assert "1. " not in result
+
+    def test_format_skill_document_with_body_markdown(self):
+        """body_markdown 제공 시 본문으로 사용되고 overview/steps/usage는 무시됨"""
+        skill_name = "my-skill"
+        steps = ["Step A", "Step B"]
+        description = "Short description."
+        overview = "Overview text"
+        usage = "Usage text"
+        body_markdown = """# My Skill
+
+## Overview
+
+Custom body with **markdown**.
+
+## When to Use
+
+Use when X.
+
+## Steps
+
+1. Do one.
+2. Do two.
+
+See `references/guide.md` for details.
+"""
+        result = _format_skill_document(
+            skill_name,
+            steps,
+            description=description,
+            overview=overview,
+            usage=usage,
+            body_markdown=body_markdown,
+        )
+        # Frontmatter
+        assert "---" in result
+        assert "name: my-skill" in result
+        assert "description: Short description." in result
+        # Body is body_markdown (no fixed 개요/단계별 실행 절차 from overview/steps)
+        assert "Custom body with **markdown**" in result
+        assert "When to Use" in result
+        assert "references/guide.md" in result
+        # overview/usage not used as section content
+        assert "Overview text" not in result
+        assert "Usage text" not in result
+        assert "## 사용법" not in result
 
 
 if __name__ == "__main__":

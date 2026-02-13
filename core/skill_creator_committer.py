@@ -267,19 +267,228 @@ def _detect_feedback_language(text: str) -> str:
     return "en"
 
 
-_SKILL_CREATOR_SYSTEM = """You implement the skill-creator workflow. Given user feedback and (for UPDATE) existing skill content, produce a JSON object that will become SKILL.md and bundled files. Follow skill-creator rules:
+# Related skills context: SKILL.md summary chars, file head chars, total cap
+_RELATED_SKILL_SUMMARY_CHARS = 700
+_RELATED_SKILL_FILE_HEAD_CHARS = 1500
+_RELATED_SKILL_CONTEXT_CAP = 20000
+
+
+def _extract_document_paths_from_find_helpful_result(res: Any) -> Dict[str, List[str]]:
+    """
+    Extract built-in skill document paths from claude-skills find_helpful_skills output.
+    Tries to be resilient across dict/list/text outputs.
+    Returns: {skill_name: [doc_path, ...]}
+    """
+    def _try_json(s: str) -> Any:
+        try:
+            return json.loads(s)
+        except Exception:
+            return None
+
+    obj: Any = res
+    # unwrap text -> json if possible
+    if isinstance(obj, str):
+        j = _try_json(obj)
+        if j is not None:
+            obj = j
+    else:
+        # sometimes tools return content blocks; attempt to extract text then json
+        txt = _extract_text(obj)
+        if txt and txt.strip().startswith("{"):
+            j = _try_json(txt.strip())
+            if j is not None:
+                obj = j
+
+    skills: List[Dict[str, Any]] = []
+    if isinstance(obj, dict):
+        v = obj.get("skills") or obj.get("results") or []
+        if isinstance(v, list):
+            skills = [x for x in v if isinstance(x, dict)]
+    elif isinstance(obj, list):
+        skills = [x for x in obj if isinstance(x, dict)]
+
+    out: Dict[str, List[str]] = {}
+    for s in skills:
+        name = (s.get("name") or s.get("skill_name") or s.get("id") or "").strip()
+        if not name:
+            continue
+        docs = s.get("documents") or s.get("document_paths") or s.get("files") or []
+        paths: List[str] = []
+        if isinstance(docs, list):
+            for d in docs:
+                if isinstance(d, str):
+                    paths.append(d.strip())
+                elif isinstance(d, dict):
+                    p = (d.get("path") or d.get("document_path") or d.get("name") or "").strip()
+                    if p:
+                        paths.append(p)
+        # ensure deterministic / remove empties
+        paths = [p for p in paths if p]
+        if paths:
+            out[name] = paths
+    return out
+
+
+async def _find_helpful_skills_documents(
+    *,
+    tenant_id: Optional[str],
+    allowed_skill_names: List[str],
+    task_description: str,
+) -> Dict[str, List[str]]:
+    """
+    Use claude-skills find_helpful_skills with list_documents=True to obtain document paths
+    for built-in skills. Returns {skill_name: [doc_path, ...]}.
+    """
+    if not allowed_skill_names:
+        return {}
+    if not tenant_id:
+        return {}
+    for tool_name in ("find_helpful_skills", "mcp_claude-skills_find_helpful_skills"):
+        tool = await get_mcp_tool_by_name_async(tool_name)
+        if tool is None:
+            continue
+        res = await tool.ainvoke(
+            {
+                "tenant_id": tenant_id,
+                "task_description": task_description,
+                "top_k": max(3, len(allowed_skill_names)),
+                "list_documents": True,
+                "allowed_skill_names": allowed_skill_names,
+            }
+        )
+        return _extract_document_paths_from_find_helpful_result(res)
+    log("   ⚠️ find_helpful_skills MCP 도구를 찾을 수 없습니다. (claude-skills)")
+    return {}
+
+
+async def _build_related_skills_context(
+    *,
+    related_skill_ids: Optional[str],
+    exclude_skill_id: Optional[str],
+    tenant_id: Optional[str],
+    task_description: str,
+) -> Optional[str]:
+    """
+    Build a context string from related skills: summary (SKILL.md head) + file paths + each file's head.
+    Supports both uploaded skills (HTTP) and built-in skills (claude-skills find_helpful_skills/read_skill_document).
+    """
+    if not related_skill_ids or not str(related_skill_ids).strip():
+        return None
+    names = [s.strip() for s in str(related_skill_ids).split(",") if s.strip()]
+    if not names:
+        return None
+    exclude = (exclude_skill_id or "").strip()
+    if exclude:
+        names = [n for n in names if n != exclude]
+    if not names:
+        return None
+    # 컨텍스트로 넘기는 스킬 개수는 최대 3개
+    names = names[:3]
+
+    # Prefer MCP (find_helpful_skills + read_skill_document) for doc lists/content.
+    # Fall back to HTTP get_skill_files/get_skill_file_content when MCP doesn't have the skill.
+    docs_map = await _find_helpful_skills_documents(
+        tenant_id=tenant_id,
+        allowed_skill_names=names,
+        task_description=task_description,
+    )
+
+    parts: List[str] = []
+    total = 0
+    cap = _RELATED_SKILL_CONTEXT_CAP
+
+    for skill_name in names:
+        if total >= cap:
+            break
+
+        # ---- summary + file list ----
+        try:
+            # MCP-first
+            try:
+                content = (await _read_skill_document(skill_name, "SKILL.md") or "").strip()
+            except Exception:
+                info = get_skill_file_content(skill_name, "SKILL.md")
+                content = (info.get("content") or "").strip()
+            summary = content[:_RELATED_SKILL_SUMMARY_CHARS]
+            if len(content) > _RELATED_SKILL_SUMMARY_CHARS:
+                summary += "..."
+            block = f"\n[관련 스킬: {skill_name}]\n요약:\n{summary}\n"
+        except Exception as e:
+            log(f"   ⚠️ 관련 스킬 SKILL.md 조회 실패 ({skill_name}), 건너뜀: {e}")
+            continue
+
+        paths: List[str] = []
+        # MCP doc list if available
+        paths = [p for p in (docs_map.get(skill_name, []) or []) if p and p != "SKILL.md"]
+        if not paths:
+            # HTTP fallback
+            try:
+                files = get_skill_files(skill_name) or []
+                for fi in files:
+                    p = (fi.get("path") or "").strip()
+                    if p and p != "SKILL.md":
+                        paths.append(p)
+            except Exception as e:
+                log(f"   ⚠️ 관련 스킬 파일 목록 조회 실패 ({skill_name}): {e}")
+        # keep deterministic and short
+        paths = list(dict.fromkeys(paths))
+        block += f"파일 목록: {paths}\n"
+        block += f"참조 시 경로 형식(필수): {skill_name}/폴더/파일 (예: {skill_name}/references/workflows.md)\n"
+
+        part_len = len(block)
+        if total + part_len > cap:
+            block = block[: cap - total]
+            part_len = len(block)
+        parts.append(block)
+        total += part_len
+
+        # ---- file heads ----
+        for path in paths:
+            if total >= cap:
+                break
+            try:
+                # MCP-first, HTTP fallback
+                try:
+                    c = (await _read_skill_document(skill_name, path) or "").strip()
+                except Exception:
+                    fc = get_skill_file_content(skill_name, path)
+                    c = (fc.get("content") or "").strip()
+                head = c[:_RELATED_SKILL_FILE_HEAD_CHARS]
+                if len(c) > _RELATED_SKILL_FILE_HEAD_CHARS:
+                    head += "..."
+                line = f"\n--- [{path}] ---\n{head}\n"
+                line_len = len(line)
+                if total + line_len > cap:
+                    line = line[: cap - total]
+                    line_len = len(line)
+                parts.append(line)
+                total += line_len
+            except Exception as e:
+                log(f"   ⚠️ 관련 스킬 파일 내용 조회 실패 ({skill_name}/{path}): {e}")
+
+    if not parts:
+        return None
+    return "".join(parts).strip()
+
+
+_SKILL_CREATOR_SYSTEM = """You implement the skill-creator workflow. Given user feedback and (for UPDATE) existing skill content, produce a JSON object that will become SKILL.md and bundled files. Follow skill-creator rules. Aim for the same depth and structure as built-in skills (e.g. skill-creator, doc-coauthoring): concrete procedures, principles, reference paths, and examples.
+
 - name: hyphen-case (e.g. my-investment-skill). For UPDATE use the provided existing name.
-- description: 1–2 sentences for frontmatter; include WHEN to use this skill.
-- overview: short body overview.
-- steps: list of strings, e.g. ["Step one", "Step two"].
-- usage: optional string.
+- description: 1–2 sentences for frontmatter; include WHAT the skill does and WHEN to use it.
+- overview: short body overview (used only when body_markdown is omitted).
+- steps: list of strings, e.g. ["Step one", "Step two"]. Used only when body_markdown is omitted.
+- usage: optional string. Used only when body_markdown is omitted.
+- body_markdown: (optional, strongly recommended) Full markdown body for SKILL.md **without frontmatter**. When provided, overview/steps/usage are ignored for the body. Keep under ~500 lines. Include: Overview, When to Use (if needed), Core Principles or Capabilities, step-by-step process (with ### subsections where helpful), explicit references to bundled files, code blocks and tables where useful. If you add additional_files, the body must reference each of them (path + one-line purpose) for progressive disclosure. **Reference path format**: for files in *this* skill use `folder/file` (e.g. `references/guide.md`, `scripts/run.py`); for files in *related* (external) skills always use `skill-name/folder/file` (e.g. `skill-creator/references/workflows.md`). Related-skill references MUST include the skill name prefix.
 - additional_files: dict of path -> full content. **CRITICAL**:
   - Include ONLY (a) NEW files with **complete** content, (b) EXISTING files you are **explicitly modifying** with **full** new content.
   - Do NOT include existing files that you are not modifying—they will be preserved automatically.
   - NEVER use placeholders like "content about X", "# code for X", "# code to X". Always provide full, runnable code or full document text.
   - For NEW files: write complete implementation (entire script or entire reference doc). One-line stubs are forbidden.
+  - **references/** (e.g. references/*.md): Write as **professional reference docs**: clear ##/### sections, optional table of contents for long docs, "when to read this file" note, code examples, tables, best practices. Avoid one- or two-sentence stub content.
+  - **scripts/** (e.g. scripts/*.py): Write **runnable, complete implementations**: module/function docstrings (purpose, args, returns, usage), error handling, type hints where appropriate. No one-line stubs or TODO-only files.
+  - **assets/**: Only include files the agent can actually use or modify (templates, boilerplate). Omit if not needed; if included, ensure they are usable as-is.
 
-For UPDATE: preserve existing structure, sections, and files; integrate feedback as additions or refinements. Do not drop existing steps, overview, or files. Merge feedback into the existing content.
+For UPDATE: preserve existing structure, sections, and files; integrate feedback as additions or refinements. Do not drop existing steps, overview, or files. Merge feedback into the existing content. When modifying a file in additional_files, apply the same quality bar (references = professional reference; scripts = full runnable code).
 When [관계 분석] indicates EXTENDS or COMPLEMENTS: **preserve all existing content**; only add or refine from feedback. Do not remove existing steps or files. For additional_files, include only new files or files you are actually changing—omit the rest.
 
 LANGUAGE RULES (CRITICAL):
@@ -298,7 +507,9 @@ LANGUAGE RULES (CRITICAL):
 If there is any conflict between previous instructions and these language rules,
 the language rules take precedence for natural-language content.
 
-Output only valid JSON. No markdown, no explanation. Example: {"name":"x","description":"...","overview":"...","steps":["a","b"],"usage":"","additional_files":{}}"""
+When [관련 스킬 참고] is provided: use the listed skills and their file paths to add **explicit references** in overview, usage, or markdown body so that reference graphs can show cross-skill edges. **Reference path rule**: references to files *inside the current skill* use `folder/file` (e.g. `references/guide.md`). References to files in *related (external) skills* MUST use `skill-name/folder/file` (e.g. `skill-creator/references/workflows.md`). Never use bare `folder/file` for external skills—always prefix with the skill name. Do not invent paths; use the skill names and file paths from the context.
+
+Output only valid JSON. No markdown, no explanation. Example: {"name":"x","description":"...","overview":"...","steps":["a","b"],"usage":"","body_markdown":null,"additional_files":{}}"""
 
 
 async def _generate_skill_artifact_from_feedback(
@@ -308,6 +519,7 @@ async def _generate_skill_artifact_from_feedback(
     existing_skill_md: Optional[str],
     existing_additional_files: Optional[Dict[str, str]],
     relationship_analysis: Optional[str] = None,
+    related_skills_context: Optional[str] = None,
 ) -> Dict:
     """skill-creator 가이드에 따라 피드백과(선택) 기존 스킬 내용으로부터 skill_artifact JSON을 생성."""
     from langchain_core.messages import SystemMessage, HumanMessage
@@ -335,6 +547,8 @@ async def _generate_skill_artifact_from_feedback(
     user_parts = [lang_hint, f"\n피드백:\n{feedback_content}"]
     if relationship_analysis and str(relationship_analysis).strip():
         user_parts.append(f"\n[관계 분석 (EXTENDS/COMPLEMENTS 시 기존 내용 보존에 참고)]\n{relationship_analysis[:6000]}")
+    if related_skills_context and str(related_skills_context).strip():
+        user_parts.append(f"\n[관련 스킬 참고 (참조 경로·링크 생성에 활용)]\n{related_skills_context}")
     if operation == "UPDATE" and skill_id:
         user_parts.append(f"\n기존 스킬 이름 (반드시 name에 사용): {skill_id}")
         if existing_skill_md:
@@ -435,11 +649,13 @@ async def commit_to_skill_via_skill_creator(
     merge_mode: Optional[str] = None,
     skill_artifact: Optional[Dict] = None,
     relationship_analysis: Optional[str] = None,
+    related_skill_ids: Optional[str] = None,
 ) -> None:
     """
     computer-use + skill-creator로 스킬을 생성/갱신한 뒤 skill_api_client로 업로드.
     skill_artifact가 None이면 피드백과(UPDATE시) 기존 스킬을 바탕으로 skill-creator(LLM)가 생성.
     relationship_analysis가 있으면 스킬 생성 LLM 컨텍스트로 전달(EXTENDS/COMPLEMENTS 시 기존 내용 보존).
+    related_skill_ids가 있으면 해당 스킬들의 요약·경로·앞부분을 컨텍스트로 전달(스킬 간 참조 생성용).
     CREATE/UPDATE만 처리 (DELETE는 호출하지 않음).
     """
     # ----- skill_artifact가 없으면 skill-creator(LLM)가 피드백에서 생성 -----
@@ -468,6 +684,21 @@ async def commit_to_skill_via_skill_creator(
                         existing_files[p] = c
             except Exception as e:
                 log(f"   ⚠️ 기존 additional_files 조회 실패: {e}")
+        related_skills_context: Optional[str] = None
+        if related_skill_ids and str(related_skill_ids).strip():
+            try:
+                agent_info_for_related = _get_agent_by_id(agent_id)
+                tenant_id_for_related = agent_info_for_related.get("tenant_id") if agent_info_for_related else None
+            except Exception:
+                tenant_id_for_related = None
+            related_skills_context = await _build_related_skills_context(
+                related_skill_ids=related_skill_ids,
+                exclude_skill_id=skill_id if operation == "UPDATE" else None,
+                tenant_id=tenant_id_for_related,
+                task_description=(feedback_content or "")[:200] or "related skills context",
+            )
+            if related_skills_context:
+                log(f"   관련 스킬 컨텍스트 수집 완료 ({len(related_skills_context)}자)")
         log("   skill-creator(LLM)가 피드백으로 스킬 내용 생성 중...")
         skill_artifact = await _generate_skill_artifact_from_feedback(
             feedback_content=feedback_content,
@@ -476,6 +707,7 @@ async def commit_to_skill_via_skill_creator(
             existing_skill_md=existing_md,
             existing_additional_files=existing_files,
             relationship_analysis=relationship_analysis,
+            related_skills_context=related_skills_context,
         )
         log(f"   생성된 스킬 name={skill_artifact.get('name')}, steps={len(skill_artifact.get('steps') or [])}")
 
@@ -490,6 +722,7 @@ async def commit_to_skill_via_skill_creator(
     )
     overview = skill_artifact.get("overview")
     usage = skill_artifact.get("usage")
+    body_markdown = skill_artifact.get("body_markdown")
     art_files = skill_artifact.get("additional_files") or {}
 
     agent_info = _get_agent_by_id(agent_id)
@@ -535,9 +768,14 @@ async def commit_to_skill_via_skill_creator(
                 existing_files[k] = v
             art_files = existing_files
 
-    # CREATE: artifact만
+    # CREATE: artifact만 (body_markdown 있으면 본문으로 사용, 없으면 overview+steps+usage)
     skill_content = _format_skill_document(
-        skill_name, steps, description=description, overview=overview, usage=usage
+        skill_name,
+        steps,
+        description=description,
+        overview=overview,
+        usage=usage,
+        body_markdown=body_markdown,
     )
 
     # ----- 2) skill-creator 스크립트 조회 -----

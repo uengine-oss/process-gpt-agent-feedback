@@ -31,6 +31,7 @@ async def commit_to_skill(
     feedback_content: Optional[str] = None,
     merge_mode: Optional[str] = None,
     relationship_analysis: Optional[str] = None,
+    related_skill_ids: Optional[str] = None,
 ):
     """
     Skill로 CRUD 작업 수행. ReAct 경로에서는 skill_artifact=None이고, 스킬 내용은 skill-creator가 생성.
@@ -44,6 +45,7 @@ async def commit_to_skill(
         feedback_content: 원본 피드백. skill-creator가 내용 생성할 때 필수.
         merge_mode: UPDATE 시 MERGE | REPLACE.
         relationship_analysis: search_similar_knowledge 결과(관계 유형 분포·상세 분석). EXTENDS/COMPLEMENTS 시 기존 내용 보존에 활용.
+        related_skill_ids: 관련 스킬 이름/ID 쉼표 구분 문자열. 스킬 간 참조 생성에 활용.
     """
     try:
         agent_info = _get_agent_by_id(agent_id)
@@ -61,6 +63,7 @@ async def commit_to_skill(
                     merge_mode=merge_mode,
                     skill_artifact=skill_artifact,
                     relationship_analysis=relationship_analysis,
+                    related_skill_ids=related_skill_ids,
                 )
                 return
             except Exception as e:
@@ -78,6 +81,7 @@ async def commit_to_skill(
         description = (skill_artifact or {}).get("description", f"{skill_name or '스킬'} 작업을 수행하기 위한 단계별 절차입니다.")
         overview = (skill_artifact or {}).get("overview")
         usage = (skill_artifact or {}).get("usage")
+        body_markdown = (skill_artifact or {}).get("body_markdown")
         
         if operation == "DELETE":
             if not skill_name:
@@ -176,7 +180,9 @@ async def commit_to_skill(
                     operation = "CREATE"
                 else:
                     # SKILL.md 파일 업데이트 (frontmatter 규칙을 항상 만족하도록 생성)
-                    skill_document = _format_skill_document(skill_name, steps, description, overview, usage)
+                    skill_document = _format_skill_document(
+                        skill_name, steps, description=description, overview=overview, usage=usage, body_markdown=body_markdown
+                    )
                     
                     # 새 내용 구성 (변경 이력용 - skill_content 문자열만 저장)
                     new_content = skill_document
@@ -247,7 +253,9 @@ async def commit_to_skill(
                     raise ValueError(f"스킬 '{skill_name}'이(가) 이미 존재합니다. 수정하려면 UPDATE 작업을 사용하세요.")
                 
                 # 스킬 문서 생성 (frontmatter 규칙을 항상 만족하도록 생성)
-                skill_document = _format_skill_document(skill_name, steps, description, overview, usage)
+                skill_document = _format_skill_document(
+                    skill_name, steps, description=description, overview=overview, usage=usage, body_markdown=body_markdown
+                )
                 
                 # 새 내용 구성 (변경 이력용 - skill_content 문자열만 저장)
                 new_content = skill_document
@@ -297,64 +305,65 @@ async def commit_to_skill(
 
 
 def _format_skill_document(
-    skill_name: str, 
-    steps: List[str], 
+    skill_name: str,
+    steps: List[str],
     description: Optional[str] = None,
     overview: Optional[str] = None,
-    usage: Optional[str] = None
+    usage: Optional[str] = None,
+    body_markdown: Optional[str] = None,
 ) -> str:
     """
-    스킬 정보를 마크다운 문서 형식으로 변환
-    
+    스킬 정보를 마크다운 문서 형식으로 변환.
+
+    body_markdown이 있으면 frontmatter만 붙이고 본문은 body_markdown 그대로 사용(이중 모드).
+    없으면 기존처럼 개요 + 단계별 실행 절차 + 사용법으로 조립.
+
     Args:
         skill_name: 스킬 이름
-        steps: 스킬 단계 목록
+        steps: 스킬 단계 목록 (body_markdown 미사용 시에만 사용)
         description: 스킬 설명 (frontmatter용)
-        overview: 스킬 개요 (본문에 표시)
-        usage: 사용법 (선택적)
-    
+        overview: 스킬 개요 (본문에 표시, body_markdown 미사용 시)
+        usage: 사용법 (선택적, body_markdown 미사용 시)
+        body_markdown: 전체 본문 마크다운(frontmatter 제외). 있으면 overview/steps/usage 무시.
+
     Returns:
         마크다운 형식의 스킬 문서 (SKILL.md 규칙을 만족하는 frontmatter 포함)
     """
     if description is None:
         description = f"{skill_name} 작업을 수행하기 위한 단계별 절차입니다."
-    
-    if overview is None:
-        overview = description
 
     lines: List[str] = []
-
-    # --- Frontmatter (SKILL.md 필수 규칙) ---
     lines.append("---\n")
     lines.append(f"name: {skill_name}\n")
     lines.append(f"description: {description}\n")
     lines.append("---\n")
     lines.append("\n")
 
-    # 본문: 개요 → 단계별 실행 절차 → 사용법 순서
+    if body_markdown and body_markdown.strip():
+        # 이중 모드: 본문은 body_markdown 그대로 (개행 정규화만)
+        body = body_markdown.strip()
+        if not body.endswith("\n"):
+            body += "\n"
+        lines.append(body)
+        return "".join(lines)
+
+    # Fallback: 개요 → 단계별 실행 절차 → 사용법
+    if overview is None:
+        overview = description
     lines.append(f"# {skill_name}\n")
     lines.append("\n")
-    
-    # 개요 섹션
     lines.append("## 개요\n")
     lines.append(f"{overview}\n")
     lines.append("\n")
-    
-    # 단계별 실행 절차 섹션 (steps가 있는 경우만)
     if steps:
         lines.append("## 단계별 실행 절차\n")
         lines.append("\n")
-        
         for idx, step in enumerate(steps, start=1):
             lines.append(f"{idx}. {step}\n")
-        
         lines.append("\n")
-    
-    # 사용법 섹션 (선택적)
     if usage:
         lines.append("## 사용법\n")
         lines.append("\n")
         lines.append(f"{usage}\n")
         lines.append("\n")
-    
     return "".join(lines)

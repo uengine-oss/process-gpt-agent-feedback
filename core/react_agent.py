@@ -140,6 +140,7 @@ def create_react_prompt(tools: List, content_type: str = "feedback") -> ChatProm
 **⚠️ 중요: 목표/페르소나 자체를 저장하지 말고, 목표/페르소나에서 도출된 구체적인 규칙/절차/선호도를 저장하세요.**
 
 ### [STEP 2] 기존 지식 심층 파악
+**`search_similar_knowledge`를 호출할 때 content 인자에는 반드시 목표(Goal)와 페르소나(Persona)를 모두 포함한 분석용 텍스트를 넣으세요. 목표만 넣지 마세요.**
 `search_similar_knowledge`와 `get_knowledge_detail`로 기존 지식을 조회한 후:
 - 기존 지식의 **적용 범위와 조건**은 무엇인가?
 - 목표/페르소나의 범위와 기존 지식의 범위가 **겹치는가? 포함되는가? 독립적인가?**
@@ -147,7 +148,8 @@ def create_react_prompt(tools: List, content_type: str = "feedback") -> ChatProm
 
 **⚠️ 스킬: ReAct은 저장소·관계만 판단. 스킬 내용(SKILL.md, steps, additional_files)은 전부 skill-creator가 생성.**
 - **ReAct의 역할:** (1) 저장소가 SKILL인지 (2) CREATE vs UPDATE vs DELETE (3) UPDATE/DELETE 시 skill_id(기존 스킬 이름). **이 세 가지만** 판단하고 `commit_to_skill(operation=..., skill_id=...)` 호출. `skill_artifact_json`·`steps`·`additional_files` 등은 넘기지 않음. 목표/페르소나는 도구 외부에서 자동 전달.
-- `search_similar_knowledge`에서 **관련 스킬이 하나라도 있으면** (COMPLEMENTS, EXTENDS, REFINES 등): `commit_to_skill(operation="UPDATE", skill_id=기존스킬이름)`. **CREATE는 관련 기존 스킬이 전혀 없을 때만.**
+- **UPDATE:** 기존 스킬과 **동일한 적용 범위·동일한 절차**를 수정·보완할 때만 사용 (예: 같은 "포트폴리오 수집" 절차의 세부 단계만 변경).
+- **CREATE:** 목표/페르소나에서 도출된 **에이전트 전용 절차**가 있고, 기존 스킬과 **다른 범위/다른 목적**이면 (예: "포트폴리오 분석 문서 생성"처럼 기존 스킬을 **참조**하는 새 워크플로우) → **CREATE**하고 `related_skill_ids`에 기존 스킬 이름(예: global-investment-analyzer)을 넣으세요. 관련 스킬이 있다고 해서 무조건 UPDATE하지 마세요.
 
 ### [STEP 3] 관계 추론 및 근거 제시
 **반드시** 다음 형식으로 추론 결과를 명시하세요:
@@ -167,7 +169,7 @@ def create_react_prompt(tools: List, content_type: str = "feedback") -> ChatProm
 | EXCEPTION | 기존 규칙의 예외 | 유지 + 예외 규칙 추가 |
 | CONFLICTS | 상충/모순 | 판단 필요 (어느 것이 맞는가?) |
 | SUPERSEDES | 명시적 대체 | 삭제 후 새로 생성 |
-| COMPLEMENTS | 다른 측면 | **SKILL: 유지 + 기존 스킬에 통합(UPDATE) 우선.** 통합 불가 시에만 별도 생성. MEMORY/DMN: 유지+별도 생성 |
+| COMPLEMENTS | 다른 측면 | **SKILL: 에이전트 전용 새 절차이면 CREATE + related_skill_ids 권장.** 기존 스킬과 완전히 같은 내용이면 UPDATE 또는 무시. MEMORY/DMN: 유지+별도 생성 |
 | UNRELATED | 무관 | 유지 + 별도 생성 |
 
 ### [STEP 4] 자기 검증 (반드시 수행)
@@ -357,7 +359,7 @@ Q3: 최종 결과가 에이전트의 목표/페르소나와 기존 지식 모두
 
 **⚠️ 스킬: ReAct은 저장소·관계만 판단. 스킬 내용(SKILL.md, steps, additional_files)은 전부 skill-creator가 생성.**
 - **ReAct의 역할:** (1) 저장소가 SKILL인지 (2) CREATE vs UPDATE vs DELETE (3) UPDATE/DELETE 시 skill_id(기존 스킬 이름). **이 세 가지만** 판단하고 `commit_to_skill(operation=..., skill_id=...)` 호출. `skill_artifact_json`·`steps`·`additional_files` 등은 넘기지 않음. 피드백은 도구 외부에서 자동 전달.
-- `search_similar_knowledge`에서 **관련 스킬이 하나라도 있으면** (COMPLEMENTS, EXTENDS, REFINES 등): `commit_to_skill(operation="UPDATE", skill_id=기존스킬이름)`. **CREATE는 관련 기존 스킬이 전혀 없을 때만.**
+- **UPDATE:** 기존 스킬과 **동일한 적용 범위·동일한 절차**를 수정·보완할 때만. **CREATE:** 피드백이 기존 스킬을 **참조**하는 **새 절차**이면 CREATE하고 `related_skill_ids`에 기존 스킬 이름을 넣으세요. 관련 스킬이 있다고 해서 무조건 UPDATE하지 마세요.
 - 관계/범위 판단을 위해 `get_knowledge_detail`로 기존 스킬을 조회해도 되지만, **내용 병합·파일 생성은 skill-creator가** 피드백과 기존 스킬을 받아 수행.
 
 ### [STEP 3] 관계 추론 및 근거 제시
@@ -378,7 +380,7 @@ Q3: 최종 결과가 에이전트의 목표/페르소나와 기존 지식 모두
 | EXCEPTION | 기존 규칙의 예외 | 유지 + 예외 규칙 추가 |
 | CONFLICTS | 상충/모순 | 판단 필요 (어느 것이 맞는가?) |
 | SUPERSEDES | 명시적 대체 | 삭제 후 새로 생성 |
-| COMPLEMENTS | 다른 측면 | **SKILL: 유지 + 기존 스킬에 통합(UPDATE) 우선.** 통합 불가 시에만 별도 생성. MEMORY/DMN: 유지+별도 생성 |
+| COMPLEMENTS | 다른 측면 | **SKILL: 에이전트 전용 새 절차이면 CREATE + related_skill_ids 권장.** 기존 스킬과 완전히 같은 내용이면 UPDATE 또는 무시. MEMORY/DMN: 유지+별도 생성 |
 | UNRELATED | 무관 | 유지 + 별도 생성 |
 
 ### [STEP 4] 자기 검증 (반드시 수행)
@@ -632,6 +634,7 @@ def _format_input_text(
 {persona_section}
 
 위 정보를 바탕으로 Thought → Action → Observation 사이클을 반복하여 에이전트의 기억(MEMORY), 규칙(DMN_RULE), 스킬(SKILL)을 생성하거나 수정하세요.
+**`search_similar_knowledge`를 호출할 때 content 인자에는 반드시 목표(Goal)와 페르소나(Persona)를 모두 포함한 분석용 텍스트를 넣으세요. 목표만 넣지 마세요.**
 기존 지식이 있으면 먼저 `search_similar_knowledge`로 확인한 후, 적절한 작업(CREATE/UPDATE/DELETE)을 결정하세요.
 최종적으로 Final Answer로 처리 결과를 보고하세요."""
     else:

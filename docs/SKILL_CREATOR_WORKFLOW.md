@@ -42,13 +42,14 @@ MEMORY·DMN_RULE은 기존 경로 그대로, SKILL만 플래그에 따라 skill-
 | 1 | `polling_manager` | `fetch_feedback_task`로 피드백 조회, `match_feedback_to_agents`로 에이전트별 학습 후보 생성 |
 | 2 | `react_agent.process_feedback_with_react` | ReAct 에이전트 실행. `feedback_content`를 `create_feedback_react_agent` → `create_react_tools`에 전달 |
 | 3 | `react_tools` | 도구: `search_similar_knowledge`, `get_knowledge_detail`, `analyze_knowledge_conflict`, `commit_to_skill` 등 |
-| 4 | `commit_skill_wrapper` | `_commit_skill_tool(agent_id, operation, skill_id, merge_mode, feedback_content)` 호출. `feedback_content`는 클로저에서. |
-| 5 | `_commit_skill_tool` | `commit_to_skill(agent_id, skill_artifact=None, operation, skill_id, feedback_content, merge_mode)` 호출 |
+| 4 | `commit_skill_wrapper` | `_commit_skill_tool(agent_id, operation, skill_id, merge_mode, feedback_content, relationship_analysis, related_skill_ids)` 호출. `feedback_content`는 클로저에서. |
+| 5 | `_commit_skill_tool` | `commit_to_skill(agent_id, skill_artifact=None, operation, skill_id, feedback_content, merge_mode, relationship_analysis, related_skill_ids)` 호출 |
 | 6 | `skill_committer.commit_to_skill` | **분기**: skill-creator 조건 충족 시 `commit_to_skill_via_skill_creator(..., skill_artifact=skill_artifact)`, 아니면 기존 HTTP |
 
 **ReAct 에이전트 역할 (스킬): 저장소·관계만. 스킬 내용은 skill-creator가 생성.**
-- ReAct은 **(1) 저장소=SKILL (2) CREATE vs UPDATE vs DELETE (3) UPDATE/DELETE 시 skill_id** 만 판단. `commit_to_skill(operation=..., skill_id=...)` 호출. `skill_artifact_json`·`steps`·`additional_files`는 **넘기지 않음**. 피드백은 `create_react_tools(feedback_content)`에서 자동 전달.
+- ReAct은 **(1) 저장소=SKILL (2) CREATE vs UPDATE vs DELETE (3) UPDATE/DELETE 시 skill_id** 만 판단. `commit_to_skill(operation=..., skill_id=..., relationship_analysis=..., related_skill_ids=...)` 호출. `skill_artifact_json`·`steps`·`additional_files`는 **넘기지 않음**. 피드백은 `create_react_tools(feedback_content)`에서 자동 전달.
 - `search_similar_knowledge`에서 **관련 스킬이 하나라도 있으면**: `commit_to_skill(operation="UPDATE", skill_id=기존스킬이름)`. **CREATE는 관련 기존 스킬이 전혀 없을 때만.**
+- **관련 스킬을 찾았으면** `related_skill_ids`에 해당 스킬 이름/ID를 쉼표 구분으로 전달하면, skill-creator가 해당 스킬의 요약·경로·앞부분을 컨텍스트로 받아 **스킬 간 참조(링크/경로)**를 생성하고 참조 그래프에 스킬 간 엣지가 표시되도록 할 수 있음. 참조 경로 규칙: 같은 스킬 내부는 `폴더/파일명`, 관련 스킬(외부)은 반드시 `스킬명/폴더/파일명` 형식으로 작성.
 - **스킬 내용(SKILL.md, steps, additional_files)** 생성·병합은 **skill-creator**가 피드백과(UPDATE 시) 기존 스킬을 받아 **LLM으로** 수행.
 - **`commit_to_skill`을 호출하지 않고** Final Answer만 쓰면 `no_commit` 실패.
 
@@ -57,8 +58,8 @@ MEMORY·DMN_RULE은 기존 경로 그대로, SKILL만 플래그에 따라 skill-
 ## 3. skill_committer 분기 로직
 
 ```
-commit_to_skill(agent_id, skill_artifact=None, operation, skill_id, feedback_content, merge_mode)
-  ※ ReAct 경로: skill_artifact=None. learning_committer 등: skill_artifact 전달.
+commit_to_skill(agent_id, skill_artifact=None, operation, skill_id, feedback_content, merge_mode, relationship_analysis, related_skill_ids)
+  ※ ReAct 경로: skill_artifact=None. learning_committer 등: skill_artifact 전달. related_skill_ids는 관련 스킬 이름 쉼표 구분.
     │
     ├─ operation == "DELETE"
     │      → skill_api_client.delete_skill + update_agent_and_tenant_skills + record_knowledge_history
@@ -85,14 +86,18 @@ commit_to_skill(agent_id, skill_artifact=None, operation, skill_id, feedback_con
 
 ### 4.1 입력·사전 준비
 
-**skill_artifact가 None (ReAct 경로)일 때:** `_generate_skill_artifact_from_feedback`가 **skill-creator 가이드에 따라 LLM**을 호출해 피드백과(UPDATE 시) 기존 SKILL.md·additional_files로부터 `{name, description, overview, steps, usage, additional_files}` JSON을 생성. 생성 후 아래와 동일하게 진행.
+**skill_artifact가 None (ReAct 경로)일 때:** `_generate_skill_artifact_from_feedback`가 **skill-creator 가이드에 따라 LLM**을 호출해 피드백과(UPDATE 시) 기존 SKILL.md·additional_files로부터 `{name, description, overview, steps, usage, body_markdown?, additional_files}` JSON을 생성. `related_skill_ids`가 있으면 해당 스킬들의 요약·파일 경로·파일 앞부분을 `[관련 스킬 참고]` 컨텍스트로 넣어 LLM이 스킬 간 참조(링크·경로)를 생성하도록 함. 본문에서 관련 스킬 파일을 참조할 때는 반드시 `스킬명/폴더/파일명` 형식(예: `skill-creator/references/workflows.md`)을 사용하고, 같은 스킬 내부만 `폴더/파일명`(예: `references/guide.md`)을 사용함. 생성 후 아래와 동일하게 진행.
+
+**SKILL.md 본문 품질:** 목표는 내장 스킬(skill-creator, doc-coauthoring 등)과 유사한 수준. LLM은 선택적으로 `body_markdown`을 출력할 수 있으며, 제공 시 `_format_skill_document`는 frontmatter만 붙이고 본문은 `body_markdown` 그대로 사용(이중 모드). `body_markdown`이 없으면 기존처럼 `overview` + `steps` + `usage`로 3섹션 조립. `body_markdown` 사용 시 Overview, When to Use, Core Principles/Capabilities, 단계별 절차(서브섹션), references/·scripts 참조 문구, 코드 블록·표 등을 권장.
+
+**스킬 내부 파일 품질:** `additional_files`의 references/는 전문 레퍼런스 수준(섹션 구조, when-to-read, 코드 예시·표), scripts/는 실행 가능·docstring·에러 처리 갖춘 완전한 구현, assets/는 에이전트가 실제 참조·수정할 수 있는 완성도로 작성되도록 프롬프트에 반영됨.
 
 | 항목 | CREATE | UPDATE |
 |------|--------|--------|
 | skill_name | `skill_artifact["name"]` (LLM 생성 또는 `skill_id`) | `skill_id` (필수) |
 | 기존 파일 | 없음 | `get_skill_files` + `get_skill_file_content`로 SKILL.md, scripts/, references/ 수집 (LLM 입력·병합용) |
 | additional_files | `skill_artifact["additional_files"]` | `existing_files` 위에 `skill_artifact["additional_files"]`로 덮어쓰기 |
-| SKILL.md 본문 | `_format_skill_document(skill_name, steps, description, overview, usage)` | 동일 |
+| SKILL.md 본문 | `_format_skill_document(..., body_markdown=artifact.get("body_markdown"))` — body_markdown 있으면 본문으로 사용, 없으면 overview+steps+usage | 동일 |
 
 ### 4.2 MCP 사용
 

@@ -10,7 +10,7 @@ from mem0 import Memory
 from utils.logger import log, handle_error
 from dotenv import load_dotenv
 from core.database import get_db_client, _get_agent_by_id
-from core.mcp_client import get_mcp_tools, get_mcp_tools_async, get_mcp_tool_by_name
+from core.mcp_client import get_mcp_tools, get_mcp_tools_async, get_mcp_tool_by_name, get_mcp_tool_by_name_async
 from core.skill_api_client import (
     check_skill_exists_with_info,
     get_skill_file_content,
@@ -34,6 +34,12 @@ if not all([DB_USER, DB_PASSWORD, DB_HOST, DB_PORT, DB_NAME]):
     raise ValueError("❌ DB 연결 환경 변수가 설정되지 않았습니다. .env 파일을 확인해주세요.")
 
 CONNECTION_STRING = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+
+# 스킬 조회: 관련도 기반 선택·집중 (이 값 미만이면 컨텍스트에서 제외, None이면 제외 안 함)
+MIN_SKILL_RELEVANCE_THRESHOLD = 0.5
+
+# 스킬 검색 시 MCP find_helpful_skills에 넘길 작업 설명 길이 (목표+페르소나 일부로 시장 조사·보고서 등 관련 스킬 상위 노출)
+SKILL_SEARCH_CONTEXT_CHARS = 220
 
 
 # ============================================================================
@@ -212,9 +218,12 @@ def _parse_skill_markdown(text: str) -> List[Dict]:
         if source_match:
             skill["source"] = source_match.group(1).strip()
             # source에서 ID 추출 시도 (경로나 URL에서)
+            # 숫자만 있는 세그먼트(예: 순위/인덱스)는 스킬 ID로 쓰지 않음 → phantom SKILL:1 방지
             id_match = re.search(r'/([^/]+)/SKILL\.md', skill["source"])
             if id_match:
-                skill["id"] = id_match.group(1)
+                path_segment = id_match.group(1)
+                if not (path_segment.isdigit() or (path_segment.startswith("-") and path_segment[1:].isdigit())):
+                    skill["id"] = path_segment
         
         # Scope 추출
         scope_match = re.search(r'Scope:\s*(.+?)(?:\n|$)', section)
@@ -231,20 +240,19 @@ def _parse_skill_markdown(text: str) -> List[Dict]:
         if content_match:
             skill["content"] = content_match.group(1).strip()
         
-        # name 기반으로 ID 생성 (아직 ID가 없는 경우)
+        # name 기반으로 ID 생성 (아직 ID가 없거나 skill_N 형태인 경우)
         if "id" not in skill or skill["id"].startswith("skill_"):
-            # source에서 마지막 경로 요소 추출
+            # source에서 마지막 경로 요소 추출 (숫자만 있는 세그먼트는 스킵)
             if "source" in skill:
-                # URL이나 경로에서 마지막 부분 추출
                 parts = re.split(r'[/\\]', skill["source"])
                 for part in reversed(parts):
                     if part and part != "SKILL.md" and not part.endswith(".md"):
-                        skill["id"] = part
-                        break
+                        if not (part.isdigit() or (part.startswith("-") and part[1:].isdigit())):
+                            skill["id"] = part
+                            break
             
             # 여전히 ID가 없으면 name 기반 생성
             if "id" not in skill or skill["id"].startswith("skill_"):
-                # name을 기반으로 URL 안전한 ID 생성
                 safe_id = re.sub(r'[^\w\s-]', '', skill_name)
                 safe_id = re.sub(r'[-\s]+', '-', safe_id).lower()
                 if safe_id:
@@ -257,12 +265,73 @@ def _parse_skill_markdown(text: str) -> List[Dict]:
     return skills
 
 
-async def retrieve_existing_skills(agent_id: str, search_text: str = "", top_k: int = 10, tenant_id: Optional[str] = None, agent_skills: Optional[str] = None, skip_detail_fetch: bool = False, only_uploaded_skills: bool = False) -> List[Dict]:
+def _normalize_skill_id(skill: Dict) -> None:
+    """
+    스킬 ID가 순위/인덱스용 숫자(또는 skill_N)일 경우 name/skill_name으로 치환.
+    phantom SKILL:1 등 잘못된 레지스트리 등록 방지.
+    """
+    sid = skill.get("id")
+    name = skill.get("name") or skill.get("skill_name") or ""
+    if not name:
+        return
+    # int 또는 숫자 문자열이면 실제 스킬 이름으로 교체
+    if isinstance(sid, int) or (isinstance(sid, str) and sid.isdigit()):
+        skill["id"] = name
+        return
+    # "-N" 형태
+    if isinstance(sid, str) and len(sid) > 1 and sid.startswith("-") and sid[1:].isdigit():
+        skill["id"] = name
+        return
+    # skill_1, skill_2 등 파싱용 임시 ID면 name으로 교체
+    if isinstance(sid, str) and sid.startswith("skill_") and sid[5:].isdigit():
+        skill["id"] = name
+        return
+
+
+def _extract_mcp_result_text(res: Any) -> str:
+    """MCP 도구 결과에서 문자열 추출."""
+    if res is None:
+        return ""
+    if isinstance(res, str):
+        return res
+    if isinstance(res, list):
+        return "".join(
+            str(x.get("text", "")) for x in res if isinstance(x, dict) and "text" in x
+        )
+    if isinstance(res, dict):
+        c = res.get("content")
+        if isinstance(c, str):
+            return c
+        if isinstance(c, list):
+            return "".join(
+                str(x.get("text", "")) for x in c if isinstance(x, dict) and "text" in x
+            )
+        return res.get("text") or res.get("output") or ""
+    return str(res)
+
+
+async def _read_skill_document_mcp(skill_name: str, document_path: str = "SKILL.md") -> str:
+    """MCP read_skill_document로 스킬 문서 내용 조회 (내장 스킬용)."""
+    for tool_name in ("read_skill_document", "mcp_claude-skills_read_skill_document"):
+        tool = await get_mcp_tool_by_name_async(tool_name)
+        if tool is not None:
+            try:
+                out = await tool.ainvoke({
+                    "skill_name": skill_name,
+                    "document_path": document_path,
+                })
+                return (_extract_mcp_result_text(out) or "").strip()
+            except Exception as e:
+                log(f"   ⚠️ MCP read_skill_document 실패 ({skill_name}/{document_path}): {e}")
+    return ""
+
+
+async def retrieve_existing_skills(agent_id: str, search_text: str = "", top_k: int = 10, tenant_id: Optional[str] = None, agent_skills: Optional[str] = None) -> List[Dict]:
     """
     MCP 서버와 HTTP API를 통해 에이전트의 기존 스킬 조회
     
     벡터 유사도 검색(MCP 도구)과 정확한 스킬 존재 확인(HTTP API)을 결합하여 조회합니다.
-    업로드된 스킬은 HTTP API로, 기본 내장 스킬은 MCP read_skill_document 도구로 조회합니다.
+    업로드된 스킬은 HTTP API로, 내장 스킬은 MCP read_skill_document 도구로 조회합니다.
     
     Args:
         agent_id: 에이전트 ID (현재는 사용되지 않지만 향후 확장 가능)
@@ -271,8 +340,6 @@ async def retrieve_existing_skills(agent_id: str, search_text: str = "", top_k: 
         top_k: 최대 반환할 스킬 개수 (기본값: 10)
         tenant_id: 테넌트 ID (MCP 서버에 전달)
         agent_skills: 데이터베이스에 저장된 에이전트의 기존 스킬 목록 (선택적)
-        skip_detail_fetch: True면 상세 내용 조회 건너뛰기 (배치 작업 등 빠른 조회용)
-        only_uploaded_skills: True면 업로드된 스킬(HTTP API로 조회 가능한 스킬)만 반환, 기본 내장 스킬 제외 (배치 작업용)
     
     Returns:
         기존 스킬 목록 (HTTP API와 MCP 서버 응답 형식을 통합)
@@ -313,75 +380,6 @@ async def retrieve_existing_skills(agent_id: str, search_text: str = "", top_k: 
         if uploaded_skills_set:
             log(f"   📋 최종 업로드된 스킬 목록: {len(uploaded_skills_set)}개 ({', '.join(list(uploaded_skills_set)[:5])}{'...' if len(uploaded_skills_set) > 5 else ''})")
         
-        # only_uploaded_skills가 True면 업로드된 스킬만 조회 (배치 작업용)
-        if only_uploaded_skills:
-            log(f"   🔍 배치 작업 모드: 업로드된 스킬만 조회 (기본 내장 스킬 제외)")
-            # agent_skills에서 업로드된 스킬만 필터링
-            if agent_skills:
-                allowed_skill_names = [s.strip() for s in agent_skills.split(",") if s.strip()]
-                for skill_name in allowed_skill_names:
-                    if skill_name in uploaded_skills_set:
-                        try:
-                            skill_info = check_skill_exists_with_info(skill_name)
-                            if skill_info and skill_info.get("exists"):
-                                try:
-                                    skill_file_info = get_skill_file_content(skill_name, "SKILL.md")
-                                    skill_content = skill_file_info.get("content", "")
-                                    
-                                    skill_dict = {
-                                        "id": skill_name,
-                                        "name": skill_name,
-                                        "skill_name": skill_name,
-                                        "description": skill_info.get("description", ""),
-                                        "source": skill_info.get("source", ""),
-                                        "document_count": skill_info.get("document_count", 0),
-                                        "content": skill_content,
-                                        "verified": True,
-                                        "is_builtin": False,
-                                    }
-                                    
-                                    results.append(skill_dict)
-                                    skill_names_found.add(skill_name)
-                                    log(f"   ✅ 업로드된 스킬 조회: {skill_name}")
-                                except Exception as e:
-                                    log(f"   ⚠️ 업로드된 스킬 파일 조회 실패 ({skill_name}): {e}")
-                        except Exception as e:
-                            log(f"   ⚠️ 업로드된 스킬 확인 실패 ({skill_name}): {e}")
-            
-            # 업로드된 스킬 목록에서도 조회 (agent_skills에 없는 경우도 포함)
-            for skill_name in uploaded_skills_set:
-                if skill_name in skill_names_found:
-                    continue
-                try:
-                    skill_info = check_skill_exists_with_info(skill_name)
-                    if skill_info and skill_info.get("exists"):
-                        try:
-                            skill_file_info = get_skill_file_content(skill_name, "SKILL.md")
-                            skill_content = skill_file_info.get("content", "")
-                            
-                            skill_dict = {
-                                "id": skill_name,
-                                "name": skill_name,
-                                "skill_name": skill_name,
-                                "description": skill_info.get("description", ""),
-                                "source": skill_info.get("source", ""),
-                                "document_count": skill_info.get("document_count", 0),
-                                "content": skill_content,
-                                "verified": True,
-                                "is_builtin": False,
-                            }
-                            
-                            results.append(skill_dict)
-                            skill_names_found.add(skill_name)
-                            log(f"   ✅ 업로드된 스킬 조회: {skill_name}")
-                        except Exception as e:
-                            log(f"   ⚠️ 업로드된 스킬 파일 조회 실패 ({skill_name}): {e}")
-                except Exception as e:
-                    log(f"   ⚠️ 업로드된 스킬 확인 실패 ({skill_name}): {e}")
-            
-            log(f"✅ 업로드된 스킬만 조회 완료: 총 {len(results)}개 스킬")
-            return results[:top_k]
-        
         # 1. 특정 스킬 이름으로 검색하는 경우
         # (search_text가 짧고 특정 스킬 이름처럼 보이는 경우)
         if search_text and len(search_text.strip()) < 100:
@@ -417,8 +415,23 @@ async def retrieve_existing_skills(agent_id: str, search_text: str = "", top_k: 
                 except Exception as e:
                     log(f"   ⚠️ HTTP API 스킬 확인 실패: {e}")
             else:
-                # 기본 내장 스킬은 피드백 처리 대상이 아니므로 조회/로딩을 스킵
-                log(f"   ℹ️ 기본 내장 스킬은 조회 대상이 아님, 건너뜀: {skill_name_candidate}")
+                # 업로드된 스킬이 아니면 MCP(내장 스킬)로 조회
+                content = await _read_skill_document_mcp(skill_name_candidate, "SKILL.md")
+                if content:
+                    skill_dict = {
+                        "id": skill_name_candidate,
+                        "name": skill_name_candidate,
+                        "skill_name": skill_name_candidate,
+                        "description": "",
+                        "source": "",
+                        "document_count": 0,
+                        "content": content,
+                        "verified": False,
+                        "is_builtin": True,
+                    }
+                    results.append(skill_dict)
+                    skill_names_found.add(skill_name_candidate)
+                    log(f"   ✅ 내장 스킬 조회 (MCP): {skill_name_candidate}")
 
         # 2. MCP 도구를 통한 벡터 유사도 검색 (작업 설명 기반 검색)
         try:
@@ -468,140 +481,25 @@ async def retrieve_existing_skills(agent_id: str, search_text: str = "", top_k: 
                 # MCP 결과 파싱 (타임아웃 시 빈 리스트)
                 mcp_skills = _parse_mcp_skill_result(mcp_result) if mcp_result is not None else []
                 
-                # MCP 결과를 처리: 업로드된 스킬만 사용 (기본 내장 스킬은 피드백 처리 대상이 아님)
-                # skip_detail_fetch가 True면 상세 조회 건너뛰기
-                if skip_detail_fetch:
-                    # 배치 작업 등 빠른 조회: MCP 벡터 검색 결과만 사용 (상세 조회 안 함)
-                    for mcp_skill in mcp_skills:
-                        skill_name = mcp_skill.get("name") or mcp_skill.get("skill_name", "")
-                        if not skill_name or skill_name in skill_names_found:
-                            continue
-                        # 업로드된 스킬만 유지, 기본 내장 스킬은 건너뜀
-                        if skill_name not in uploaded_skills_set:
-                            log(f"   ℹ️ 기본 내장 스킬 (벡터 검색 결과) 건너뜀: {skill_name}")
-                            continue
-
-                        mcp_skill["verified"] = False
-                        mcp_skill["is_builtin"] = False
-                        results.append(mcp_skill)
-                        skill_names_found.add(skill_name)
-                else:
-                    # 일반 조회: 업로드된 스킬에 대해서만 상세 내용 조회
-                    read_skill_tool = None
-                    # 기본 내장 스킬은 아예 사용하지 않으므로 read_skill_document 도구는 사용하지 않음
+                for mcp_skill in mcp_skills:
+                    skill_name = mcp_skill.get("name") or mcp_skill.get("skill_name", "")
+                    if not skill_name or skill_name in skill_names_found:
+                        continue
                     
-                    for mcp_skill in mcp_skills:
-                        skill_name = mcp_skill.get("name") or mcp_skill.get("skill_name", "")
-                        if not skill_name or skill_name in skill_names_found:
-                            continue
-                        
-                        # 업로드된 스킬인 경우 HTTP API 사용
-                        # agent_skills에 있는 스킬도 업로드된 스킬로 간주 (HTTP API로 확인)
-                        is_uploaded_skill = skill_name in uploaded_skills_set
-                        if not is_uploaded_skill and agent_skills:
-                            # agent_skills에 있으면 HTTP API로 확인
-                            allowed_skill_names = [s.strip() for s in agent_skills.split(",") if s.strip()]
-                            if skill_name in allowed_skill_names:
-                                try:
-                                    skill_info = check_skill_exists_with_info(skill_name)
-                                    if skill_info and skill_info.get("exists"):
-                                        is_uploaded_skill = True
-                                        uploaded_skills_set.add(skill_name)  # 캐시에 추가
-                                        log(f"   ✅ agent_skills에서 업로드된 스킬 확인 (벡터 검색 결과): {skill_name}")
-                                except Exception as e:
-                                    log(f"   ⚠️ agent_skills 스킬 확인 실패 ({skill_name}): {e}")
-                        
-                        if is_uploaded_skill:
+                    is_uploaded_skill = skill_name in uploaded_skills_set
+                    if not is_uploaded_skill and agent_skills:
+                        allowed_skill_names = [s.strip() for s in agent_skills.split(",") if s.strip()]
+                        if skill_name in allowed_skill_names:
                             try:
                                 skill_info = check_skill_exists_with_info(skill_name)
                                 if skill_info and skill_info.get("exists"):
-                                    try:
-                                        skill_file_info = get_skill_file_content(skill_name, "SKILL.md")
-                                        skill_content = skill_file_info.get("content", "")
-                                        
-                                        combined_skill = {
-                                            **mcp_skill,
-                                            "id": skill_name,
-                                            "name": skill_name,
-                                            "skill_name": skill_name,
-                                            "description": skill_info.get("description", mcp_skill.get("description", "")),
-                                            "source": skill_info.get("source", mcp_skill.get("source", "")),
-                                            "document_count": skill_info.get("document_count", 0),
-                                            "content": skill_content if skill_content else mcp_skill.get("content", ""),
-                                            "verified": True,
-                                            "is_builtin": False,
-                                        }
-                                        
-                                        results.append(combined_skill)
-                                        skill_names_found.add(skill_name)
-                                        log(f"   ✅ 업로드된 스킬 (HTTP API): {skill_name}")
-                                    except Exception as e:
-                                        log(f"   ⚠️ 업로드된 스킬 파일 조회 실패 ({skill_name}): {e}")
-                                        # 파일 조회 실패해도 MCP 결과와 기본 정보는 추가
-                                        combined_skill = {
-                                            **mcp_skill,
-                                            "id": skill_name,
-                                            "name": skill_name,
-                                            "skill_name": skill_name,
-                                            "description": skill_info.get("description", mcp_skill.get("description", "")),
-                                            "source": skill_info.get("source", mcp_skill.get("source", "")),
-                                            "document_count": skill_info.get("document_count", 0),
-                                            "verified": True,
-                                            "is_builtin": False,
-                                        }
-                                        results.append(combined_skill)
-                                        skill_names_found.add(skill_name)
+                                    is_uploaded_skill = True
+                                    uploaded_skills_set.add(skill_name)
+                                    log(f"   ✅ agent_skills에서 업로드된 스킬 확인 (벡터 검색 결과): {skill_name}")
                             except Exception as e:
-                                log(f"   ⚠️ 업로드된 스킬 HTTP API 확인 실패 ({skill_name}): {e}")
-                                # 실패 시 MCP 결과만 사용
-                                mcp_skill["verified"] = False
-                                mcp_skill["is_builtin"] = False
-                                results.append(mcp_skill)
-                                skill_names_found.add(skill_name)
-                        else:
-                            # 기본 내장 스킬은 피드백 처리 및 에이전트 스킬 후보에서 제외
-                            log(f"   ℹ️ 기본 내장 스킬 (벡터 검색 결과) 건너뜀: {skill_name}")
-            else:
-                tool_names = [t.name for t in tools if hasattr(t, "name")]
-                log(f"   ⚠️ find_helpful_skills 도구를 찾을 수 없습니다. 사용 가능한 도구: {tool_names}")
-        except Exception as e:
-            log(f"   ⚠️ MCP 도구를 통한 스킬 검색 실패: {e}")
-
-        # 3. agent_skills에 명시된 스킬들도 확인 (업로드된 스킬만 사용, 기본 내장 스킬은 무시)
-        # skip_detail_fetch가 True면 상세 내용 조회 건너뛰고 이름만 추가
-        if agent_skills:
-            allowed_skill_names = [s.strip() for s in agent_skills.split(",") if s.strip()]
-            
-            if skip_detail_fetch:
-                # 배치 작업 등 빠른 조회가 필요한 경우: 상세 내용 없이 이름만 추가
-                for skill_name in allowed_skill_names:
-                    if skill_name in skill_names_found:
-                        continue
+                                log(f"   ⚠️ agent_skills 스킬 확인 실패 ({skill_name}): {e}")
                     
-                    # 기본 내장 스킬은 레지스트리/피드백 처리 대상이 아니므로 건너뜀
-                    if skill_name not in uploaded_skills_set:
-                        log(f"   ℹ️ agent_skills 기본 내장 스킬 무시 (상세 조회 스킵): {skill_name}")
-                        continue
-
-                    skill_dict = {
-                        "id": skill_name,
-                        "name": skill_name,
-                        "skill_name": skill_name,
-                        "content": "",  # 상세 내용 없음
-                        "verified": False,  # 상세 조회 안 했으므로 False
-                        "is_builtin": False,
-                    }
-                    results.append(skill_dict)
-                    skill_names_found.add(skill_name)
-                    log(f"   ✅ agent_skills에서 스킬 추가 (상세 조회 건너뜀): {skill_name}")
-            else:
-                # 일반 조회: 업로드된 스킬에 대해서만 상세 내용 조회
-                for skill_name in allowed_skill_names:
-                    if skill_name in skill_names_found:
-                        continue
-                    
-                    # 업로드된 스킬인 경우 HTTP API 사용
-                    if skill_name in uploaded_skills_set:
+                    if is_uploaded_skill:
                         try:
                             skill_info = check_skill_exists_with_info(skill_name)
                             if skill_info and skill_info.get("exists"):
@@ -609,31 +507,133 @@ async def retrieve_existing_skills(agent_id: str, search_text: str = "", top_k: 
                                     skill_file_info = get_skill_file_content(skill_name, "SKILL.md")
                                     skill_content = skill_file_info.get("content", "")
                                     
-                                    skill_dict = {
+                                    combined_skill = {
+                                        **mcp_skill,
                                         "id": skill_name,
                                         "name": skill_name,
                                         "skill_name": skill_name,
-                                        "description": skill_info.get("description", ""),
-                                        "source": skill_info.get("source", ""),
+                                        "description": skill_info.get("description", mcp_skill.get("description", "")),
+                                        "source": skill_info.get("source", mcp_skill.get("source", "")),
                                         "document_count": skill_info.get("document_count", 0),
-                                        "content": skill_content,
+                                        "content": skill_content if skill_content else mcp_skill.get("content", ""),
                                         "verified": True,
                                         "is_builtin": False,
                                     }
                                     
-                                    results.append(skill_dict)
+                                    results.append(combined_skill)
                                     skill_names_found.add(skill_name)
-                                    log(f"   ✅ agent_skills에서 업로드된 스킬 확인: {skill_name}")
+                                    log(f"   ✅ 업로드된 스킬 (HTTP API): {skill_name}")
                                 except Exception as e:
                                     log(f"   ⚠️ 업로드된 스킬 파일 조회 실패 ({skill_name}): {e}")
+                                    combined_skill = {
+                                        **mcp_skill,
+                                        "id": skill_name,
+                                        "name": skill_name,
+                                        "skill_name": skill_name,
+                                        "description": skill_info.get("description", mcp_skill.get("description", "")),
+                                        "source": skill_info.get("source", mcp_skill.get("source", "")),
+                                        "document_count": skill_info.get("document_count", 0),
+                                        "verified": True,
+                                        "is_builtin": False,
+                                    }
+                                    results.append(combined_skill)
+                                    skill_names_found.add(skill_name)
                         except Exception as e:
-                            log(f"   ⚠️ agent_skills 업로드된 스킬 확인 실패 ({skill_name}): {e}")
+                            log(f"   ⚠️ 업로드된 스킬 HTTP API 확인 실패 ({skill_name}): {e}")
+                            mcp_skill["verified"] = False
+                            mcp_skill["is_builtin"] = False
+                            mcp_skill["id"] = skill_name
+                            mcp_skill["name"] = skill_name
+                            mcp_skill["skill_name"] = skill_name
+                            results.append(mcp_skill)
+                            skill_names_found.add(skill_name)
                     else:
-                        # 기본 내장 스킬은 피드백 처리 대상이 아니므로 완전히 무시
-                        log(f"   ℹ️ agent_skills 기본 내장 스킬 무시: {skill_name}")
+                        # 내장 스킬: MCP read_skill_document로 상세 조회
+                        content = await _read_skill_document_mcp(skill_name, "SKILL.md")
+                        combined_skill = {
+                            **mcp_skill,
+                            "id": skill_name,
+                            "name": skill_name,
+                            "skill_name": skill_name,
+                            "description": mcp_skill.get("description", ""),
+                            "source": mcp_skill.get("source", ""),
+                            "document_count": mcp_skill.get("document_count", 0),
+                            "content": content or mcp_skill.get("content", ""),
+                            "verified": bool(content),
+                            "is_builtin": True,
+                        }
+                        results.append(combined_skill)
+                        skill_names_found.add(skill_name)
+                        log(f"   ✅ 내장 스킬 (MCP): {skill_name}")
+            else:
+                tool_names = [t.name for t in tools if hasattr(t, "name")]
+                log(f"   ⚠️ find_helpful_skills 도구를 찾을 수 없습니다. 사용 가능한 도구: {tool_names}")
+        except Exception as e:
+            log(f"   ⚠️ MCP 도구를 통한 스킬 검색 실패: {e}")
 
-        # verified=True인 스킬을 우선 정렬
-        results.sort(key=lambda x: (not x.get("verified", False), x.get("relevance_score", 0) or 0), reverse=True)
+        # 3. agent_skills에 명시된 스킬들도 확인
+        if agent_skills:
+            allowed_skill_names = [s.strip() for s in agent_skills.split(",") if s.strip()]
+            for skill_name in allowed_skill_names:
+                if skill_name in skill_names_found:
+                    continue
+                
+                if skill_name in uploaded_skills_set:
+                    try:
+                        skill_info = check_skill_exists_with_info(skill_name)
+                        if skill_info and skill_info.get("exists"):
+                            try:
+                                skill_file_info = get_skill_file_content(skill_name, "SKILL.md")
+                                skill_content = skill_file_info.get("content", "")
+                                
+                                skill_dict = {
+                                    "id": skill_name,
+                                    "name": skill_name,
+                                    "skill_name": skill_name,
+                                    "description": skill_info.get("description", ""),
+                                    "source": skill_info.get("source", ""),
+                                    "document_count": skill_info.get("document_count", 0),
+                                    "content": skill_content,
+                                    "verified": True,
+                                    "is_builtin": False,
+                                }
+                                
+                                results.append(skill_dict)
+                                skill_names_found.add(skill_name)
+                                log(f"   ✅ agent_skills에서 업로드된 스킬 확인: {skill_name}")
+                            except Exception as e:
+                                log(f"   ⚠️ 업로드된 스킬 파일 조회 실패 ({skill_name}): {e}")
+                    except Exception as e:
+                        log(f"   ⚠️ agent_skills 업로드된 스킬 확인 실패 ({skill_name}): {e}")
+                else:
+                    # 내장 스킬: MCP로 조회
+                    content = await _read_skill_document_mcp(skill_name, "SKILL.md")
+                    skill_dict = {
+                        "id": skill_name,
+                        "name": skill_name,
+                        "skill_name": skill_name,
+                        "description": "",
+                        "source": "",
+                        "document_count": 0,
+                        "content": content,
+                        "verified": bool(content),
+                        "is_builtin": True,
+                    }
+                    results.append(skill_dict)
+                    skill_names_found.add(skill_name)
+                    log(f"   ✅ agent_skills에서 내장 스킬 조회 (MCP): {skill_name}")
+
+        # 관련도 임계값 미만 스킬 제외 (relevance_score 없으면 유지: 정확 매칭·agent_skills 등)
+        results = [
+            r for r in results
+            if r.get("relevance_score") is None
+            or (r.get("relevance_score") or 0) >= MIN_SKILL_RELEVANCE_THRESHOLD
+        ]
+        # 스킬 ID가 숫자/인덱스 형태면 name 기반으로 정규화 (phantom SKILL:1 방지)
+        for r in results:
+            _normalize_skill_id(r)
+        # 관련도 1순위, verified 2순위로 정렬 후 top_k만 반환
+        results.sort(key=lambda x: ((x.get("relevance_score") or 0), x.get("verified", False)), reverse=True)
         
         log(f"✅ 스킬 조회 완료: 총 {len(results)}개 스킬 발견 (HTTP API 검증: {sum(1 for s in results if s.get('verified', False))}개)")
         return results[:top_k]  # top_k만큼만 반환
@@ -678,6 +678,8 @@ def _parse_mcp_skill_result(result: Any) -> List[Dict]:
             parsed_skills = _parse_skill_markdown(full_text)
         
         if parsed_skills:
+            for s in parsed_skills:
+                _normalize_skill_id(s)
             return parsed_skills
         
         # 구조화되지 않은 리스트인 경우 그대로 반환
@@ -687,9 +689,13 @@ def _parse_mcp_skill_result(result: Any) -> List[Dict]:
         # 딕셔너리인 경우 skills/results 필드를 우선적으로 사용
         skills = result.get("skills", result.get("results", []))
         if isinstance(skills, list):
+            for s in skills:
+                _normalize_skill_id(s)
             return skills
         else:
             # 단일 스킬인 경우 리스트로 변환
+            if skills:
+                _normalize_skill_id(skills)
             return [skills] if skills else []
 
     if isinstance(result, str):
@@ -698,15 +704,23 @@ def _parse_mcp_skill_result(result: Any) -> List[Dict]:
         try:
             parsed = json.loads(result)
             if isinstance(parsed, list):
+                for s in parsed:
+                    _normalize_skill_id(s)
                 return parsed
             if isinstance(parsed, dict):
-                return parsed.get("skills", parsed.get("results", []))
+                skills = parsed.get("skills", parsed.get("results", []))
+                if isinstance(skills, list):
+                    for s in skills:
+                        _normalize_skill_id(s)
+                return skills
         except Exception:
             pass
         
         # 마크다운 텍스트인 경우 파싱
         parsed_skills = _parse_skill_markdown(result)
         if parsed_skills:
+            for s in parsed_skills:
+                _normalize_skill_id(s)
             return parsed_skills
 
     return []
@@ -742,7 +756,7 @@ async def retrieve_all_existing_knowledge(agent_id: str, feedback_content: str) 
         # 각 저장소에서 조회 (병렬 처리)
         memories = await retrieve_existing_memories(agent_id, feedback_content, limit=10)
         dmn_rules = await retrieve_existing_dmn_rules(agent_id, feedback_content[:100])  # 검색용으로 앞부분만 사용
-        skills = await retrieve_existing_skills(agent_id, feedback_content[:100], top_k=10, tenant_id=tenant_id, agent_skills=agent_skills)
+        skills = await retrieve_existing_skills(agent_id, feedback_content[:SKILL_SEARCH_CONTEXT_CHARS], top_k=3, tenant_id=tenant_id, agent_skills=agent_skills)
         
         log(f"📊 기존 지식 조회 완료: memories={len(memories)}, dmn_rules={len(dmn_rules)}, skills={len(skills)}")
         
