@@ -959,10 +959,26 @@ async def _check_duplicate_tool(
                 dmn_rules = await retrieve_existing_dmn_rules(agent_id, "")
                 candidate = next((r for r in dmn_rules if r.get("id") == candidate_id), None)
             elif knowledge_type == "SKILL":
-                skills = await retrieve_existing_skills(
-                    agent_id, "", top_k=100, tenant_id=tenant_id, agent_skills=agent_skills
-                )
-                candidate = next((s for s in skills if s.get("id") == candidate_id or s.get("name") == candidate_id), None)
+                # 직접 조회: 업로드 스킬(HTTP API) → 내장 스킬(MCP) 순서 (벡터 검색 100개 회피)
+                candidate = None
+                _cand_name = candidate_id
+                try:
+                    from core.skill_api_client import check_skill_exists_with_info as _check_skill, get_skill_file_content as _get_skill_file
+                    _info = _check_skill(_cand_name)
+                    if _info and _info.get("exists"):
+                        _file = _get_skill_file(_cand_name, "SKILL.md")
+                        candidate = {
+                            "id": _cand_name, "name": _info.get("name", _cand_name),
+                            "description": _info.get("description", ""),
+                            "content": _file.get("content", ""),
+                        }
+                except Exception:
+                    pass
+                if not candidate:
+                    from core.knowledge_retriever import _read_skill_document_mcp
+                    _content = await _read_skill_document_mcp(_cand_name, "SKILL.md")
+                    if _content:
+                        candidate = {"id": _cand_name, "name": _cand_name, "description": "", "content": _content}
         else:
             # 가장 유사한 항목 찾기
             existing = []
@@ -1207,12 +1223,31 @@ async def _get_knowledge_detail_tool(
                     output_lines.append(f"\n📊 규칙 수: {len(rules)}개")
         
         elif knowledge_type == "SKILL":
-            skills = await retrieve_existing_skills(
-                agent_id, "", top_k=100,
-                tenant_id=tenant_id, agent_skills=agent_skills
-            )
-            target = next((s for s in skills if s.get("id") == knowledge_id or s.get("name") == knowledge_id), None)
-            
+            # 직접 조회: 업로드 스킬(HTTP API) → 내장 스킬(MCP) 순서 (벡터 검색 100개 회피)
+            target = None
+            _skill_name = knowledge_id
+            try:
+                from core.skill_api_client import check_skill_exists_with_info as _check_skill, get_skill_file_content as _get_skill_file
+                _info = _check_skill(_skill_name)
+                if _info and _info.get("exists"):
+                    _file = _get_skill_file(_skill_name, "SKILL.md")
+                    target = {
+                        "id": _skill_name, "name": _info.get("name", _skill_name),
+                        "description": _info.get("description", ""),
+                        "content": _file.get("content", ""),
+                        "verified": True, "is_builtin": False,
+                    }
+            except Exception:
+                pass
+            if not target:
+                from core.knowledge_retriever import _read_skill_document_mcp
+                _content = await _read_skill_document_mcp(_skill_name, "SKILL.md")
+                if _content:
+                    target = {
+                        "id": _skill_name, "name": _skill_name,
+                        "description": "", "content": _content,
+                        "verified": True, "is_builtin": True,
+                    }
             if not target:
                 return f"❌ ID/이름이 '{knowledge_id}'인 스킬을 찾을 수 없습니다."
             

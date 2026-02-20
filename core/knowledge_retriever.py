@@ -37,7 +37,8 @@ if not all([DB_USER, DB_PASSWORD, DB_HOST, DB_PORT, DB_NAME]):
 CONNECTION_STRING = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 
 # 스킬 조회: 관련도 기반 선택·집중 (이 값 미만이면 컨텍스트에서 제외, None이면 제외 안 함)
-MIN_SKILL_RELEVANCE_THRESHOLD = 0.5
+# 벡터 유사도 점수는 일반적으로 0.1~0.4 범위이므로 너무 높이 설정하면 유효 결과가 모두 필터링됨
+MIN_SKILL_RELEVANCE_THRESHOLD = 0.15
 
 # 스킬 검색 시 MCP find_helpful_skills에 넘길 작업 설명 길이 (목표+페르소나 일부로 시장 조사·보고서 등 관련 스킬 상위 노출)
 SKILL_SEARCH_CONTEXT_CHARS = 220
@@ -435,6 +436,9 @@ async def retrieve_existing_skills(agent_id: str, search_text: str = "", top_k: 
                     log(f"   ✅ 내장 스킬 조회 (MCP): {skill_name_candidate}")
 
         # 2. MCP 도구를 통한 벡터 유사도 검색 (작업 설명 기반 검색)
+        #    이중 검색: 한글 원문 + 영문 번역 모두 수행하여 결과 병합
+        #    - 업로드된 스킬은 한글 설명이 대부분 → 한글 원문 검색 필요
+        #    - 내장 스킬은 영문 설명 → 영문 번역 검색 필요
         try:
             tools = await get_mcp_tools_async()
             find_skills_tool = None
@@ -444,46 +448,74 @@ async def retrieve_existing_skills(agent_id: str, search_text: str = "", top_k: 
                     break
             
             if find_skills_tool is not None:
-                # 작업 설명이 없으면 기본값 사용
                 task_description = search_text if search_text else "일반적인 작업 수행"
-                # 검색용 한→영 번역 (내장 스킬은 영어 설명 → 한영 임베딩 불일치 완화, 최종 저장에는 미적용)
-                task_description_for_search = await translate_ko_to_en_for_search(task_description)
+                task_description_en = await translate_ko_to_en_for_search(task_description)
+                is_translated = task_description_en != task_description
 
-                # find_helpful_skills 도구 호출 파라미터 구성
-                invoke_params = {
-                    "task_description": task_description_for_search,
-                    "top_k": top_k,
-                    "list_documents": True,  # 문서 목록도 함께 조회
-                }
-                
-                # tenant_id가 제공된 경우에만 추가
-                if tenant_id:
-                    invoke_params["tenant_id"] = tenant_id
+                def _build_invoke_params(desc: str) -> dict:
+                    params = {
+                        "task_description": desc,
+                        "top_k": top_k,
+                        "list_documents": True,
+                    }
+                    if tenant_id:
+                        params["tenant_id"] = tenant_id
+                    if agent_skills:
+                        names = [s.strip() for s in agent_skills.split(",") if s.strip()]
+                        if names:
+                            params["allowed_skill_names"] = names
+                    return params
 
-                if agent_skills:
-                    # 공백 제거하여 스킬 이름 배열 생성
-                    allowed_skill_names = [s.strip() for s in agent_skills.split(",") if s.strip()]
-                    if allowed_skill_names:
-                        invoke_params["allowed_skill_names"] = allowed_skill_names
-
-                # find_helpful_skills 도구 호출 (비동기 방식)
-                log(
-                    f"   🔍 MCP 도구를 통한 벡터 검색: "
-                    f"task_description='{task_description_for_search[:100]}...', top_k={top_k}, tenant_id={tenant_id or 'None'}"
-                )
-                # 타임아웃 추가 (30초)
-                try:
-                    mcp_result = await asyncio.wait_for(
-                        find_skills_tool.ainvoke(invoke_params),
-                        timeout=30.0
+                async def _invoke_find_skills(desc: str, label: str):
+                    log(
+                        f"   🔍 MCP 벡터 검색 ({label}): "
+                        f"task_description='{desc[:100]}...', top_k={top_k}, tenant_id={tenant_id or 'None'}"
                     )
-                except asyncio.TimeoutError:
-                    log(f"   ⚠️ MCP find_helpful_skills 타임아웃, 벡터 검색 건너뜀")
-                    mcp_result = None
+                    try:
+                        res = await asyncio.wait_for(
+                            find_skills_tool.ainvoke(_build_invoke_params(desc)),
+                            timeout=30.0,
+                        )
+                        return _parse_mcp_skill_result(res) if res is not None else []
+                    except asyncio.TimeoutError:
+                        log(f"   ⚠️ MCP find_helpful_skills 타임아웃 ({label}), 건너뜀")
+                        return []
 
-                # MCP 결과 파싱 (타임아웃 시 빈 리스트)
-                mcp_skills = _parse_mcp_skill_result(mcp_result) if mcp_result is not None else []
-                
+                if is_translated:
+                    ko_skills, en_skills = await asyncio.gather(
+                        _invoke_find_skills(task_description, "한글 원문"),
+                        _invoke_find_skills(task_description_en, "영문 번역"),
+                    )
+                    merged: dict = {}
+                    for skill in ko_skills + en_skills:
+                        sname = skill.get("name") or skill.get("skill_name") or ""
+                        if not sname:
+                            continue
+                        existing = merged.get(sname)
+                        if existing is None:
+                            merged[sname] = skill
+                        else:
+                            if (skill.get("relevance_score") or 0) > (existing.get("relevance_score") or 0):
+                                merged[sname] = skill
+                    mcp_skills = list(merged.values())
+                    log(f"   📊 이중 검색 결과 병합: 한글={len(ko_skills)}개, 영문={len(en_skills)}개 → 병합={len(mcp_skills)}개")
+                else:
+                    mcp_skills = await _invoke_find_skills(task_description, "원문")
+
+                # 업로드 스킬 우선 보존 + 관련도 순 top_k 제한
+                if len(mcp_skills) > top_k:
+                    uploaded = [s for s in mcp_skills if (s.get("name") or s.get("skill_name", "")) in uploaded_skills_set]
+                    builtin = [s for s in mcp_skills if (s.get("name") or s.get("skill_name", "")) not in uploaded_skills_set]
+                    builtin.sort(key=lambda s: s.get("relevance_score") or 0, reverse=True)
+                    remaining_slots = max(0, top_k - len(uploaded))
+                    mcp_skills = uploaded + builtin[:remaining_slots]
+                    log(
+                        f"   ✂️ 벡터 검색 결과 {len(uploaded) + len(builtin)}개 → {len(mcp_skills)}개로 제한 "
+                        f"(업로드={len(uploaded)}개 우선 보존, 내장 상위 {remaining_slots}개)"
+                    )
+                else:
+                    mcp_skills.sort(key=lambda s: s.get("relevance_score") or 0, reverse=True)
+
                 for mcp_skill in mcp_skills:
                     skill_name = mcp_skill.get("name") or mcp_skill.get("skill_name", "")
                     if not skill_name or skill_name in skill_names_found:
@@ -525,7 +557,7 @@ async def retrieve_existing_skills(agent_id: str, search_text: str = "", top_k: 
                                     
                                     results.append(combined_skill)
                                     skill_names_found.add(skill_name)
-                                    log(f"   ✅ 업로드된 스킬 (HTTP API): {skill_name}")
+                                    log(f"   ✅ 업로드된 스킬 (HTTP API): {skill_name} (relevance: {mcp_skill.get('relevance_score', 'N/A')})")
                                 except Exception as e:
                                     log(f"   ⚠️ 업로드된 스킬 파일 조회 실패 ({skill_name}): {e}")
                                     combined_skill = {
@@ -551,8 +583,10 @@ async def retrieve_existing_skills(agent_id: str, search_text: str = "", top_k: 
                             results.append(mcp_skill)
                             skill_names_found.add(skill_name)
                     else:
-                        # 내장 스킬: MCP read_skill_document로 상세 조회
-                        content = await _read_skill_document_mcp(skill_name, "SKILL.md")
+                        # 내장 스킬: find_helpful_skills 결과에 content가 있으면 재사용, 없을 때만 MCP 조회
+                        existing_content = mcp_skill.get("content", "")
+                        if not existing_content:
+                            existing_content = await _read_skill_document_mcp(skill_name, "SKILL.md")
                         combined_skill = {
                             **mcp_skill,
                             "id": skill_name,
@@ -561,13 +595,13 @@ async def retrieve_existing_skills(agent_id: str, search_text: str = "", top_k: 
                             "description": mcp_skill.get("description", ""),
                             "source": mcp_skill.get("source", ""),
                             "document_count": mcp_skill.get("document_count", 0),
-                            "content": content or mcp_skill.get("content", ""),
-                            "verified": bool(content),
+                            "content": existing_content,
+                            "verified": bool(existing_content),
                             "is_builtin": True,
                         }
                         results.append(combined_skill)
                         skill_names_found.add(skill_name)
-                        log(f"   ✅ 내장 스킬 (MCP): {skill_name}")
+                        log(f"   ✅ 내장 스킬{' (MCP 조회)' if not mcp_skill.get('content') else ''}: {skill_name} (relevance: {mcp_skill.get('relevance_score', 'N/A')})")
             else:
                 tool_names = [t.name for t in tools if hasattr(t, "name")]
                 log(f"   ⚠️ find_helpful_skills 도구를 찾을 수 없습니다. 사용 가능한 도구: {tool_names}")
@@ -627,18 +661,26 @@ async def retrieve_existing_skills(agent_id: str, search_text: str = "", top_k: 
                     log(f"   ✅ agent_skills에서 내장 스킬 조회 (MCP): {skill_name}")
 
         # 관련도 임계값 미만 스킬 제외 (relevance_score 없으면 유지: 정확 매칭·agent_skills 등)
+        before_filter = len(results)
         results = [
             r for r in results
             if r.get("relevance_score") is None
             or (r.get("relevance_score") or 0) >= MIN_SKILL_RELEVANCE_THRESHOLD
         ]
+        filtered_out = before_filter - len(results)
+        if filtered_out > 0:
+            log(f"   🔻 관련도 임계값({MIN_SKILL_RELEVANCE_THRESHOLD}) 미만 {filtered_out}개 스킬 제외")
         # 스킬 ID가 숫자/인덱스 형태면 name 기반으로 정규화 (phantom SKILL:1 방지)
         for r in results:
             _normalize_skill_id(r)
         # 관련도 1순위, verified 2순위로 정렬 후 top_k만 반환
         results.sort(key=lambda x: ((x.get("relevance_score") or 0), x.get("verified", False)), reverse=True)
         
-        log(f"✅ 스킬 조회 완료: 총 {len(results)}개 스킬 발견 (HTTP API 검증: {sum(1 for s in results if s.get('verified', False))}개)")
+        log(
+            f"✅ 스킬 조회 완료: 총 {len(results)}개 스킬 발견 "
+            f"(HTTP API 검증: {sum(1 for s in results if s.get('verified', False))}개, "
+            f"임계값: {MIN_SKILL_RELEVANCE_THRESHOLD})"
+        )
         return results[:top_k]  # top_k만큼만 반환
 
     except Exception as e:
