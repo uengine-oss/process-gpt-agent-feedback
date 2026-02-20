@@ -147,9 +147,10 @@ def create_react_prompt(tools: List, content_type: str = "feedback") -> ChatProm
 - 기존 지식에서 **반드시 보존해야 할 부분**은 무엇인가?
 
 **⚠️ 스킬: ReAct은 저장소·관계만 판단. 스킬 내용(SKILL.md, steps, additional_files)은 전부 skill-creator가 생성.**
-- **ReAct의 역할:** (1) 저장소가 SKILL인지 (2) CREATE vs UPDATE vs DELETE (3) UPDATE/DELETE 시 skill_id(기존 스킬 이름). **이 세 가지만** 판단하고 `commit_to_skill(operation=..., skill_id=...)` 호출. `skill_artifact_json`·`steps`·`additional_files` 등은 넘기지 않음. 목표/페르소나는 도구 외부에서 자동 전달.
-- **UPDATE:** 기존 스킬과 **동일한 적용 범위·동일한 절차**를 수정·보완할 때만 사용 (예: 같은 "포트폴리오 수집" 절차의 세부 단계만 변경).
-- **CREATE:** 목표/페르소나에서 도출된 **에이전트 전용 절차**가 있고, 기존 스킬과 **다른 범위/다른 목적**이면 (예: "포트폴리오 분석 문서 생성"처럼 기존 스킬을 **참조**하는 새 워크플로우) → **CREATE**하고 `related_skill_ids`에 기존 스킬 이름(예: global-investment-analyzer)을 넣으세요. 관련 스킬이 있다고 해서 무조건 UPDATE하지 마세요.
+- **목표/결과는 스킬 절차가 아님:** "사업부 의사결정에 기여", "성과 달성" 등 **목표·결과·맥락**은 스킬로 구현하지 않습니다. 스킬은 **구체적 작업 절차·산출물**(데이터 수집, 보고서 작성, 시각화 등)만 담습니다. 기존 스킬이 그 절차를 이미 커버하면 **attach_skills_to_agent**만 하세요.
+- **ReAct의 역할:** (1) 저장소가 SKILL인지 (2) **attach_skills_to_agent vs commit_to_skill** (3) commit_to_skill 시 CREATE/UPDATE/DELETE, skill_id.
+- **attach_skills_to_agent (재사용 우선):** 기존 스킬이 **요구사항(절차·산출물)을 충분히 커버**할 때—유사도가 높고(0.85 이상 권장), DUPLICATE/COMPLEMENTS 등으로 **새 스킬 생성이 불필요**할 때. 단일 스킬로 충분하면 `attach_skills_to_agent(skill_ids="skill-a")`, 여러 스킬 조합이 필요하면 `attach_skills_to_agent(skill_ids="skill-a, skill-b")` 호출.
+- **commit_to_skill (생성/수정 필요 시):** 기존 스킬로 **구체적 절차·산출물**이 커버되지 않을 때만. **UPDATE:** 동일한 적용 범위·동일한 절차를 수정·보완할 때만. **CREATE:** 목표/페르소나에서 도출된 **에이전트 전용 절차**(기존 스킬에 없는 작업 단계·산출물)가 있을 때만. 목표/결과(의사결정 기여 등)만으로는 CREATE 사유가 되지 않습니다. 에이전트는 멀티 스킬 지원—여러 기존 스킬로 충분하면 attach, 새 절차가 필요할 때만 commit_to_skill CREATE.
 
 ### [STEP 3] 관계 추론 및 근거 제시
 **반드시** 다음 형식으로 추론 결과를 명시하세요:
@@ -163,13 +164,13 @@ def create_react_prompt(tools: List, content_type: str = "feedback") -> ChatProm
 **관계 유형:**
 | 유형 | 정의 | 기존 지식 처리 |
 |------|------|---------------|
-| DUPLICATE | 표현만 다른 동일 내용 | 유지 (아무것도 안함) |
+| DUPLICATE | 표현만 다른 동일 내용 | **SKILL: 기존 스킬이 에이전트에 없으면 attach_skills_to_agent.** MEMORY/DMN: 유지 (아무것도 안함) |
 | EXTENDS | 새 조건/케이스 추가 | 유지 + 새 내용 추가 |
 | REFINES | 기존 값/세부사항 변경 | 해당 부분만 수정 |
 | EXCEPTION | 기존 규칙의 예외 | 유지 + 예외 규칙 추가 |
 | CONFLICTS | 상충/모순 | 판단 필요 (어느 것이 맞는가?) |
 | SUPERSEDES | 명시적 대체 | 삭제 후 새로 생성 |
-| COMPLEMENTS | 다른 측면 | **SKILL: 에이전트 전용 새 절차이면 CREATE + related_skill_ids 권장.** 기존 스킬과 완전히 같은 내용이면 UPDATE 또는 무시. MEMORY/DMN: 유지+별도 생성 |
+| COMPLEMENTS | 다른 측면 | **SKILL: 기존 스킬이 절차·산출물을 이미 커버하면 attach_skills_to_agent.** 목표/결과(의사결정 기여 등)는 스킬 절차가 아니므로, 기존 스킬로 작업 절차가 커버되면 새 스킬 CREATE 금지. 에이전트 전용 **새 절차**가 있을 때만 CREATE. MEMORY/DMN: 유지+별도 생성 |
 | UNRELATED | 무관 | 유지 + 별도 생성 |
 
 ### [STEP 4] 자기 검증 (반드시 수행)
@@ -267,7 +268,7 @@ Q3: 최종 결과가 에이전트의 목표/페르소나와 기존 지식 모두
 - **전달하는 내용이 최종 완성본**이어야 함 (도구가 병합해주지 않음)
 - 기존 내용 + 새 내용을 **직접 병합**하여 전달
 
-**⚠️ SKILL 시:** `commit_to_skill(operation=..., skill_id=UPDATE/DELETE시 필수)`. 스킬 내용·병합은 skill-creator가 담당.
+**⚠️ SKILL 시:** 목표/결과(의사결정 기여 등)는 스킬 절차가 아님. 기존 스킬이 절차를 커버하면 `attach_skills_to_agent(skill_ids=...)`. 새 절차가 필요할 때만 `commit_to_skill`. 스킬 내용·병합은 skill-creator가 담당.
 
 **CREATE 시:**
 - operation 생략 또는 "CREATE"
@@ -301,7 +302,7 @@ Q3: 최종 결과가 에이전트의 목표/페르소나와 기존 지식 모두
 - [ ] 기존 지식에서 보존해야 할 부분을 보존했는가?
 - [ ] 저장하려는 내용이 핵심 지식인가? (설명이나 중복이 아닌가?)
 - [ ] 이 내용이 다른 저장소에 이미 저장되었는가?
-- [ ] 스킬 CREATE/UPDATE 결론을 냈다면, Final Answer 전에 반드시 commit_to_skill을 호출했는가?
+- [ ] 스킬 결론을 냈다면, Final Answer 전에 반드시 commit_to_skill 또는 attach_skills_to_agent를 호출했는가?
 
 **⚠️ 중요: 목표/페르소나만으로는 메모리만 생성하면 안 됩니다. 반드시 DMN_RULE이나 SKILL도 함께 생성해야 합니다.**"""
     else:
@@ -358,8 +359,10 @@ Q3: 최종 결과가 에이전트의 목표/페르소나와 기존 지식 모두
 - 기존 지식에서 **반드시 보존해야 할 부분**은 무엇인가?
 
 **⚠️ 스킬: ReAct은 저장소·관계만 판단. 스킬 내용(SKILL.md, steps, additional_files)은 전부 skill-creator가 생성.**
-- **ReAct의 역할:** (1) 저장소가 SKILL인지 (2) CREATE vs UPDATE vs DELETE (3) UPDATE/DELETE 시 skill_id(기존 스킬 이름). **이 세 가지만** 판단하고 `commit_to_skill(operation=..., skill_id=...)` 호출. `skill_artifact_json`·`steps`·`additional_files` 등은 넘기지 않음. 피드백은 도구 외부에서 자동 전달.
-- **UPDATE:** 기존 스킬과 **동일한 적용 범위·동일한 절차**를 수정·보완할 때만. **CREATE:** 피드백이 기존 스킬을 **참조**하는 **새 절차**이면 CREATE하고 `related_skill_ids`에 기존 스킬 이름을 넣으세요. 관련 스킬이 있다고 해서 무조건 UPDATE하지 마세요.
+- **목표/결과는 스킬 절차가 아님:** "사업부 의사결정에 기여", "성과 달성" 등 **목표·결과·맥락**은 스킬로 구현하지 않습니다. 스킬은 **구체적 작업 절차·산출물**만 담습니다. 기존 스킬이 그 절차를 이미 커버하면 **attach_skills_to_agent**만 하세요.
+- **ReAct의 역할:** (1) 저장소가 SKILL인지 (2) **attach_skills_to_agent vs commit_to_skill** (3) commit_to_skill 시 CREATE/UPDATE/DELETE, skill_id.
+- **attach_skills_to_agent (재사용 우선):** 기존 스킬이 **피드백의 절차·산출물 요구를 충분히 커버**할 때—유사도가 높고(0.85 이상 권장), DUPLICATE/COMPLEMENTS 등으로 **새 스킬 생성이 불필요**할 때. 단일 스킬로 충분하면 `attach_skills_to_agent(skill_ids="skill-a")`, 여러 스킬 조합이 필요하면 `attach_skills_to_agent(skill_ids="skill-a, skill-b")` 호출.
+- **commit_to_skill (생성/수정 필요 시):** 기존 스킬로 **구체적 절차·산출물**이 커버되지 않을 때만. **UPDATE:** 동일한 적용 범위·동일한 절차를 수정·보완할 때만. **CREATE:** 피드백이 기존 스킬에 없는 **새 절차**(작업 단계·산출물)를 요구할 때만. 목표/결과(의사결정 기여 등)만으로는 CREATE 사유가 되지 않습니다. 에이전트는 멀티 스킬 지원—여러 기존 스킬로 충분하면 attach, 새 절차가 필요할 때만 commit_to_skill CREATE.
 - 관계/범위 판단을 위해 `get_knowledge_detail`로 기존 스킬을 조회해도 되지만, **내용 병합·파일 생성은 skill-creator가** 피드백과 기존 스킬을 받아 수행.
 
 ### [STEP 3] 관계 추론 및 근거 제시
@@ -374,13 +377,13 @@ Q3: 최종 결과가 에이전트의 목표/페르소나와 기존 지식 모두
 **관계 유형:**
 | 유형 | 정의 | 기존 지식 처리 |
 |------|------|---------------|
-| DUPLICATE | 표현만 다른 동일 내용 | 유지 (아무것도 안함) |
+| DUPLICATE | 표현만 다른 동일 내용 | **SKILL: 기존 스킬이 에이전트에 없으면 attach_skills_to_agent.** MEMORY/DMN: 유지 (아무것도 안함) |
 | EXTENDS | 새 조건/케이스 추가 | 유지 + 새 내용 추가 |
 | REFINES | 기존 값/세부사항 변경 | 해당 부분만 수정 |
 | EXCEPTION | 기존 규칙의 예외 | 유지 + 예외 규칙 추가 |
 | CONFLICTS | 상충/모순 | 판단 필요 (어느 것이 맞는가?) |
 | SUPERSEDES | 명시적 대체 | 삭제 후 새로 생성 |
-| COMPLEMENTS | 다른 측면 | **SKILL: 에이전트 전용 새 절차이면 CREATE + related_skill_ids 권장.** 기존 스킬과 완전히 같은 내용이면 UPDATE 또는 무시. MEMORY/DMN: 유지+별도 생성 |
+| COMPLEMENTS | 다른 측면 | **SKILL: 기존 스킬이 절차·산출물을 이미 커버하면 attach_skills_to_agent.** 목표/결과(의사결정 기여 등)는 스킬 절차가 아니므로, 기존 스킬로 작업 절차가 커버되면 새 스킬 CREATE 금지. 에이전트 전용 **새 절차**가 있을 때만 CREATE. MEMORY/DMN: 유지+별도 생성 |
 | UNRELATED | 무관 | 유지 + 별도 생성 |
 
 ### [STEP 4] 자기 검증 (반드시 수행)
@@ -484,7 +487,7 @@ Q3: 최종 결과가 피드백의 의도와 기존 지식 모두를 반영하는
 - **전달하는 내용이 최종 완성본**이어야 함 (도구가 병합해주지 않음)
 - 기존 내용 + 새 내용을 **직접 병합**하여 전달
 
-**⚠️ SKILL 시:** `commit_to_skill(operation=..., skill_id=UPDATE/DELETE시 필수)`. 스킬 내용·병합은 skill-creator가 담당.
+**⚠️ SKILL 시:** 목표/결과(의사결정 기여 등)는 스킬 절차가 아님. 기존 스킬이 절차를 커버하면 `attach_skills_to_agent(skill_ids=...)`. 새 절차가 필요할 때만 `commit_to_skill`. 스킬 내용·병합은 skill-creator가 담당.
 
 **CREATE 시:**
 - operation 생략 또는 "CREATE"
@@ -524,7 +527,7 @@ Q3: 최종 결과가 피드백의 의도와 기존 지식 모두를 반영하는
 **"기존 지식에서 보존해야 할 부분을 보존했는가?"**
 **"저장하려는 내용이 핵심 지식인가? (설명이나 중복이 아닌가?)"**
 **"이 내용이 다른 저장소에 이미 저장되었는가?"**
-**"스킬 CREATE/UPDATE 결론을 냈다면, Final Answer 전에 반드시 commit_to_skill을 호출했는가?"**"""
+**"스킬 결론을 냈다면, Final Answer 전에 반드시 commit_to_skill 또는 attach_skills_to_agent를 호출했는가?"**"""
 
     # ReAct output parser는 아래 형식을 엄격히 요구한다.
     # 모델이 [STEP 1] 같은 임의 형식으로 출력하면 도구 호출 파싱이 매번 실패하므로,
@@ -556,9 +559,9 @@ Final Answer: 최종 보고 (도구 호출 없이도 반드시 이 줄로 종료
 - 최종 결론이 CREATE/UPDATE/DELETE 이면, **반드시** 그에 맞는 commit 도구를 **먼저** 호출하고, Observation을 받은 **뒤에만** Final Answer를 쓴다.
   · MEMORY → commit_to_memory
   · DMN_RULE → commit_to_dmn_rule
-  · SKILL → commit_to_skill  (스킬 관련 시 MCP를 통해 기존 스킬을 갱신하려면 반드시 이 도구 호출)
-- **⚠️ 절대 금지: commit 도구를 호출하지 않고** 저장/생성/수정/삭제 결론만 Final Answer에 적으면 **처리 실패(no_commit)** 로 간주되어 전체 작업이 실패합니다.
-- **⚠️ SKILL 생성/수정 시:** "새로운 SKILL로 생성해야 합니다" 또는 "SKILL을 수정해야 합니다"라고 판단했다면, **반드시 commit_to_skill을 호출해야 합니다.** Final Answer만으로는 절대 안 됩니다.
+  · SKILL → commit_to_skill 또는 attach_skills_to_agent  (기존 스킬 재사용 시 attach_skills_to_agent, 새 스킬 생성/수정 시 commit_to_skill)
+- **⚠️ 절대 금지: commit 도구를 호출하지 않고** 저장/생성/수정/삭제/적재 결론만 Final Answer에 적으면 **처리 실패(no_commit)** 로 간주되어 전체 작업이 실패합니다.
+- **⚠️ SKILL 시:** 목표/결과(의사결정 기여 등)는 스킬로 구현하지 않음. 기존 스킬이 절차를 커버하면 **attach_skills_to_agent**. 새 절차가 필요할 때만 **commit_to_skill**. Final Answer만으로는 절대 안 됩니다.
 - **⚠️ DMN_RULE/MEMORY 생성/수정 시:** 마찬가지로 **반드시 commit_to_dmn_rule 또는 commit_to_memory를 호출해야 합니다.**
 - IGNORE(저장하지 않음)인 경우에만 commit 도구 호출 없이 Final Answer로 종료할 수 있다.
 - **예시 (올바른 사용):**
@@ -794,7 +797,7 @@ async def _process_knowledge_with_react_core(
     intermediate_steps = result.get("intermediate_steps", [])
 
     # ✅ 실행 결과가 "말로만 결론"이고 실제 commit이 없는 경우를 실패로 처리
-    committed_tools = {"commit_to_memory", "commit_to_dmn_rule", "commit_to_skill"}
+    committed_tools = {"commit_to_memory", "commit_to_dmn_rule", "commit_to_skill", "attach_skills_to_agent"}
     used_tools = []
     commit_failures: List[str] = []
     commit_successes: List[str] = []

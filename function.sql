@@ -213,7 +213,7 @@ CREATE TABLE IF NOT EXISTS public.agent_knowledge_setup_log (
     FOREIGN KEY (agent_id, tenant_id) REFERENCES public.users (id, tenant_id) ON DELETE CASCADE
 );
 
-GRANT SELECT, INSERT ON public.agent_knowledge_setup_log TO anon;
+GRANT SELECT, INSERT, UPDATE ON public.agent_knowledge_setup_log TO anon;
 CREATE INDEX IF NOT EXISTS idx_agent_knowledge_setup_log_agent_id ON public.agent_knowledge_setup_log(agent_id);
 
 

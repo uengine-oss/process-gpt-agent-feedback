@@ -179,23 +179,35 @@ async def fetch_agents_needing_setup(limit: int = 1) -> List[Dict[str, Any]]:
         return []
 
 
+def upsert_agent_knowledge_setup_log(
+    agent_id: str,
+    tenant_id: Optional[str] = None,
+    status: str = 'DONE'
+) -> bool:
+    """에이전트 초기 지식 셋팅 로그 upsert (시작 시 STARTED, 종료 시 DONE/FAILED)"""
+    try:
+        supabase = get_db_client()
+        supabase.table('agent_knowledge_setup_log').upsert(
+            {
+                'agent_id': agent_id,
+                'tenant_id': tenant_id,
+                'status': status
+            },
+            on_conflict='agent_id'
+        ).execute()
+        return True
+    except Exception as e:
+        handle_error("에이전트셋팅로그기록", e)
+        return False
+
+
 def insert_agent_knowledge_setup_log(
     agent_id: str,
     tenant_id: Optional[str] = None,
     status: str = 'DONE'
 ) -> bool:
-    """에이전트 초기 지식 셋팅 완료 로그 INSERT"""
-    try:
-        supabase = get_db_client()
-        supabase.table('agent_knowledge_setup_log').insert({
-            'agent_id': agent_id,
-            'tenant_id': tenant_id,
-            'status': status
-        }).execute()
-        return True
-    except Exception as e:
-        handle_error("에이전트셋팅로그기록", e)
-        return False
+    """에이전트 초기 지식 셋팅 로그 기록 (upsert 호출)"""
+    return upsert_agent_knowledge_setup_log(agent_id, tenant_id, status)
 
 
 # ============================================================================

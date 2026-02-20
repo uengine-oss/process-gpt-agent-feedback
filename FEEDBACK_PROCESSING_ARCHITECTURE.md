@@ -125,13 +125,39 @@ Q3: 최종 결과가 피드백 의도와 기존 지식 모두를 반영하는가
 - `commit_to_dmn_rule`: DMN_RULE CRUD
   - `merge_mode`: REPLACE | EXTEND | REFINE
   - EXTEND 시 LLM으로 기존 XML + 새 규칙 자동 병합
-- `commit_to_skill`: SKILL CRUD
+- `attach_skills_to_agent`: 기존 스킬을 에이전트에 적재만 (스킬 생성/수정 없음)
+  - 유사도가 높고 기존 스킬로 요구사항 충족 시 사용. 단일/멀티 스킬 지원.
+- `commit_to_skill`: SKILL 생성/수정/삭제
   - `merge_mode`: REPLACE | EXTEND | REFINE
-  - EXTEND 시 기존 steps + 새 steps 자동 병합
+  - 기존 스킬로 충분하면 `attach_skills_to_agent` 우선, 새 절차 필요 시만 commit_to_skill
+
+---
+
+## SKILL 처리 의사결정
+
+- **재사용 우선:** search_similar_knowledge에서 유사 스킬 발견 시, 기존 스킬이 요구사항을 충분히 커버하면 `attach_skills_to_agent` 사용 (새 스킬 생성 대신)
+- **멀티 스킬:** 여러 스킬의 기능이 필요하면 `attach_skills_to_agent(skill_ids="skill-a, skill-b")`로 에이전트에 적재
+- **생성/수정 필요 시:** 기존 스킬로 커버 불가일 때만 `commit_to_skill` (CREATE/UPDATE)
 
 ---
 
 ## 주요 수정 사항
+
+### 2026-02-20: 스킬 재사용 및 외부 참조 제거
+
+#### 1. attach_skills_to_agent 도구 추가
+- 기존 스킬을 에이전트에 적재만 (스킬 생성/수정 없음)
+- 유사도 높고 DUPLICATE/COMPLEMENTS 등으로 새 스킬 불필요 시 사용
+- 멀티 스킬 지원 (skill_ids에 쉼표 구분)
+
+#### 2. 스킬 마크다운 외부 참조 제거
+- skill-creator는 `[관련 스킬 참고]`를 참고용 컨텍스트로만 사용
+- 생성 결과 SKILL.md에는 외부 스킬 경로/링크를 포함하지 않음 (단일·독립 스킬 관리)
+
+#### 3. search_similar_knowledge 재사용 가이드
+- 유사도 0.85 이상 + DUPLICATE/COMPLEMENTS/EXTENDS 관계인 스킬 발견 시 attach_skills_to_agent 사용 권장 문구 포함
+
+---
 
 ### 2026-01-08 (v2): 하이브리드 접근 도입
 

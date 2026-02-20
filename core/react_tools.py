@@ -5,7 +5,7 @@ ReAct 에이전트용 도구 정의
 
 import json
 import re
-from typing import Dict, List, Optional, Any
+from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field
 from langchain_core.tools import StructuredTool
 from utils.logger import log, handle_error
@@ -87,6 +87,14 @@ class CommitDmnRuleInput(BaseModel):
     rule_id: Optional[str] = Field(default=None, description="⚠️ UPDATE/DELETE 시 필수! 기존 규칙 ID (search_similar_knowledge 또는 search_dmn_rules 결과에서 얻은 ID)")
     feedback_content: str = Field(default="", description="원본 피드백 내용 (선택적)")
     merge_mode: Optional[str] = Field(default="REPLACE", description="병합 모드 (REPLACE | EXTEND | REFINE). EXTEND: 기존 규칙 보존 + 새 규칙 추가. REFINE: 기존 규칙 참조 후 일부 수정. REPLACE: 완전 대체 (기본값)")
+
+
+class AttachSkillsToAgentInput(BaseModel):
+    """기존 스킬을 에이전트에 적재하는 도구 입력 (스킬 생성/수정 없음)"""
+    skill_ids: str = Field(
+        ...,
+        description="에이전트에 적재할 기존 스킬 이름/ID를 쉼표 구분 (예: 'skill-a, skill-b'). search_similar_knowledge에서 찾은 스킬 ID 사용."
+    )
 
 
 class CommitSkillInput(BaseModel):
@@ -560,6 +568,91 @@ async def _commit_skill_tool(
         return f"❌ Skill 저장 실패: {str(e)}"
 
 
+def _parse_skill_ids_input(skill_ids: Any) -> List[str]:
+    """skill_ids 입력을 파싱하여 스킬명 리스트 반환. JSON/dict/문자열 모두 처리."""
+    raw = skill_ids
+    if raw is None:
+        return []
+    if isinstance(raw, dict):
+        raw = raw.get("skill_ids", "") or ""
+    if isinstance(raw, str) and raw.strip().startswith("{"):
+        try:
+            obj = json.loads(raw)
+            if isinstance(obj, dict):
+                raw = obj.get("skill_ids", "") or ""
+            elif isinstance(obj, list):
+                raw = ",".join(str(x) for x in obj)
+        except (json.JSONDecodeError, TypeError):
+            pass
+    return [s.strip() for s in str(raw).split(",") if s.strip()]
+
+
+async def _attach_skills_to_agent_tool(agent_id: str, skill_ids: Any) -> str:
+    """
+    기존 스킬을 에이전트에 적재만 합니다. 스킬 내용은 생성/수정하지 않습니다.
+    유사도가 높은 기존 스킬로 요구사항을 충족할 때 사용합니다.
+
+    Args:
+        agent_id: 에이전트 ID
+        skill_ids: 쉼표 구분 스킬 이름/ID (예: 'skill-a, skill-b') 또는 JSON {"skill_ids": "..."}
+
+    Returns:
+        처리 결과 메시지
+    """
+    try:
+        from core.database import (
+            _get_agent_by_id,
+            update_agent_and_tenant_skills,
+            register_knowledge,
+            record_knowledge_history,
+        )
+        from utils.logger import log
+
+        skill_names = _parse_skill_ids_input(skill_ids)
+        if not skill_names:
+            return "❌ skill_ids가 비어있습니다. 쉼표 구분으로 스킬 이름을 입력하세요."
+
+        agent_info = _get_agent_by_id(agent_id)
+        if not agent_info:
+            return f"❌ 에이전트를 찾을 수 없습니다: {agent_id}"
+        tenant_id = agent_info.get("tenant_id")
+
+        attached = []
+        for skill_name in skill_names[:10]:  # 최대 10개
+            try:
+                update_agent_and_tenant_skills(agent_id, skill_name, "CREATE")
+                register_knowledge(
+                    agent_id=agent_id,
+                    tenant_id=tenant_id,
+                    knowledge_type="SKILL",
+                    knowledge_id=skill_name,
+                    knowledge_name=skill_name,
+                    content_summary=f"기존 스킬 적재: {skill_name}",
+                )
+                record_knowledge_history(
+                    knowledge_type="SKILL",
+                    knowledge_id=skill_name,
+                    agent_id=agent_id,
+                    tenant_id=tenant_id,
+                    operation="CREATE",
+                    new_content={"source": "attach_existing_skill", "skill_name": skill_name},
+                    feedback_content=None,
+                    knowledge_name=skill_name,
+                )
+                attached.append(skill_name)
+                log(f"✅ 스킬 에이전트 적재 완료: {skill_name} (agent_id={agent_id})")
+            except Exception as e:
+                log(f"⚠️ 스킬 적재 실패 ({skill_name}): {e}")
+                # 계속 진행
+
+        if not attached:
+            return f"❌ 스킬 적재 실패: {', '.join(skill_names)}"
+        return f"✅ 기존 스킬 {len(attached)}개를 에이전트에 적재했습니다: {', '.join(attached)}"
+    except Exception as e:
+        handle_error("attach_skills_to_agent_tool", e)
+        return f"❌ 스킬 적재 실패: {str(e)}"
+
+
 # ============================================================================
 # 새로운 통합 도구 함수 (Phase 2: 의미적 유사도 기반)
 # ============================================================================
@@ -796,14 +889,31 @@ async def _search_similar_knowledge_tool(
             if full_content:
                 output_lines.append(f"    📜 기존 지식 내용: {full_content[:500]}...")
         
+        # SKILL 재사용 가이드: 유사도 높고 DUPLICATE/COMPLEMENTS면 attach_skills_to_agent 권장
+        skill_results = [r for r in results if r.get("storage_type") == "SKILL"]
+        high_sim_skills = [
+            r for r in skill_results
+            if r.get("similarity_score", 0) >= 0.85
+            and r.get("relationship", "") in ("DUPLICATE", "COMPLEMENTS", "EXTENDS")
+        ]
+        if high_sim_skills:
+            skill_ids = [r.get("id", "") or r.get("name", "") for r in high_sim_skills[:5] if r.get("id") or r.get("name")]
+            if skill_ids:
+                output_lines.append("")
+                output_lines.append("📌 **SKILL 재사용 권장:**")
+                output_lines.append(f"   유사도 0.85 이상 + DUPLICATE/COMPLEMENTS/EXTENDS 관계인 스킬 {len(skill_ids)}개 발견.")
+                output_lines.append("   기존 스킬로 요구사항을 충분히 충족하면 **attach_skills_to_agent** 사용 권장 (새 스킬 생성 대신).")
+                output_lines.append(f"   예: attach_skills_to_agent(skill_ids=\"{', '.join(skill_ids)}\")")
+
         output_lines.append("")
         output_lines.append("━" * 50)
         output_lines.append("🧠 위 정보를 바탕으로 직접 판단하세요:")
         output_lines.append("   - 이 피드백은 기존 지식과 어떤 관계인가?")
-        output_lines.append("   - 기존 지식을 어떻게 처리해야 하나? (유지/수정/삭제/확장)")
-        output_lines.append("   - 새 지식을 어떻게 처리해야 하나? (생성/병합/무시)")
+        output_lines.append("   - 기존 지식을 어떻게 처리해야 하나? (유지/수정/삭제/확장/적재)")
+        output_lines.append("   - **SKILL:** 목표/결과(예: 의사결정 기여)는 스킬 절차가 아님. 구체적 절차·산출물이 기존 스킬로 커버되면 attach_skills_to_agent 우선, 새 절차가 필요할 때만 commit_to_skill.")
+        output_lines.append("   - 새 지식을 어떻게 처리해야 하나? (생성/병합/무시/기존 적재)")
         output_lines.append("   - 필요하다면 get_knowledge_detail로 기존 지식의 전체 내용을 확인하세요.")
-        
+
         return "\n".join(output_lines)
         
     except Exception as e:
@@ -1770,7 +1880,11 @@ def create_react_tools(agent_id: str, feedback_content: Optional[str] = None) ->
             )
         except Exception as e:
             return f"❌ Skill 저장 실패: {str(e)}"
-    
+
+    async def attach_skills_to_agent_wrapper(skill_ids: str) -> str:
+        """기존 스킬을 에이전트에 적재합니다. 스킬 생성/수정 없이 에이전트에 추가만 합니다."""
+        return await _attach_skills_to_agent_tool(agent_id=agent_id, skill_ids=skill_ids)
+
     # 새로운 통합 도구 래퍼 함수들
     async def search_similar_knowledge_wrapper(content: str, knowledge_type: str = "ALL", threshold: float = 0.7) -> str:
         """유사 지식 검색 도구 (async). 초기 지식 셋팅 시 feedback_content가 있으면 목표+페르소나를 검색에 사용."""
@@ -1923,8 +2037,18 @@ merge_mode 파라미터 (UPDATE 시 중요):
         StructuredTool.from_function(
             coroutine=commit_skill_wrapper,
             name="commit_to_skill",
-            description="Skill을 저장/수정/삭제합니다. **ReAct은 저장소(SKILL)·기존과의 관계(operation, skill_id)만 판단합니다.** 스킬 내용(SKILL.md, steps, additional_files)은 skill-creator가 생성. 기존 스킬을 **참조**하는 **새 스킬**을 만들 때는 operation=CREATE, related_skill_ids=기존스킬이름(쉼표 구분)으로 호출하세요. 동일 범위·동일 절차 수정 시에만 operation=UPDATE, skill_id=기존스킬이름. DELETE 시 skill_id 필수. **search_similar_knowledge 결과가 있으면 relationship_analysis에 그대로 전달**하면 EXTENDS/COMPLEMENTS 시 기존 내용 보존에 활용됩니다. **관련 스킬을 찾았으면 해당 스킬 이름/ID를 related_skill_ids에 쉼표 구분으로 전달**하면 스킬 간 참조 생성에 활용됩니다.",
+            description="Skill을 저장/수정/삭제합니다. **ReAct은 저장소(SKILL)·기존과의 관계(operation, skill_id)만 판단합니다.** 스킬 내용(SKILL.md, steps, additional_files)은 skill-creator가 생성. **목표/결과(예: 의사결정 기여)는 스킬 절차가 아님**—구체적 작업 절차·산출물이 기존 스킬로 부족할 때만 CREATE. 기존 스킬을 참조하는 새 스킬은 operation=CREATE, related_skill_ids=기존스킬이름(쉼표 구분). 동일 범위·동일 절차 수정 시에만 operation=UPDATE, skill_id=기존스킬이름. DELETE 시 skill_id 필수. search_similar_knowledge 결과는 relationship_analysis에 전달. 관련 스킬은 related_skill_ids에 전달.",
             args_schema=CommitSkillInput
+        ),
+        StructuredTool.from_function(
+            coroutine=attach_skills_to_agent_wrapper,
+            name="attach_skills_to_agent",
+            description="""기존 스킬을 에이전트에 적재만 합니다. **스킬 생성/수정 없이** 에이전트에 추가합니다.
+**사용 시점:** search_similar_knowledge에서 유사/연관 스킬을 찾았고, 기존 스킬이 **작업 절차·산출물**(데이터 수집, 보고서, 시각화 등)을 이미 커버할 때. 목표에 "의사결정 기여" 등이 있어도, 그 절차를 기존 스킬이 담당하면 attach만 하세요.
+- 단일 스킬로 충분: skill_ids="skill-a"
+- 여러 스킬 조합 필요: skill_ids="skill-a, skill-b, skill-c"
+**주의:** 새 스킬 생성(commit_to_skill CREATE)이 아닌 기존 스킬 재사용입니다. 에이전트는 멀티 스킬 지원.""",
+            args_schema=AttachSkillsToAgentInput
         ),
     ]
     

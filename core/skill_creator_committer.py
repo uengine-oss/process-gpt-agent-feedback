@@ -478,7 +478,7 @@ _SKILL_CREATOR_SYSTEM = """You implement the skill-creator workflow. Given user 
 - overview: short body overview (used only when body_markdown is omitted).
 - steps: list of strings, e.g. ["Step one", "Step two"]. Used only when body_markdown is omitted.
 - usage: optional string. Used only when body_markdown is omitted.
-- body_markdown: (optional, strongly recommended) Full markdown body for SKILL.md **without frontmatter**. When provided, overview/steps/usage are ignored for the body. Keep under ~500 lines. Include: Overview, When to Use (if needed), Core Principles or Capabilities, step-by-step process (with ### subsections where helpful), explicit references to bundled files, code blocks and tables where useful. If you add additional_files, the body must reference each of them (path + one-line purpose) for progressive disclosure. **Reference path format**: for files in *this* skill use `folder/file` (e.g. `references/guide.md`, `scripts/run.py`); for files in *related* (external) skills always use `skill-name/folder/file` (e.g. `skill-creator/references/workflows.md`). Related-skill references MUST include the skill name prefix.
+- body_markdown: (optional, strongly recommended) Full markdown body for SKILL.md **without frontmatter**. When provided, overview/steps/usage are ignored for the body. Keep under ~500 lines. Include: Overview, When to Use (if needed), Core Principles or Capabilities, step-by-step process (with ### subsections where helpful), explicit references to **this skill's bundled files only** using `folder/file` (e.g. `references/guide.md`, `scripts/run.py`). If you add additional_files, the body must reference each of them (path + one-line purpose) for progressive disclosure. **Do NOT include references to external/related skills** in the output—this skill must be self-contained.
 - additional_files: dict of path -> full content. **CRITICAL**:
   - Include ONLY (a) NEW files with **complete** content, (b) EXISTING files you are **explicitly modifying** with **full** new content.
   - Do NOT include existing files that you are not modifying—they will be preserved automatically.
@@ -507,7 +507,7 @@ LANGUAGE RULES (CRITICAL):
 If there is any conflict between previous instructions and these language rules,
 the language rules take precedence for natural-language content.
 
-When [관련 스킬 참고] is provided: use the listed skills and their file paths to add **explicit references** in overview, usage, or markdown body so that reference graphs can show cross-skill edges. **Reference path rule**: references to files *inside the current skill* use `folder/file` (e.g. `references/guide.md`). References to files in *related (external) skills* MUST use `skill-name/folder/file` (e.g. `skill-creator/references/workflows.md`). Never use bare `folder/file` for external skills—always prefix with the skill name. Do not invent paths; use the skill names and file paths from the context.
+When [관련 스킬 참고] is provided: use it **as reference context only** to improve content quality (e.g. structure, depth, examples). **Do NOT add references, links, or paths to external/related skills** in overview, usage, or markdown body. This skill must be self-contained without cross-skill dependencies. Use `folder/file` only for files *inside this skill* (e.g. `references/guide.md`, `scripts/run.py`).
 
 Output only valid JSON. No markdown, no explanation. Example: {"name":"x","description":"...","overview":"...","steps":["a","b"],"usage":"","body_markdown":null,"additional_files":{}}"""
 

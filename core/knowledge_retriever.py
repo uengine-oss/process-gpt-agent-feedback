@@ -8,6 +8,7 @@ import asyncio
 from typing import Dict, List, Optional, Any
 from mem0 import Memory
 from utils.logger import log, handle_error
+from utils.translator import translate_ko_to_en_for_search
 from dotenv import load_dotenv
 from core.database import get_db_client, _get_agent_by_id
 from core.mcp_client import get_mcp_tools, get_mcp_tools_async, get_mcp_tool_by_name, get_mcp_tool_by_name_async
@@ -445,10 +446,12 @@ async def retrieve_existing_skills(agent_id: str, search_text: str = "", top_k: 
             if find_skills_tool is not None:
                 # 작업 설명이 없으면 기본값 사용
                 task_description = search_text if search_text else "일반적인 작업 수행"
+                # 검색용 한→영 번역 (내장 스킬은 영어 설명 → 한영 임베딩 불일치 완화, 최종 저장에는 미적용)
+                task_description_for_search = await translate_ko_to_en_for_search(task_description)
 
                 # find_helpful_skills 도구 호출 파라미터 구성
                 invoke_params = {
-                    "task_description": task_description,
+                    "task_description": task_description_for_search,
                     "top_k": top_k,
                     "list_documents": True,  # 문서 목록도 함께 조회
                 }
@@ -466,7 +469,7 @@ async def retrieve_existing_skills(agent_id: str, search_text: str = "", top_k: 
                 # find_helpful_skills 도구 호출 (비동기 방식)
                 log(
                     f"   🔍 MCP 도구를 통한 벡터 검색: "
-                    f"task_description='{task_description[:100]}...', top_k={top_k}, tenant_id={tenant_id or 'None'}"
+                    f"task_description='{task_description_for_search[:100]}...', top_k={top_k}, tenant_id={tenant_id or 'None'}"
                 )
                 # 타임아웃 추가 (30초)
                 try:

@@ -10,7 +10,7 @@ from core.database import (
     update_feedback_status,
     fetch_events_by_todo_id,
     fetch_agents_needing_setup,
-    insert_agent_knowledge_setup_log,
+    upsert_agent_knowledge_setup_log,
 )
 from core.feedback_processor import match_feedback_to_agents
 from core.react_agent import process_feedback_with_react, process_agent_knowledge_setup_with_react
@@ -243,9 +243,11 @@ async def process_agent_setup_task(agent_info: Dict):
         return
     if not goal:
         log(f"⚠️ 에이전트 {agent_name}에 goal이 없어 초기 지식 셋팅 건너뜀")
-        insert_agent_knowledge_setup_log(agent_id, agent_info.get('tenant_id'), status='FAILED')
+        upsert_agent_knowledge_setup_log(agent_id, agent_info.get('tenant_id'), status='FAILED')
         return
 
+    # 지식 셋팅 시작 시 STARTED로 upsert
+    upsert_agent_knowledge_setup_log(agent_id, agent_info.get('tenant_id'), status='STARTED')
     try:
         log(f"🤖 에이전트 초기 지식 셋팅 시작: {agent_name} (agent_id={agent_id})")
         result = await process_agent_knowledge_setup_with_react(
@@ -255,7 +257,7 @@ async def process_agent_setup_task(agent_info: Dict):
             persona=persona,
         )
         status = 'FAILED' if result.get('error') else 'DONE'
-        insert_agent_knowledge_setup_log(agent_id, agent_info.get('tenant_id'), status=status)
+        upsert_agent_knowledge_setup_log(agent_id, agent_info.get('tenant_id'), status=status)
         if result.get('error'):
             log(f"⚠️ 에이전트 초기 지식 셋팅 실패 (로그 기록됨): {result.get('error')[:200]}...")
         else:
@@ -263,7 +265,7 @@ async def process_agent_setup_task(agent_info: Dict):
     except Exception as e:
         log(f"⚠️ 에이전트 초기 지식 셋팅 중 예외 (로그 기록함): {str(e)[:200]}...")
         handle_error("에이전트초기지식셋팅", e)
-        insert_agent_knowledge_setup_log(agent_id, agent_info.get('tenant_id'), status='FAILED')
+        upsert_agent_knowledge_setup_log(agent_id, agent_info.get('tenant_id'), status='FAILED')
 
 
 # ============================================================================

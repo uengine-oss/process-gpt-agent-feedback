@@ -39,7 +39,7 @@ from pydantic import BaseModel
 from typing import Optional
 from core.polling_manager import start_feedback_polling, initialize_connections
 from core.react_agent import process_agent_knowledge_setup_with_react
-from core.database import _get_agent_by_id
+from core.database import _get_agent_by_id, upsert_agent_knowledge_setup_log
 from utils.logger import log
 
 @asynccontextmanager
@@ -127,6 +127,10 @@ async def setup_agent_knowledge(request: AgentKnowledgeSetupRequest):
                 detail="에이전트 정보에 goal이 없습니다."
             )
         
+        # 지식 셋팅 시작 시 STARTED로 upsert
+        upsert_agent_knowledge_setup_log(
+            request.agent_id, agent_info.get('tenant_id'), status='STARTED'
+        )
         # ReAct 에이전트로 초기 지식 셋팅 처리
         result = await process_agent_knowledge_setup_with_react(
             agent_id=request.agent_id,
@@ -135,14 +139,21 @@ async def setup_agent_knowledge(request: AgentKnowledgeSetupRequest):
             persona=persona,
         )
         
-        # 에러가 있으면 500 에러 반환
+        # 에러가 있으면 FAILED로 upsert 후 500 에러 반환
         if result.get("error"):
             log(f"❌ 에이전트 초기 지식 셋팅 실패: {result.get('error')}")
+            upsert_agent_knowledge_setup_log(
+                request.agent_id, agent_info.get('tenant_id'), status='FAILED'
+            )
             raise HTTPException(
                 status_code=500,
                 detail=result.get("error", "에이전트 초기 지식 셋팅 중 에러 발생")
             )
         
+        # 종료 시 DONE으로 upsert
+        upsert_agent_knowledge_setup_log(
+            request.agent_id, agent_info.get('tenant_id'), status='DONE'
+        )
         log(f"✅ 에이전트 초기 지식 셋팅 완료: agent_id={request.agent_id}")
         return result
         
@@ -151,6 +162,16 @@ async def setup_agent_knowledge(request: AgentKnowledgeSetupRequest):
         raise
     except Exception as e:
         log(f"❌ 에이전트 초기 지식 셋팅 API 에러: {str(e)[:300]}...")
+        # 예외 시 FAILED로 upsert (agent_info는 예외 발생 시점에 없을 수 있음)
+        try:
+            _agent = _get_agent_by_id(request.agent_id)
+            upsert_agent_knowledge_setup_log(
+                request.agent_id,
+                _agent.get('tenant_id') if _agent else None,
+                status='FAILED',
+            )
+        except Exception:
+            pass
         raise HTTPException(
             status_code=500,
             detail=f"에이전트 초기 지식 셋팅 중 예상치 못한 에러 발생: {str(e)}"
