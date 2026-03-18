@@ -1879,7 +1879,14 @@ def create_react_tools(agent_id: str, feedback_content: Optional[str] = None) ->
                 if obj.get("relationship_analysis") is not None:
                     actual_ra = (obj.get("relationship_analysis") or "").strip() or None
                 if obj.get("related_skill_ids") is not None:
-                    actual_related = (obj.get("related_skill_ids") or "").strip() or None
+                    val = obj.get("related_skill_ids")
+                    # 리스트/문자열/기타 어떤 형태든 안전하게 쉼표 문자열로 정규화
+                    if isinstance(val, list):
+                        joined = ",".join(str(x).strip() for x in val if str(x).strip())
+                        actual_related = joined or None
+                    else:
+                        s = "" if val is None else str(val)
+                        actual_related = s.strip() or None
 
         if isinstance(operation, dict):
             _unwrap(operation)

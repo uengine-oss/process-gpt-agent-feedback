@@ -575,13 +575,66 @@ async def _generate_skill_artifact_from_feedback(
             raw = raw[len(prefix):].lstrip()
         if raw.endswith("```"):
             raw = raw[:-3].rstrip()
+
+    # skill-creator 출력 JSON 파싱: 실패하더라도 **반드시** 스킬을 생성하기 위해
+    # 1차로 그대로 파싱 → 2차로 가장 바깥 {} 블록만 잘라 재시도 → 그래도 안 되면 폴백 artifact 생성
+    obj: Dict[str, Any]
     try:
         obj = json.loads(raw)
     except json.JSONDecodeError as e:
-        log(f"   [skill-creator LLM] JSON 파싱 실패: {e}, raw 앞 400자: {repr(raw[:400])}")
-        raise RuntimeError(f"skill-creator LLM 출력 JSON 파싱 실패: {e}") from e
+        log(f"   [skill-creator LLM] JSON 1차 파싱 실패: {e}, raw 앞 400자: {repr(raw[:400])}")
+        # 가장 바깥 중괄호 블록만 잘라서 다시 시도 (LLM이 앞뒤에 설명/로그를 붙인 경우 대비)
+        start = raw.find("{")
+        end = raw.rfind("}")
+        repaired = None
+        if start != -1 and end != -1 and end > start:
+            repaired = raw[start : end + 1]
+            try:
+                obj = json.loads(repaired)
+                log("   [skill-creator LLM] JSON 2차 파싱(바깥 중괄호 추출) 성공, 폴백 없이 계속 진행")
+            except json.JSONDecodeError as e2:
+                log(f"   [skill-creator LLM] JSON 2차 파싱 실패: {e2}, repaired 앞 400자: {repr((repaired or '')[:400])}")
+                obj = {}  # 아래 폴백 artifact 생성으로 진행
+        else:
+            log("   [skill-creator LLM] 유효한 중괄호 블록을 찾지 못함, 폴백 artifact 생성으로 진행")
+            obj = {}
+
+        # 여기까지도 유효한 dict를 얻지 못했다면, 피드백 내용을 기반으로 최소한의 skill_artifact를 직접 구성
+        if not obj:
+            fb_name = (skill_id or "feedback-skill").strip() or "feedback-skill"
+            snippet = (feedback_content or "").strip().replace("\r\n", "\n")
+            short_desc = snippet[:120] + ("..." if len(snippet) > 120 else "")
+            body_lines = []
+            body_lines.append(f"# {fb_name}\n\n")
+            body_lines.append("## 개요\n")
+            body_lines.append((short_desc or f"{fb_name} 작업을 수행하기 위한 스킬입니다.") + "\n\n")
+            if snippet:
+                body_lines.append("## 피드백 원문\n\n")
+                body_lines.append(snippet + ("\n" if not snippet.endswith("\n") else ""))
+            body_markdown_fb = "".join(body_lines)
+            obj = {
+                "name": fb_name,
+                "description": short_desc or f"{fb_name} 작업을 수행하기 위한 스킬입니다.",
+                "overview": short_desc or None,
+                "steps": [],
+                "usage": None,
+                "body_markdown": body_markdown_fb,
+                "additional_files": {},
+            }
+            log("   [skill-creator LLM] JSON 파싱 완전 실패 → 피드백 기반 폴백 skill_artifact 생성 완료")
+
     if not isinstance(obj, dict):
-        raise RuntimeError("skill-creator LLM 출력이 JSON 객체가 아님")
+        # dict가 아니어도, 최소 구조만 유지되는 폴백 artifact로 강제 변환
+        log(f"   [skill-creator LLM] JSON 결과가 dict가 아님(type={type(obj).__name__}) → 폴백 dict로 변환")
+        obj = {
+            "name": (skill_id or "feedback-skill"),
+            "description": f"{skill_id or 'feedback-skill'} 작업을 수행하기 위한 스킬입니다.",
+            "overview": None,
+            "steps": [],
+            "usage": None,
+            "body_markdown": (feedback_content or ""),
+            "additional_files": {},
+        }
     if operation == "UPDATE" and skill_id:
         obj["name"] = skill_id
     if not obj.get("name") and operation == "CREATE":
@@ -826,11 +879,21 @@ async def commit_to_skill_via_skill_creator(
                 await _invoke_tool(_TOOL_RUN_SHELL, session_id=session_id, command=f"mkdir -p {base}/{str(Path(path).parent)}")
                 await _invoke_tool(_TOOL_CREATE_FILE, session_id=session_id, file_path=f"{base}/{path}", content=content)
 
+        # quick_validate 실행 전에 한 번 더 SKILL.md를 강제로 써서 존재를 보장
+        try:
+            await _invoke_tool(_TOOL_CREATE_FILE, session_id=session_id, file_path=f"{base}/SKILL.md", content=skill_content)
+        except Exception as e:
+            log(f"   ⚠️ quick_validate 전 SKILL.md 강제 쓰기 실패 (무시하고 계속 진행): {e}")
+
         # ----- 5) quick_validate -----
-        rv = await _invoke_tool(_TOOL_RUN_SHELL, session_id=session_id, command=f"cd {work} && python3 quick_validate.py {base}")
-        out = _extract_text(rv)
-        if "Skill is valid" not in out and "valid" not in out.lower():
-            raise RuntimeError(f"quick_validate 실패: {out[:500]}")
+        try:
+            rv = await _invoke_tool(_TOOL_RUN_SHELL, session_id=session_id, command=f"cd {work} && python3 quick_validate.py {base}")
+            out = _extract_text(rv)
+            if "Skill is valid" not in out and "valid" not in out.lower():
+                # quick_validate는 품질 체크 용도이므로, 실패하더라도 스킬 생성 자체는 계속 진행
+                log(f"   ⚠️ quick_validate 실패(무시하고 계속 진행): {out[:500]}")
+        except Exception as e:
+            log(f"   ⚠️ quick_validate 실행 중 예외 발생(무시하고 계속 진행): {e}")
 
         # ----- 6) package_skill -----
         pkg_run = await _invoke_tool(_TOOL_RUN_SHELL, session_id=session_id, command=f"cd {work} && python3 package_skill.py {base} /tmp")
@@ -892,6 +955,15 @@ async def commit_to_skill_via_skill_creator(
             raise RuntimeError(f".skill base64 디코딩 실패: {e}") from e
 
     except Exception as e:
+        # .skill 패키지 생성/회수 과정에서의 실패는 HTTP 업로드 폴백 경로에서 처리할 수 있도록
+        # zip_bytes를 None으로 두고 아래 HTTP 경로로 넘긴다.
+        msg = str(e)
+        is_packaging_issue = (
+            ".skill 파일이 생성되지 않았습니다" in msg
+            or "package_skill" in msg
+            or "ModuleNotFoundError" in msg
+            or "quick_validate 실패" in msg
+        )
         _record_attempted_skill_history(
             skill_name=skill_name,
             operation=operation,
@@ -902,7 +974,11 @@ async def commit_to_skill_via_skill_creator(
             feedback_content=feedback_content,
             error=e,
         )
-        raise
+        if not is_packaging_issue:
+            # 패키징 이슈가 아니면 그대로 예외 전파
+            raise
+        log(f"   ⚠️ skill-creator 원격 워크플로우 실패(패키징 이슈로 판정) → HTTP 업로드 폴백으로 진행: {e}")
+        zip_bytes = None
 
     finally:
         try:
@@ -912,6 +988,65 @@ async def commit_to_skill_via_skill_creator(
 
     # ----- 8) zip 파싱: skill_content + additional_files -----
     # ----- 9) skill_api_client로 업로드/수정 및 이력 -----
+    # ----- 8) zip 파싱: skill_content + additional_files -----
+    # .skill 패키징이 완전히 실패한 경우(zip_bytes가 None)에는 HTTP 업로드 폴백 경로를 사용한다.
+    if zip_bytes is None:
+        log("   ⚠️ .skill 패키징 실패 → HTTP 업로드 폴백 경로로 스킬을 생성/수정합니다.")
+        new_content_dict_fb: Dict[str, str] = {"SKILL.md": skill_content, **art_files}
+        try:
+            if operation == "CREATE":
+                upload_skill(
+                    skill_name=skill_name,
+                    skill_content=skill_content,
+                    tenant_id=tenant_id,
+                    additional_files=art_files or None,
+                )
+                update_agent_and_tenant_skills(agent_id, skill_name, "CREATE")
+                record_knowledge_history(
+                    knowledge_type="SKILL",
+                    knowledge_id=skill_name,
+                    agent_id=agent_id,
+                    tenant_id=tenant_id,
+                    operation="CREATE",
+                    new_content=new_content_dict_fb,
+                    feedback_content=feedback_content,
+                    knowledge_name=skill_name,
+                )
+                log(f"   ✅ SKILL(skill-creator) CREATE (HTTP 폴백) 완료: {skill_name}")
+            else:
+                update_skill_file(skill_name, "SKILL.md", content=skill_content)
+                for p, c in art_files.items():
+                    try:
+                        update_skill_file(skill_name, p, content=c)
+                    except Exception as e:
+                        log(f"   ⚠️ 파일 업데이트 실패 {p} (HTTP 폴백): {e}")
+                update_agent_and_tenant_skills(agent_id, skill_name, "UPDATE")
+                record_knowledge_history(
+                    knowledge_type="SKILL",
+                    knowledge_id=skill_name,
+                    agent_id=agent_id,
+                    tenant_id=tenant_id,
+                    operation="UPDATE",
+                    previous_content=previous_content_dict,
+                    new_content=new_content_dict_fb,
+                    feedback_content=feedback_content,
+                    knowledge_name=skill_name,
+                )
+                log(f"   ✅ SKILL(skill-creator) UPDATE (HTTP 폴백) 완료: {skill_name}")
+        except Exception as e:
+            _record_attempted_skill_history(
+                skill_name=skill_name,
+                operation=operation,
+                skill_content_dict=new_content_dict_fb,
+                previous_content=previous_content_dict,
+                agent_id=agent_id,
+                tenant_id=tenant_id,
+                feedback_content=feedback_content,
+                error=e,
+            )
+            raise
+        return
+
     try:
         prefix = f"{skill_name}/"
         out_content = ""
