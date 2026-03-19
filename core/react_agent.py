@@ -704,7 +704,7 @@ def _create_react_agent_core(
     """
     try:
         # LLM 초기화
-        llm = create_llm(model="gpt-4o", streaming=False, temperature=0)
+        llm = create_llm(streaming=False, temperature=0)
         
         # ReAct 에이전트 생성 (커스텀 정책 프롬프트 사용)
         agent = create_react_agent(llm, tools, prompt)

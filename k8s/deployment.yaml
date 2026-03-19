@@ -1,0 +1,95 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agent-feedback
+  namespace: dev
+  labels:
+    app: agent-feedback
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: agent-feedback
+  template:
+    metadata:
+      labels:
+        app: agent-feedback
+    spec:
+      containers:
+      - name: agent-feedback
+        image: ghcr.io/uengine-oss/agent-feedback:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 6789
+          name: http
+        env:
+        - name: PORT
+          value: "6789"
+        - name: OPENAI_API_KEY
+          valueFrom:
+            secretKeyRef:
+              key: OPENAI_API_KEY
+              name: openai-secret
+        - name: SUPABASE_URL
+          valueFrom:
+            configMapKeyRef:
+              key: SUPABASE_URL
+              name: my-config
+        - name: SUPABASE_KEY
+          valueFrom:
+            secretKeyRef:
+              key: SERVICE_ROLE_KEY
+              name: my-secrets
+        - name: DB_USER
+          valueFrom:
+            secretKeyRef:
+              key: DB_USER
+              name: my-secrets
+        - name: DB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              key: DB_PASSWORD
+              name: my-secrets
+        - name: DB_HOST
+          valueFrom:
+            secretKeyRef:
+              key: DB_HOST
+              name: my-secrets
+        - name: DB_PORT
+          valueFrom:
+            secretKeyRef:
+              key: DB_PORT
+              name: my-secrets
+        - name: DB_NAME
+          valueFrom:
+            secretKeyRef:
+              key: DB_NAME
+              name: my-secrets
+        - name: MCP_SERVER_URL
+          value: "http://claude-skills:8765/mcp"
+        - name: USE_SKILL_CREATOR_WORKFLOW
+          value: "true"
+        - name: USE_SKILL_CREATOR_FALLBACK_TO_HTTP
+          value: "true"
+        - name: COMPUTER_USE_MCP_URL
+          value: "http://computer-use:8000/mcp"
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "250m"
+          limits:
+            memory: "2Gi"
+            cpu: "1000m"
+        livenessProbe:
+          httpGet:
+            path: /docs
+            port: 6789
+          initialDelaySeconds: 30
+          periodSeconds: 60
+        readinessProbe:
+          httpGet:
+            path: /docs
+            port: 6789
+          initialDelaySeconds: 10
+          periodSeconds: 30
+

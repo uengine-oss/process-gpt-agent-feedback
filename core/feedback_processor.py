@@ -47,7 +47,7 @@ async def match_feedback_to_agents(
     맥락으로 고려할 수 있도록 한다.
     """
     
-    llm = create_llm(model="gpt-4o", streaming=False, temperature=0)
+    llm = create_llm(streaming=False, temperature=0)
     
     agents_info = "\n".join([
         f"- 에이전트 ID: {agent['id']}, 이름: {agent['name']}, 역할: {agent['role']}, 목표: {agent['goal']}"

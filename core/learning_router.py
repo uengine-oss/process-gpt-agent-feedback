@@ -42,7 +42,7 @@ async def route_learning(candidate: Dict, existing_skill_content: Optional[str] 
         }
     """
     
-    llm = create_llm(model="gpt-4o", streaming=False, temperature=0)
+    llm = create_llm(streaming=False, temperature=0)
     
     content = candidate.get("content", "")
     intent_hint = candidate.get("intent_hint", "")

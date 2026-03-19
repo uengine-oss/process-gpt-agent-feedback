@@ -19,7 +19,7 @@ class SemanticKnowledgeMatcher:
     """의미 기반 지식 유사도 분석기"""
     
     def __init__(self):
-        self.llm = create_llm(model="gpt-4o", streaming=False, temperature=0)
+        self.llm = create_llm(streaming=False, temperature=0)
     
     async def find_similar_knowledge(
         self,

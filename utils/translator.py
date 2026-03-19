@@ -13,6 +13,7 @@ import re
 from typing import Optional
 
 from utils.logger import log
+from core.llm import get_llm_model
 
 
 def _is_mainly_korean(text: str) -> bool:
@@ -56,7 +57,7 @@ async def translate_ko_to_en_for_search(text: str) -> str:
 
         client = AsyncOpenAI(api_key=api_key)
         response = await client.chat.completions.create(
-            model="gpt-4o-mini",
+            model=(os.getenv("LLM_TRANSLATOR_MODEL") or get_llm_model(default="gpt-4o")),
             messages=[
                 {
                     "role": "system",

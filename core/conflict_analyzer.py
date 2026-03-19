@@ -47,7 +47,7 @@ async def analyze_knowledge_conflict(
         }
     """
     
-    llm = create_llm(model="gpt-4o", streaming=False, temperature=0)
+    llm = create_llm(streaming=False, temperature=0)
     
     # 타겟 타입에 맞는 새 지식과 기존 지식 추출
     if target_type == "MEMORY":

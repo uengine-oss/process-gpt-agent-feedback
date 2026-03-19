@@ -332,7 +332,7 @@ async def _generate_dmn_xml_llm(rule_name: str, condition: str, action: str, fee
     Returns:
         DMN XML 문자열
     """
-    llm = create_llm(model="gpt-4o", streaming=False, temperature=0)
+    llm = create_llm(streaming=False, temperature=0)
     
     prompt = f"""You are a **DMN (Decision Model and Notation) 1.3 expert**. 
 Generate a **complete, well-structured DMN 1.3 XML model** from the business rule provided.
@@ -611,7 +611,7 @@ async def _extend_dmn_xml_llm(existing_xml: str, rule_name: str, new_condition: 
     Returns:
         확장된 DMN XML 문자열
     """
-    llm = create_llm(model="gpt-4o", streaming=False, temperature=0)
+    llm = create_llm(streaming=False, temperature=0)
     
     prompt = f"""You are a **DMN (Decision Model and Notation) 1.3 expert**. 
 Your task is to **EXTEND** an existing DMN model by adding new rules, while **PRESERVING the complete model structure**.

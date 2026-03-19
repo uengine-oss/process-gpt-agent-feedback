@@ -69,10 +69,6 @@ wandb/
 # Environments
 .env
 .venv
-.env.*
-
-# Deployment files (contains API keys)
-deployment.yaml
 
 # Temp files
 tmp/

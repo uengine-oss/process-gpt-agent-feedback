@@ -11,14 +11,27 @@ Setting `disable_streaming=True` forces the underlying model to not use streamin
 
 from __future__ import annotations
 
-from typing import Optional, Tuple, Union
-
+from typing import Dict, Optional, Tuple, Union
+import os
 
 TimeoutType = Union[float, Tuple[float, float]]
 
 
+def get_llm_model(default: str = "gpt-4o") -> str:
+    """
+    Resolve the LLM model name from environment.
+
+    Priority:
+    - LLM_MODEL (preferred)
+    - OPENAI_MODEL (fallback)
+    - default (when unset/blank)
+    """
+    model = (os.getenv("LLM_MODEL") or os.getenv("OPENAI_MODEL") or "").strip()
+    return model or default
+
+
 def create_llm(
-    model: str = "gpt-4o",
+    model: Optional[str] = None,
     streaming: bool = False,  # kept for compatibility; we always disable transport streaming
     temperature: float = 0.0,
     timeout: Optional[TimeoutType] = (10.0, 120.0),  # connect, read
@@ -29,8 +42,14 @@ def create_llm(
     """
     from langchain_openai import ChatOpenAI
 
+    base_url = os.getenv("LLM_PROXY_URL", "http://litellm-proxy:4000")
+    api_key = os.getenv("LLM_PROXY_API_KEY") or os.getenv("OPENAI_API_KEY", "")
+    resolved_model = model or get_llm_model(default="gpt-4o")
+
     return ChatOpenAI(
-        model=model,
+        base_url=base_url,
+        api_key=api_key,
+        model=resolved_model,
         temperature=temperature,
         streaming=False,
         disable_streaming=True,
