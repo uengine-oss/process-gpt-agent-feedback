@@ -1,3 +1,14 @@
+# 스킬 크리에이터 워크플로우 동작 구조 (구세대 문서 — 아래 내용은 현재 코드와 다릅니다)
+
+> ⚠️ **이 문서는 computer-use Pod + `.skill` zip 패키징 세대를 설명하며, 현재 코드베이스와 더 이상 일치하지 않습니다.**
+> `USE_SKILL_CREATOR_WORKFLOW`/`COMPUTER_USE_MCP_URL`, `core/react_agent.py`, `core/react_tools.py`,
+> `core/skill_creator_committer.py`, `core/mcp_client.py`는 현재 리포에 존재하지 않습니다.
+> 현재 서비스는 `core/deep_agent.py` + `core/skill_tools.py`로 스킬을 개선하며, `skills/skill-creator`를
+> Deep Agent의 참조 스킬로 로드하는 방식입니다 — 최신 구조는 [README.md](../README.md)를 참고하세요.
+> 아래는 과거 설계 기록으로만 남겨둡니다.
+
+---
+
 # 스킬 크리에이터 워크플로우 동작 구조
 
 피드백이 **스킬(SKILL)** 관련일 때, **computer-use**와 **claude-skills의 skill-creator**를 사용해 스킬을 새로 만들거나 갱신하는 end-to-end 구조입니다.  

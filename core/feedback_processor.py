@@ -1,37 +1,13 @@
 import json
-import os
 from typing import Dict, List, Any, Optional
 from utils.logger import log, handle_error
-from dotenv import load_dotenv
 from core.llm import create_llm
 
-# ============================================================================
-# 설정 및 초기화
-# ============================================================================
-
-load_dotenv()
-
-# 데이터베이스 연결 정보
-DB_USER = os.getenv("DB_USER")
-DB_PASSWORD = os.getenv("DB_PASSWORD")
-DB_HOST = os.getenv("DB_HOST")
-DB_PORT = os.getenv("DB_PORT")
-DB_NAME = os.getenv("DB_NAME")
-
-
-# ============================================================================
-# 유틸리티 함수
-# ============================================================================
 
 def clean_json_response(content: str) -> str:
-    """LLM 응답에서 백틱과 json 키워드 제거"""
-    # ```json과 ``` 제거
     content = content.replace("```json", "").replace("```", "")
     return content.strip()
 
-# ============================================================================
-# 피드백 매칭 프롬프트
-# ============================================================================
 
 async def match_feedback_to_agents(
     feedback: str,
@@ -40,34 +16,27 @@ async def match_feedback_to_agents(
     events: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict:
     """
-    AI를 사용해 피드백을 각 에이전트에 매칭
-
-    추가로, 해당 워크아이템(todo_id)의 이벤트 로그를 함께 전달하여
-    에이전트가 실제 어떤 스킬/지식을 언제 어떻게 사용했는지까지
-    맥락으로 고려할 수 있도록 한다.
+    AI를 사용해 피드백을 각 에이전트에 매칭하고 스킬 개선용 학습 후보를 생성합니다.
     """
-    
+
     llm = create_llm(streaming=False, temperature=0)
-    
+
     agents_info = "\n".join([
         f"- 에이전트 ID: {agent['id']}, 이름: {agent['name']}, 역할: {agent['role']}, 목표: {agent['goal']}"
         for agent in agents
     ])
 
-    # 이벤트 로그를 사람이 읽을 수 있는 요약 문자열로 변환
     events_summary = "없음"
     if events:
         lines = []
-        for ev in events[:30]:  # LLM에 과도한 토큰이 가지 않도록 최대 30개까지만 전달
+        for ev in events[:30]:
             ev_type = ev.get("event_type", "")
             status = ev.get("status", "")
             crew_type = ev.get("crew_type", "")
             ts = ev.get("timestamp", "")
-            # data에는 스킬 이름, 도구 호출 정보 등이 들어있을 수 있으므로 JSON 문자열로 축약
             data_str = ""
             try:
                 data = ev.get("data", {})
-                # 너무 길면 앞부분만 전달
                 data_str = json.dumps(data, ensure_ascii=False)
                 if len(data_str) > 300:
                     data_str = data_str[:300] + "...(truncated)"
@@ -79,7 +48,7 @@ async def match_feedback_to_agents(
         events_summary = "\n".join(lines)
 
     prompt = f"""
-다음 상황을 분석하여 각 에이전트에게 적절한 학습 피드백을 생성해주세요.
+다음 상황을 분석하여 각 에이전트에게 적절한 스킬 개선 피드백을 생성해주세요.
 
 **작업 지시사항:**
 {task_description}
@@ -94,37 +63,23 @@ async def match_feedback_to_agents(
 {agents_info}
 
 **상황 설명:**
-에이전트들이 위의 작업지시사항에 따라 작업을 수행했지만, 사용자가 여러 차례에 걸쳐 피드백을 제공했습니다. 
-피드백은 시간순으로 제공되었으며, 가장 최근(마지막) 피드백이 가장 중요하지만 이전 피드백들의 내용도 모두 반영되어야 합니다.
+에이전트들이 위의 작업지시사항에 따라 작업을 수행했지만, 사용자가 피드백을 제공했습니다.
+이 피드백을 바탕으로 에이전트의 스킬(작업 절차)을 개선하기 위한 학습 후보를 생성하세요.
 
 **피드백 처리 방식:**
-- **가장 최신(time이 늦은) 피드백을 최우선으로 반영**
-- 이전 피드백들은 상황 맥락을 이해하기 위한 참고 정보로만 활용
-- **시간 흐름을 파악하여 피드백들 간의 연결고리와 문맥을 이해**
-- 최신 피드백의 요구사항이 이전과 다르면 최신 것을 따라야 함
-- 최신 피드백에서 요구하는 정확한 액션을 명확히 파악
-- **자연스럽고 통합된 하나의 완전한 피드백으로 작성**
+- 가장 최신(time이 늦은) 피드백을 최우선으로 반영
+- 이전 피드백들은 맥락 참고용
+- 최신 피드백의 요구사항이 이전과 다르면 최신 것을 따름
+- 자연스럽고 통합된 하나의 완전한 피드백으로 작성
 - 최대 2500자까지 허용하여 상세히 작성
 
-**중요한 상황별 처리:**
-- 이전에 저장을 했는데 잘못 저장되었다면 → **수정**이 필요 (다시 저장하면 안됨)
-- 이전에 조회만 했는데 저장이 필요하다면 → **저장**이 필요
-- 최신 피드백에서 명시한 요구사항이 절대 우선
-
-**통합 예시:**
-1번 피드백: "정보 저장을 요청했는데 조회만 했다"
-2번 피드백: "정보 저장을 하긴 했으나 잘못 저장되어서 수정을 요청"
-→ 통합 결과: "이전에 저장된 정보가 잘못되었으므로, 올바른 정보로 수정이 필요하다"
-
-**지시사항:**
-1. 시간 순서대로 피드백을 분석하여 상황의 전체적인 흐름을 파악하세요
-2. **최신 피드백의 요구사항을 중심으로** 완전한 해결책을 제시하세요
-3. 이전 피드백들의 맥락을 자연스럽게 녹여서 통합된 하나의 피드백으로 작성하세요
-4. 에이전트가 **처음부터 끝까지 완벽하게 수행할 수 있는 구체적이고 실행 가능한 가이드**를 제공하세요
+**스킬 개선 초점:**
+- 피드백에서 절차(작업 순서, 단계별 프로세스)와 관련된 내용을 추출
+- 기존 스킬의 수정이 필요한지, 새 스킬 생성이 필요한지 판단 힌트 제공
+- 에이전트가 스킬을 개선할 수 있는 구체적이고 실행 가능한 가이드 제공
 
 **응답 형식:**
 - 추가 설명 없이 오직 아래 JSON 구조로만 응답하세요
-- 마크다운 코드블록(```)이나 기타 텍스트는 포함하지 마세요
 - JSON 객체만 출력하세요
 
 {{
@@ -133,8 +88,8 @@ async def match_feedback_to_agents(
       "agent_id": "에이전트_ID",
       "agent_name": "에이전트_이름",
       "learning_candidate": {{
-        "content": "시간순 피드백들을 통합한 자연스러운 학습 가이드",
-        "intent_hint": "이 피드백이 판단 기준(조건-결과)인지 / 절차(작업 순서)인지 / 지침(선호/주의)인지에 대한 요약 힌트"
+        "content": "시간순 피드백들을 통합한 자연스러운 스킬 개선 가이드",
+        "intent_hint": "이 피드백이 어떤 스킬 개선을 요구하는지에 대한 요약 힌트"
       }}
     }}
   ]
@@ -143,21 +98,18 @@ async def match_feedback_to_agents(
 
     try:
         response = await llm.ainvoke(prompt)
-        
-        # 응답 내용 정리 (백틱 제거)
         cleaned_content = clean_json_response(response.content)
-        
+
         log(f"📤 LLM 전체 응답: {cleaned_content}")
-        
-        # 피드백 내용이 있다면 전체 출력
+
         parsed_result = json.loads(cleaned_content)
         if parsed_result.get("agent_feedbacks"):
-            for feedback in parsed_result["agent_feedbacks"]:
-                learning_candidate = feedback.get('learning_candidate', {})
-                log(f"📝 에이전트 '{feedback.get('agent_name', 'Unknown')}' 학습 후보:")
-                log(f"   내용: {learning_candidate.get('content', 'No content')}")
-                log(f"   의도 힌트: {learning_candidate.get('intent_hint', 'No hint')}")
-        
+            for fb in parsed_result["agent_feedbacks"]:
+                lc = fb.get('learning_candidate', {})
+                log(f"📝 에이전트 '{fb.get('agent_name', 'Unknown')}' 학습 후보:")
+                log(f"   내용: {lc.get('content', 'No content')}")
+                log(f"   의도 힌트: {lc.get('intent_hint', 'No hint')}")
+
         return parsed_result
     except json.JSONDecodeError as e:
         log(f"❌ JSON 파싱 실패 - 응답: {response.content if 'response' in locals() else 'None'}")
@@ -167,3 +119,61 @@ async def match_feedback_to_agents(
         handle_error("피드백매칭", e)
         return {"agent_feedbacks": []}
 
+
+async def extract_general_rule(
+    collected_items: List[Dict],
+    task_description: str = "",
+) -> Optional[str]:
+    """배치에 모인 피드백들에서 공통 일반 규칙만 추출한다.
+
+    이 단계는 스킬 개선 작업이 아니다 — 어떤 스킬을 고칠지 결정하거나 SKILL.md를
+    작성하지 않는다. 피드백들 사이에 명확한 공통 규칙이 없으면 None을 반환한다
+    (억지로 저품질 규칙을 만들어내지 않는다).
+    """
+    llm = create_llm(streaming=False, temperature=0)
+
+    items_sorted = sorted(collected_items, key=lambda x: x.get("time", ""))
+    items_summary = "\n".join(
+        f"- time={item.get('time', '')}, content={item.get('content', '')}"
+        for item in items_sorted
+    ) or "없음"
+
+    prompt = f"""
+같은 업무 활동 단계에서 수집된 여러 워크아이템의 사용자 피드백입니다.
+이 피드백들 사이에 공통적으로 추출 가능한 일반 규칙(가이드라인)이 있는지 판단하세요.
+
+**작업 지시사항 (참고용):**
+{task_description}
+
+**수집된 피드백 (시간순):**
+{items_summary}
+
+**주의:**
+- 아직 어떤 스킬을 고칠지 결정하는 단계가 아닙니다. 스킬 이름을 언급하거나 SKILL.md 내용을 작성하지 마세요.
+- 피드백들 사이에 명확한 공통 규칙이 없다면 억지로 만들어내지 마세요 — 이 경우 has_common_rule을 false로 응답하세요.
+- 최신(time이 늦은) 피드백이 이전 피드백과 상충하면 최신 것을 우선하되, 이전 것도 맥락으로 반영하세요.
+
+**응답 형식:**
+- 추가 설명 없이 오직 아래 JSON 구조로만 응답하세요
+- JSON 객체만 출력하세요
+
+{{
+  "has_common_rule": true 또는 false,
+  "general_rule": "공통 규칙을 자연스럽게 서술한 텍스트 (has_common_rule이 true일 때만 채움)"
+}}
+"""
+
+    try:
+        response = await llm.ainvoke(prompt)
+        cleaned_content = clean_json_response(response.content)
+        parsed_result = json.loads(cleaned_content)
+        rule = parsed_result.get("general_rule")
+        if parsed_result.get("has_common_rule") and rule:
+            return rule
+        return None
+    except json.JSONDecodeError as e:
+        handle_error("일반규칙추출 JSON 파싱", f"응답 파싱 실패: {e}")
+        return None
+    except Exception as e:
+        handle_error("일반규칙추출", e)
+        return None

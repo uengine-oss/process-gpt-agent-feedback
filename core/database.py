@@ -627,18 +627,18 @@ def update_knowledge_access_time(
 ) -> bool:
     """
     지식의 마지막 접근 시간 업데이트
-    
+
     Args:
         agent_id: 에이전트 ID
         knowledge_type: 지식 타입
         knowledge_id: 지식 ID
-    
+
     Returns:
         업데이트 성공 여부
     """
     try:
         supabase = get_db_client()
-        
+
         (
             supabase
             .table('agent_knowledge_registry')
@@ -648,11 +648,243 @@ def update_knowledge_access_time(
             .eq('knowledge_id', knowledge_id)
             .execute()
         )
-        
+
         return True
-        
+
     except Exception as e:
         handle_error("접근시간업데이트", e)
         return False
+
+
+# ============================================================================
+# 피드백 배치(skill_feedback_proposals) — 수집/트리거/제안/승인·반려
+# ============================================================================
+
+async def fetch_todolist_rows_by_ids(todo_ids: List[str]) -> List[Dict[str, Any]]:
+    """배치에 속한 todo_id들의 todolist row를 재조회 (승인 처리 시 담당자·설명 합성용)"""
+    if not todo_ids:
+        return []
+    try:
+        supabase = get_db_client()
+        resp = supabase.table("todolist").select("*").in_("id", todo_ids).execute()
+        return resp.data or []
+    except Exception as e:
+        handle_error("todolist재조회", e)
+        return []
+
+
+async def append_feedback_to_batch(
+    tenant_id: str,
+    proc_def_id: str,
+    activity_id: str,
+    todo_id: str,
+    content: str,
+    time: str,
+    user_id: str,
+) -> Optional[Dict[str, Any]]:
+    """(tenant_id, proc_def_id, activity_id) 기준 COLLECTING 배치에 피드백을 원자적으로 적재.
+
+    해당 배치가 없으면 새로 만든다 (append_feedback_to_batch DB 함수, 부분 유니크 인덱스 기반 upsert).
+    """
+    try:
+        supabase = get_db_client()
+        resp = supabase.rpc(
+            "append_feedback_to_batch",
+            {
+                "p_tenant_id": tenant_id,
+                "p_proc_def_id": proc_def_id,
+                "p_activity_id": activity_id,
+                "p_todo_id": todo_id,
+                "p_content": content,
+                "p_time": time,
+                "p_user_id": user_id,
+            },
+        ).execute()
+        data = resp.data
+        if isinstance(data, list):
+            return data[0] if data else None
+        return data
+    except Exception as e:
+        handle_error("피드백배치적재", e)
+        return None
+
+
+async def fetch_collecting_batches(tenant_id: str = "") -> List[Dict[str, Any]]:
+    """트리거 조건 확인 대상인 COLLECTING 배치 전체를 가져온다"""
+    try:
+        supabase = get_db_client()
+        query = supabase.table("skill_feedback_proposals").select("*").eq("status", "COLLECTING")
+        if tenant_id:
+            query = query.eq("tenant_id", tenant_id)
+        resp = query.execute()
+        return resp.data or []
+    except Exception as e:
+        handle_error("COLLECTING배치조회", e)
+        return []
+
+
+def _now_iso() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat()
+
+
+async def mark_batch_proposed(
+    batch_id: str,
+    extracted_rule: str,
+    candidate_skill_names: Optional[List[str]] = None,
+) -> bool:
+    """규칙 추출 성공 시 COLLECTING → PROPOSED로 전환 (중복 트리거 방지를 위해 COLLECTING인 것만)"""
+    try:
+        supabase = get_db_client()
+        resp = (
+            supabase.table("skill_feedback_proposals")
+            .update({
+                "status": "PROPOSED",
+                "extracted_rule": extracted_rule,
+                "proposed_at": _now_iso(),
+                "candidate_skill_names": candidate_skill_names or [],
+            })
+            .eq("id", batch_id)
+            .eq("status", "COLLECTING")
+            .execute()
+        )
+        return bool(resp.data)
+    except Exception as e:
+        handle_error("배치PROPOSED전환", e)
+        return False
+
+
+async def mark_batch_discarded(batch_id: str) -> bool:
+    """공통 규칙 없음 판정 시 COLLECTING → DISCARDED로 전환"""
+    try:
+        supabase = get_db_client()
+        resp = (
+            supabase.table("skill_feedback_proposals")
+            .update({"status": "DISCARDED"})
+            .eq("id", batch_id)
+            .eq("status", "COLLECTING")
+            .execute()
+        )
+        return bool(resp.data)
+    except Exception as e:
+        handle_error("배치DISCARDED전환", e)
+        return False
+
+
+async def fetch_proposed_batches(tenant_id: str = "") -> List[Dict[str, Any]]:
+    """사용자 승인/반려 대기 중인 제안(PROPOSED) 목록을 가져온다"""
+    try:
+        supabase = get_db_client()
+        query = supabase.table("skill_feedback_proposals").select("*").eq("status", "PROPOSED")
+        if tenant_id:
+            query = query.eq("tenant_id", tenant_id)
+        resp = query.order("proposed_at", desc=True).execute()
+        return resp.data or []
+    except Exception as e:
+        handle_error("PROPOSED배치조회", e)
+        return []
+
+
+def fetch_batch_by_id(batch_id: str) -> Optional[Dict[str, Any]]:
+    try:
+        supabase = get_db_client()
+        resp = supabase.table("skill_feedback_proposals").select("*").eq("id", batch_id).execute()
+        rows = resp.data or []
+        return rows[0] if rows else None
+    except Exception as e:
+        handle_error("배치조회", e)
+        return None
+
+
+async def mark_batch_decided(
+    batch_id: str,
+    status: str,
+    decided_by: Optional[str] = None,
+    decided_by_name: Optional[str] = None,
+    decided_by_email: Optional[str] = None,
+    decision_note: Optional[str] = None,
+) -> bool:
+    """PROPOSED 상태인 배치를 APPROVED 또는 REJECTED로 전환 (중복 결정 방지를 위해 PROPOSED인 것만)"""
+    try:
+        supabase = get_db_client()
+        resp = (
+            supabase.table("skill_feedback_proposals")
+            .update({
+                "status": status,
+                "decided_by": decided_by,
+                "decided_by_name": decided_by_name,
+                "decided_by_email": decided_by_email,
+                "decision_note": decision_note,
+                "decided_at": _now_iso(),
+            })
+            .eq("id", batch_id)
+            .eq("status", "PROPOSED")
+            .execute()
+        )
+        return bool(resp.data)
+    except Exception as e:
+        handle_error("배치결정반영", e)
+        return False
+
+
+# ============================================================================
+# 액티비티 설정 스킬 조회 (proc_def.definition 파싱, 담당 에이전트 없는 피드백용)
+# ============================================================================
+
+def _get_proc_def_definition(tenant_id: str, proc_def_id: str) -> Optional[Dict[str, Any]]:
+    tid = (tenant_id or "").strip()
+    pdid = (proc_def_id or "").strip()
+    if not (tid and pdid):
+        return None
+    try:
+        supabase = get_db_client()
+        resp = (
+            supabase.table("proc_def")
+            .select("definition")
+            .eq("tenant_id", tid)
+            .eq("id", pdid)
+            .limit(1)
+            .execute()
+        )
+        rows = resp.data or []
+        if not rows:
+            return None
+        return rows[0].get("definition")
+    except Exception as e:
+        handle_error("proc_def조회", e)
+        return None
+
+
+def load_activity_skills(tenant_id: str, proc_def_id: str, activity_id: str) -> List[str]:
+    """프로세스 정의에서 특정 액티비티에 설정된 스킬 이름 목록을 반환. 실패 시 빈 리스트."""
+    aid = (activity_id or "").strip()
+    definition = _get_proc_def_definition(tenant_id, proc_def_id)
+    if not aid or not isinstance(definition, dict):
+        return []
+    activities = definition.get("activities")
+    if not isinstance(activities, list):
+        return []
+
+    target: Optional[Dict[str, Any]] = None
+    for act in activities:
+        if not isinstance(act, dict):
+            continue
+        for key in ("id", "activity_id", "activityId", "key"):
+            if str(act.get(key) or "").strip() == aid:
+                target = act
+                break
+        if target is not None:
+            break
+    if target is None:
+        return []
+
+    skills = target.get("skills")
+    if skills is None:
+        return []
+    if isinstance(skills, str):
+        return [s.strip() for s in skills.split(",") if s.strip()]
+    if isinstance(skills, list):
+        return [str(s).strip() for s in skills if str(s).strip()]
+    return []
 
 

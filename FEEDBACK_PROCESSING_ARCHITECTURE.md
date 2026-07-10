@@ -1,4 +1,11 @@
-# 피드백 처리 아키텍처
+# 피드백 처리 아키텍처 (구세대 문서 — 아래 내용은 현재 코드와 다릅니다)
+
+> ⚠️ **이 문서는 초기 세대(ReAct 에이전트 + MEMORY/DMN_RULE/SKILL 3종 저장소)를 설명하며, 현재 코드베이스와 더 이상 일치하지 않습니다.**
+> 현재 서비스는 SKILL만 다루며 `deepagents.create_deep_agent` 기반입니다 — 최신 구조는 [README.md](README.md)를,
+> 배치 수집·제안·승인 플로우는 `openspec/changes/add-feedback-batching/`를 참고하세요.
+> 아래는 과거 설계 기록으로만 남겨둡니다.
+
+---
 
 에이전트 피드백을 분석하여 지식 저장소(MEMORY, DMN_RULE, SKILL)에 적절히 분류/저장하는 시스템.
 
