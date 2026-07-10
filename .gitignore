@@ -73,3 +73,10 @@ wandb/
 # Temp files
 tmp/
 temp/ 
+
+
+.agent/
+.claude/
+.codex/
+
+openspec/

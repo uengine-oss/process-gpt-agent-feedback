@@ -71,6 +71,7 @@ Thumbs.db
 # Documentation (optional, can remove if needed in container)
 *.md
 !readme.md
+!skills/**/*.md
 
 # Migration files (if not needed at runtime)
 # migrations/

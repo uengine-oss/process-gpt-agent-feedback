@@ -20,10 +20,7 @@ load_dotenv()
 # HTTP API 서버 설정
 # ============================================================================
 
-# MCP_SERVER_URL에서 /mcp를 제거하여 기본 URL 추출
-MCP_SERVER_URL = os.getenv("MCP_SERVER_URL", "http://localhost:8765/mcp")
-# http://localhost:8765/mcp -> http://localhost:8765
-SKILL_API_BASE_URL = MCP_SERVER_URL.rsplit("/mcp", 1)[0] if "/mcp" in MCP_SERVER_URL else MCP_SERVER_URL.replace("/mcp", "")
+SKILL_API_BASE_URL = os.getenv("SKILL_API_BASE_URL", "http://localhost:8765")
 
 
 def _get_base_url() -> str:
