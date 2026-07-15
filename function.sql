@@ -9,6 +9,14 @@
 -- 1. 피드백 작업 조회 함수
 -- ============================================================================
 
+-- feedback_collected_count: 이 워크아이템에서 지금까지 수집한 feedback 배열 항목 개수.
+-- 같은 워크아이템에 피드백이 여러 번 추가될 수 있는데, feedback_status만으로는 재조회
+-- 여부를 판단할 수 없어(종결 상태 이후 새 피드백이 추가돼도 되돌리는 코드가 없음)
+-- 두 번째 이후 피드백이 영원히 누락되는 문제가 있었다. 배열 길이를 이 값과 비교해
+-- 재조회 대상을 판단한다 (feedback_collected_count.sql 참고).
+ALTER TABLE public.todolist
+    ADD COLUMN IF NOT EXISTS feedback_collected_count integer NOT NULL DEFAULT 0;
+
 -- DONE 상태이면서 피드백이 있는 작업 조회 및 상태 변경
 CREATE OR REPLACE FUNCTION public.agent_feedback_task(
   p_limit integer
@@ -19,12 +27,18 @@ BEGIN
     WITH cte AS (
       SELECT *
         FROM todolist
-       WHERE feedback IS NOT NULL 
-         AND feedback != '[]'::jsonb 
+       WHERE feedback IS NOT NULL
+         AND feedback != '[]'::jsonb
          AND feedback != '{}'::jsonb
          AND proc_def_id IS NOT NULL
          AND proc_def_id != ''
-         AND (feedback_status IS NULL OR feedback_status = 'REQUESTED')
+         AND (
+           (feedback_status IS NULL OR feedback_status = 'REQUESTED')
+           OR (
+             jsonb_typeof(feedback) = 'array'
+             AND jsonb_array_length(feedback) > COALESCE(feedback_collected_count, 0)
+           )
+         )
        ORDER BY updated_at DESC
        LIMIT p_limit
        FOR UPDATE SKIP LOCKED
@@ -237,6 +251,108 @@ $$ LANGUAGE plpgsql STABLE;
 
 GRANT EXECUTE ON FUNCTION public.agent_needing_knowledge_setup(integer) TO anon;
 
+
+CREATE TABLE IF NOT EXISTS public.proc_def_version (
+  arcv_id text not null,
+  proc_def_id text not null,
+  version text not null,
+  version_tag text null,
+  snapshot text null,
+  definition jsonb null,
+  "timeStamp" timestamp without time zone null default CURRENT_TIMESTAMP,
+  diff text null,
+  message text null,
+  uuid uuid not null default gen_random_uuid (),
+  tenant_id text null default tenant_id (),
+  parent_version text null,
+  source_todolist_id uuid null,
+  is_draft boolean not null default false,
+  constraint proc_def_version_pkey primary key (uuid),
+  constraint proc_def_version_tenant_id_fkey foreign KEY (tenant_id) references tenants (id) on update CASCADE on delete CASCADE
+) TABLESPACE pg_default;
+
+
+create table public.resource_pull_requests (
+  id uuid not null default gen_random_uuid (),
+  tenant_id text not null,
+  resource_type text not null,
+  resource_id text not null,
+  branch_name text not null,
+  base_branch text not null default 'main'::text,
+  title text not null,
+  description text null,
+  status public.resource_pr_status not null default 'OPEN'::resource_pr_status,
+  requester_id uuid not null,
+  reviewer_id uuid null,
+  git_pr_number integer null,
+  git_pr_url text null,
+  created_at timestamp with time zone not null default now(),
+  updated_at timestamp with time zone not null default now(),
+  merged_at timestamp with time zone null,
+  git_repo_url text null,
+  requester_name text null,
+  constraint resource_pull_requests_pkey primary key (id),
+  constraint resource_pull_requests_resource_type_check check (
+    (
+      resource_type = any (array['skill'::text, 'bpmn'::text, 'dmn'::text])
+    )
+  )
+) TABLESPACE pg_default;
+
+create index IF not exists idx_resource_pull_requests_tenant_resource on public.resource_pull_requests using btree (tenant_id, resource_type, resource_id) TABLESPACE pg_default;
+
+create index IF not exists idx_resource_pull_requests_status on public.resource_pull_requests using btree (tenant_id, status) TABLESPACE pg_default;
+
+create trigger resource_pull_requests_updated_at BEFORE
+update on resource_pull_requests for EACH row
+execute FUNCTION update_updated_at_column ();
+
+
+create table public.feedback_proposals (
+  id uuid not null default gen_random_uuid (),
+  tenant_id text not null,
+  proc_def_id text not null,
+  activity_id text not null,
+  status text not null default 'COLLECTING'::text,
+  collected_items jsonb not null default '[]'::jsonb,
+  first_collected_at timestamp with time zone not null default now(),
+  extracted_rule text null,
+  proposed_at timestamp with time zone null,
+  decided_by uuid null,
+  decided_by_name text null,
+  decided_by_email text null,
+  decided_at timestamp with time zone null,
+  decision_note text null,
+  created_at timestamp with time zone not null default now(),
+  updated_at timestamp with time zone not null default now(),
+  candidate_skill_names text[] not null default '{}'::text[],
+  targets jsonb not null default '[]'::jsonb,
+  constraint feedback_proposals_pkey primary key (id),
+  constraint feedback_proposals_status_check check (
+    (
+      status = any (
+        array[
+          'COLLECTING'::text,
+          'PROPOSED'::text,
+          'APPROVED'::text,
+          'REJECTED'::text,
+          'DISCARDED'::text,
+          'RESOLVED'::text
+        ]
+      )
+    )
+  )
+) TABLESPACE pg_default;
+
+create unique INDEX IF not exists feedback_proposals_collecting_key on public.feedback_proposals using btree (tenant_id, proc_def_id, activity_id) TABLESPACE pg_default
+where
+  (status = 'COLLECTING'::text);
+
+create index IF not exists feedback_proposals_status_idx on public.feedback_proposals using btree (status) TABLESPACE pg_default;
+
+create trigger feedback_proposals_updated_at BEFORE
+update on feedback_proposals for EACH row
+execute FUNCTION update_updated_at_column ();
 
 -- ============================================================================
 -- 완료! 모든 테이블과 함수가 생성되었습니다.

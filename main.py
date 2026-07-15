@@ -18,6 +18,10 @@ sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 os.environ["PYTHONIOENCODING"] = "utf-8"
 load_dotenv(override=True)
 
+if os.getenv('ENV') == "local":
+    os.environ["LANGSMITH_TRACING"] = "true"
+    os.environ["LANGSMITH_ENDPOINT"] = "https://api.smith.langchain.com"
+
 _orig_print = builtins.print
 def print(*args, **kwargs):
     if 'flush' not in kwargs:
@@ -32,14 +36,10 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 # ============================================================================
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from core.polling_manager import start_feedback_polling, initialize_connections
+from core.polling_manager import initialize_connections
 from core.feedback_batch_manager import start_feedback_batch_collection, start_feedback_batch_trigger
 from core.feedback_proposal_routes import router as feedback_proposals_router
 from utils.logger import log
-
-# 배치 수집 → 제안 → 승인 플로우로 전환할지 여부. false면 기존처럼 즉시 처리한다.
-# 두 경로를 동시에 켜두면 같은 agent_feedback_task 큐를 경쟁적으로 소비하게 되므로 반드시 배타적으로 운영한다.
-USE_BATCHED_FEEDBACK = os.environ.get("USE_BATCHED_FEEDBACK", "").lower() in ("1", "true", "yes", "on")
 
 
 @asynccontextmanager
@@ -47,14 +47,11 @@ async def lifespan(app: FastAPI):
     """애플리케이션 생명주기 관리"""
     initialize_connections()
 
-    tasks = []
-    if USE_BATCHED_FEEDBACK:
-        log("서버 시작 - 연결 초기화, 피드백 배치 수집(7s) + 배치 트리거 확인(900s) 시작")
-        tasks.append(asyncio.create_task(start_feedback_batch_collection(interval=7)))
-        tasks.append(asyncio.create_task(start_feedback_batch_trigger(interval=900)))
-    else:
-        log("서버 시작 - 연결 초기화 및 피드백 폴링(즉시 처리) 시작")
-        tasks.append(asyncio.create_task(start_feedback_polling(interval=7)))
+    log("서버 시작 - 연결 초기화, 피드백 배치 수집(7s) + 배치 트리거 확인(900s) 시작")
+    tasks = [
+        asyncio.create_task(start_feedback_batch_collection(interval=7)),
+        asyncio.create_task(start_feedback_batch_trigger(interval=900)),
+    ]
 
     yield
 

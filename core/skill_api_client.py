@@ -1,6 +1,7 @@
 """
 스킬 HTTP API 클라이언트 모듈
-Claude Skills Backend의 HTTP API 엔드포인트를 호출하는 기능을 제공합니다.
+process-gpt-deepagents가 제공하는 스킬 API(core/api/skills_router.py)의
+HTTP 엔드포인트를 호출하는 기능을 제공합니다. 별도 claude-skills 서비스가 아닙니다.
 """
 
 import os
@@ -20,7 +21,7 @@ load_dotenv()
 # HTTP API 서버 설정
 # ============================================================================
 
-SKILL_API_BASE_URL = os.getenv("SKILL_API_BASE_URL", "http://localhost:8765")
+SKILL_API_BASE_URL = os.getenv("SKILL_API_BASE_URL", "http://localhost:8888")
 
 
 def _get_base_url() -> str:
@@ -130,23 +131,23 @@ def create_skill_zip(skill_name: str, skill_content: str, additional_files: Opti
 def upload_skill(
     skill_name: str,
     skill_content: str,
-    tenant_id: Optional[str] = None,
+    tenant_id: str,
     additional_files: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """
     스킬을 ZIP 파일로 업로드
-    
+
     Parameters
     ----------
     skill_name : str
         스킬 이름
     skill_content : str
         SKILL.md 파일 내용
-    tenant_id : str, optional
-        테넌트 ID (제공 시 scope="tenant"로 설정)
+    tenant_id : str
+        테넌트 ID (서버가 필수로 요구 — 없으면 400)
     additional_files : dict, optional
         추가 파일들 { "path": "content", ... }
-    
+
     Returns
     -------
     dict
@@ -158,95 +159,85 @@ def upload_skill(
             ...
         }
     """
+    if not tenant_id:
+        raise ValueError("tenant_id는 필수입니다")
+
     log(f"📦 스킬 ZIP 패키징: {skill_name}")
-    
+
     # ZIP 파일 생성
     zip_buffer = create_skill_zip(skill_name, skill_content, additional_files)
-    
+
     # multipart/form-data로 업로드
     files = {
         "file": (f"{skill_name}.zip", zip_buffer, "application/zip")
     }
-    
-    data = {}
-    if tenant_id:
-        data["tenant_id"] = tenant_id
-    
-    log(f"📤 스킬 업로드: {skill_name}, tenant_id={tenant_id or 'None (global)'}")
-    
+
+    data = {"tenant_id": tenant_id}
+
+    log(f"📤 스킬 업로드: {skill_name}, tenant_id={tenant_id}")
+
     return _make_request("POST", "/skills/upload", files=files, data=data)
 
 
 def update_skill_file(
     skill_name: str,
     file_path: str,
-    content: Optional[str] = None,
-    content_base64: Optional[str] = None,
+    content: str,
+    tenant_id: str,
 ) -> Dict[str, Any]:
     """
-    스킬 파일 업데이트 (또는 새 파일 추가)
-    
+    스킬 파일 업데이트 (git provider commit + PR 워크플로우 경유)
+
+    서버에 파일을 직접 덮어쓰는 PUT 라우트는 존재하지 않는다 — 실제로 존재하는
+    POST /skills/{name}/commit(commit_skill_file)을 사용한다. 이 라우트는 내부적으로
+    tenant_git_config에 연동된 git provider를 조회하므로, **git이 연동되지 않은
+    테넌트는 이 호출이 항상 400으로 실패한다** (process-gpt-deepagents
+    core/skills/git_providers/factory.py:get_provider). 로컬 전용 스킬을 덮어쓰는
+    서버 라우트는 현재 없다 — upload_skill(CREATE)은 이미 존재하면 409를 반환한다.
+
     Parameters
     ----------
     skill_name : str
         스킬 이름
     file_path : str
         파일 경로 (예: "scripts/example.py", "SKILL.md")
-    content : str, optional
+    content : str
         텍스트 파일 내용
-    content_base64 : str, optional
-        바이너리 파일 내용 (base64 인코딩)
-    
+    tenant_id : str
+        테넌트 ID (git provider 조회에 필수)
+
     Returns
     -------
     dict
-        API 응답
-        {
-            "skill_name": "...",
-            "file_path": "...",
-            "size": 1234,
-            "modified": 1704067600.0,
-            "message": "File updated successfully"
-        }
-    
-    Raises
-    ------
-    ValueError
-        content와 content_base64가 모두 없거나 둘 다 있는 경우
+        API 응답 {"committed": True, "branch": ..., "pr_created": ..., ...}
     """
-    if not content and not content_base64:
-        raise ValueError("content 또는 content_base64 중 하나는 필수입니다")
-    if content and content_base64:
-        raise ValueError("content와 content_base64는 동시에 사용할 수 없습니다")
-    
-    # URL 인코딩
     encoded_skill_name = quote(skill_name)
-    encoded_file_path = quote(file_path)
-    
-    endpoint = f"/skills/{encoded_skill_name}/files/{encoded_file_path}"
-    
-    json_data = {}
-    if content:
-        json_data["content"] = content
-    if content_base64:
-        json_data["content_base64"] = content_base64
-    
-    log(f"✏️ 스킬 파일 업데이트: {skill_name}/{file_path}")
-    
-    return _make_request("PUT", endpoint, json_data=json_data)
+    endpoint = f"/skills/{encoded_skill_name}/commit"
+
+    json_data = {
+        "tenant_id": tenant_id,
+        "file_path": file_path,
+        "content": content,
+    }
+
+    log(f"✏️ 스킬 파일 커밋: {skill_name}/{file_path}")
+
+    return _make_request("POST", endpoint, json_data=json_data)
 
 
-def delete_skill_file(skill_name: str, file_path: str) -> Dict[str, Any]:
+def delete_skill_file(skill_name: str, file_path: str, tenant_id: str) -> Dict[str, Any]:
     """
     스킬 파일 삭제
-    
+
     Parameters
     ----------
     skill_name : str
         스킬 이름
     file_path : str
         삭제할 파일 경로
-    
+    tenant_id : str
+        테넌트 ID (서버가 필수로 요구 — 없으면 400)
+
     Returns
     -------
     dict
@@ -257,25 +248,30 @@ def delete_skill_file(skill_name: str, file_path: str) -> Dict[str, Any]:
             "message": "File deleted successfully"
         }
     """
+    if not tenant_id:
+        raise ValueError("tenant_id는 필수입니다")
+
     encoded_skill_name = quote(skill_name)
     encoded_file_path = quote(file_path)
-    
+
     endpoint = f"/skills/{encoded_skill_name}/files/{encoded_file_path}"
-    
+
     log(f"🗑️ 스킬 파일 삭제: {skill_name}/{file_path}")
-    
-    return _make_request("DELETE", endpoint)
+
+    return _make_request("DELETE", endpoint, json_data={"tenant_id": tenant_id})
 
 
-def delete_skill(skill_name: str) -> Dict[str, Any]:
+def delete_skill(skill_name: str, tenant_id: str) -> Dict[str, Any]:
     """
     전체 스킬 삭제
-    
+
     Parameters
     ----------
     skill_name : str
         삭제할 스킬 이름
-    
+    tenant_id : str
+        테넌트 ID (서버가 필수로 요구 — 없으면 400)
+
     Returns
     -------
     dict
@@ -285,127 +281,106 @@ def delete_skill(skill_name: str) -> Dict[str, Any]:
             "message": "Skill deleted successfully"
         }
     """
+    if not tenant_id:
+        raise ValueError("tenant_id는 필수입니다")
+
     encoded_skill_name = quote(skill_name)
-    
+
     endpoint = f"/skills/{encoded_skill_name}"
-    
+
     log(f"🗑️ 스킬 삭제: {skill_name}")
-    
-    return _make_request("DELETE", endpoint)
+
+    return _make_request("DELETE", endpoint, json_data={"tenant_id": tenant_id})
 
 
-def check_skill_exists(skill_name: str) -> bool:
+def list_uploaded_skills(tenant_id: str = "") -> List[Dict[str, Any]]:
     """
-    스킬 존재 확인
-    
+    업로드된 스킬 목록 조회 (GET /skills — list_skills)
+
+    이전에는 존재하지 않는 GET /skills/list를 호출해 항상 빈 목록으로 실패했다.
+    실제 라우트는 GET /skills이며 tenant_id 쿼리 파라미터로 스코프를 지정한다.
+
     Parameters
     ----------
-    skill_name : str
-        확인할 스킬 이름
-    
-    Returns
-    -------
-    bool
-        스킬이 존재하면 True
-    """
-    try:
-        # URL 인코딩을 명시적으로 수행 (다른 함수들과 일관성 유지)
-        encoded_skill_name = quote(skill_name)
-        endpoint = f"/skills/check?name={encoded_skill_name}"
-        url = f"{_get_base_url()}{endpoint}"
-        
-        # 직접 요청하여 404를 정상 응답으로 처리
-        response = requests.get(url, timeout=30)
-        if response.status_code == 404:
-            # 404는 스킬이 존재하지 않음을 의미 (정상 응답)
-            return False
-        response.raise_for_status()
-        
-        # JSON 응답 파싱
-        if response.headers.get("content-type", "").startswith("application/json"):
-            data = response.json()
-            return data.get("exists", False)
-        return False
-    except requests.exceptions.HTTPError as e:
-        # 404가 아닌 다른 HTTP 에러인 경우만 로깅
-        if e.response.status_code != 404:
-            log(f"⚠️ 스킬 존재 확인 실패 (HTTP {e.response.status_code}): {skill_name}")
-        return False
-    except Exception as e:
-        log(f"⚠️ 스킬 존재 확인 실패: {str(e)[:200]}...")
-        return False
+    tenant_id : str, optional
+        테넌트 ID (없으면 전역/기본 스코프만 조회됨)
 
-
-def check_skill_exists_with_info(skill_name: str) -> Optional[Dict[str, Any]]:
-    """
-    스킬 존재 확인 및 상세 정보 조회
-    
-    Parameters
-    ----------
-    skill_name : str
-        확인할 스킬 이름
-    
-    Returns
-    -------
-    dict | None
-        스킬이 존재하면 상세 정보 딕셔너리 반환, 없으면 None
-        {
-            "name": "...",
-            "description": "...",
-            "source": "...",
-            "document_count": 4,
-            "exists": true
-        }
-    """
-    try:
-        # URL 인코딩을 명시적으로 수행 (다른 함수들과 일관성 유지)
-        encoded_skill_name = quote(skill_name)
-        endpoint = f"/skills/check?name={encoded_skill_name}"
-        response = _make_request("GET", endpoint)
-        if response.get("exists", False):
-            return response
-        return None
-    except Exception as e:
-        log(f"⚠️ 스킬 존재 확인 실패: {e}")
-        return None
-
-
-def list_uploaded_skills() -> List[Dict[str, Any]]:
-    """
-    업로드된 스킬 목록 조회
-    
     Returns
     -------
     list
-        업로드된 스킬 목록
-        [
-            {
-                "name": "My Custom Skill",
-                "description": "A custom skill for data analysis",
-                "directory": "my-custom-skill",
-                "file_count": 5,
-                "path": "/path/to/skills/my-custom-skill"
-            },
-            ...
-        ]
+        업로드된 스킬 목록 (각 항목에 최소 "name", "description" 포함)
     """
     try:
-        response = _make_request("GET", "/skills/list")
+        params = {"tenant_id": tenant_id} if tenant_id else None
+        response = _make_request("GET", "/skills", params=params)
         return response.get("skills", [])
     except Exception as e:
         log(f"⚠️ 스킬 목록 조회 실패: {e}")
         return []
 
 
-def get_skill_files(skill_name: str) -> List[Dict[str, Any]]:
+def check_skill_exists(skill_name: str, tenant_id: str = "") -> bool:
+    """
+    스킬 존재 확인
+
+    이전에는 존재하지 않는 GET /skills/check를 호출해 항상 404 → False로
+    잘못 판정했다. 실제로는 그런 단건 조회 라우트가 없어 목록에서 찾는다.
+
+    Parameters
+    ----------
+    skill_name : str
+        확인할 스킬 이름
+    tenant_id : str, optional
+        테넌트 ID
+
+    Returns
+    -------
+    bool
+        스킬이 존재하면 True
+    """
+    return check_skill_exists_with_info(skill_name, tenant_id) is not None
+
+
+def check_skill_exists_with_info(skill_name: str, tenant_id: str = "") -> Optional[Dict[str, Any]]:
+    """
+    스킬 존재 확인 및 상세 정보 조회 (list_uploaded_skills 결과에서 이름으로 검색)
+
+    Parameters
+    ----------
+    skill_name : str
+        확인할 스킬 이름
+    tenant_id : str, optional
+        테넌트 ID
+
+    Returns
+    -------
+    dict | None
+        스킬이 존재하면 목록 항목(dict, "exists": True 추가) 반환, 없으면 None
+    """
+    try:
+        for skill in list_uploaded_skills(tenant_id):
+            if skill.get("name") == skill_name:
+                return {**skill, "exists": True}
+        return None
+    except Exception as e:
+        log(f"⚠️ 스킬 존재 확인 실패: {e}")
+        return None
+
+
+def get_skill_files(skill_name: str, tenant_id: str) -> List[Dict[str, Any]]:
     """
     스킬 파일 목록 조회
-    
+
+    tenant_id를 전달하지 않으면 서버가 테넌트 전용 스킬 디렉토리(_find_tenant_skill_dir)를
+    탐색하지 않아 테넌트 스킬을 찾지 못한다.
+
     Parameters
     ----------
     skill_name : str
         스킬 이름
-    
+    tenant_id : str
+        테넌트 ID
+
     Returns
     -------
     list
@@ -420,24 +395,30 @@ def get_skill_files(skill_name: str) -> List[Dict[str, Any]]:
         ]
     """
     encoded_skill_name = quote(skill_name)
-    
+
     endpoint = f"/skills/{encoded_skill_name}/files"
-    
-    response = _make_request("GET", endpoint)
+
+    params = {"tenant_id": tenant_id} if tenant_id else None
+    response = _make_request("GET", endpoint, params=params)
     return response.get("files", [])
 
 
-def get_skill_file_content(skill_name: str, file_path: str) -> Dict[str, Any]:
+def get_skill_file_content(skill_name: str, file_path: str, tenant_id: str) -> Dict[str, Any]:
     """
     스킬 파일 내용 조회
-    
+
+    tenant_id를 전달하지 않으면 서버가 테넌트 전용 스킬 디렉토리(_find_tenant_skill_dir)를
+    탐색하지 않아 테넌트 스킬을 찾지 못한다.
+
     Parameters
     ----------
     skill_name : str
         스킬 이름
     file_path : str
         파일 경로
-    
+    tenant_id : str
+        테넌트 ID
+
     Returns
     -------
     dict
@@ -454,8 +435,9 @@ def get_skill_file_content(skill_name: str, file_path: str) -> Dict[str, Any]:
     """
     encoded_skill_name = quote(skill_name)
     encoded_file_path = quote(file_path)
-    
+
     endpoint = f"/skills/{encoded_skill_name}/files/{encoded_file_path}"
-    
-    return _make_request("GET", endpoint)
+
+    params = {"tenant_id": tenant_id} if tenant_id else None
+    return _make_request("GET", endpoint, params=params)
 

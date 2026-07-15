@@ -21,43 +21,52 @@
 - 모든 스킬 변경 이력 통합 관리 (`agent_knowledge_history` 테이블)
 - 변경 전후 상태 추적
 
-### 4. 피드백 배치 수집 및 승인 (`USE_BATCHED_FEEDBACK=true`)
+### 4. 피드백 배치 수집 → 분류 → 제안 승인
 - 피드백을 즉시 처리하지 않고 `(tenant_id, proc_def_id, activity_id)` 기준 배치로 수집
-- 5건 또는 3일 중 먼저 오는 조건으로 배치 트리거 → LLM이 공통 규칙만 추출(스킬은 아직 건드리지 않음)
-- 공통 규칙이 없으면 배치 폐기, 있으면 `PROPOSED` 제안 생성 — 사용자가 승인해야만 실제 스킬 개선 실행
-- `GET /feedback-proposals`, `POST /feedback-proposals/{id}/approve`, `POST /feedback-proposals/{id}/reject`
-- 자세한 내용은 `openspec/changes/add-feedback-batching/`(설계·스펙) 참고
+- 5건 또는 3일 중 먼저 오는 조건으로 배치 트리거
+- 트리거된 배치는 먼저 **무엇을 개선할 수 있는지 분류**된다 (LLM 한 콜, 한 배치가 여러 target에 동시에 해당할 수 있음):
+  - **SKILL** — 절차/실행 규칙 → 일반화된 규칙 텍스트 (기존과 동일한 산출물)
+  - **DMN_RULE** — 조건-결과 비즈니스 규칙 → `proc_def.definition`과 같은 형태의 decision/rules 패치
+  - **PROCESS_DEFINITION** — 업무 흐름/구조 변경 → activities/sequences/gateways 패치
+- 공통 관심사가 전혀 없으면 배치 폐기, 있으면 target별 아티팩트를 담은 `PROPOSED` 제안 생성
+- 각 target은 **독립적으로 승인/거절**된다.
+  - `SKILL` target 승인 → 피드백 매칭(LLM) → Deep Agent 분석 → 스킬 CRUD(HTTP API). 담당 에이전트가 없는 배치도 지원한다 — 이 경우 스킬은 사용자가 아니라 활동(`proc_def.definition.activities[].skills`)에 귀속된다.
+  - `DMN_RULE` target 승인 → 라이브 `proc_def.definition`은 건드리지 않고, draft `proc_def_version` 행(JSON + DMN 1.3 XML)과 `resource_pull_requests` 병합 요청을 생성한다. 실제 라이브 반영(머지)은 별도 단계로 스코프 밖.
+  - `PROCESS_DEFINITION` target 승인 → `DMN_RULE`과 동일한 패턴 — 라이브 `proc_def.definition`은 건드리지 않고, artifact의 activities/sequences/gateways를 라이브 정의 사본에 기계적으로 병합한 draft `proc_def_version` 행과 `resource_pull_requests` 병합 요청을 생성한다. LLM/스킬 호출 없이 승인 요청 안에서 동기적으로 처리되며, id가 매칭되지 않는 `MODIFY` 항목은 새 요소(`ADD`)로 강등된다.
+- `GET /feedback-proposals`
+- `POST /feedback-proposals/{id}/targets/{type}/approve` (`type`: `SKILL` | `DMN_RULE` | `PROCESS_DEFINITION`)
+- `POST /feedback-proposals/{id}/targets/{type}/reject`
+- 자세한 내용은 `openspec/changes/add-feedback-batching/`(배치 수집·분류·제안 생성), `openspec/changes/add-feedback-proposal-apply/`(무에이전트 SKILL 적용, DMN_RULE draft+PR), `openspec/changes/add-process-definition-apply/`(PROCESS_DEFINITION draft+PR) 참고
 
 ## 아키텍처
 
 ### 처리 워크플로우
 
-`USE_BATCHED_FEEDBACK` 플래그로 두 방식 중 하나만 동작한다(둘을 동시에 켜면 같은 큐를 경쟁적으로 소비하게 되므로 배타적으로 운영):
+```
+배치 수집(7초) → 배치 트리거 확인(900초, 5건/3일) → 분류+제안 생성(LLM, target별 아티팩트)
+  → 제안(PROPOSED, target 1개 이상) → 사용자가 target별로 승인/반려
+  → (SKILL 승인 시) 피드백 매칭(LLM) → Deep Agent 분석 → 스킬 CRUD(HTTP API) — 담당 에이전트 없으면 활동 귀속
+  → (DMN_RULE 승인 시) draft proc_def_version(JSON+XML) + resource_pull_requests 병합 요청 생성 (라이브 proc_def는 그대로)
+  → (PROCESS_DEFINITION 승인 시) draft proc_def_version(activities/sequences/gateways 병합) + resource_pull_requests 병합 요청 생성 (라이브 proc_def는 그대로)
+```
+1. **배치 수집**: Supabase `agent_feedback_task` 테이블에서 피드백 작업을 조회해 `(tenant_id, proc_def_id, activity_id)` 기준 배치에 적재 (7초 간격) — 즉시 처리하지 않음
+2. **배치 트리거**: 5건 또는 3일 중 먼저 오는 조건으로 배치를 트리거 대상으로 확인 (900초 간격)
+3. **분류+제안 생성**: 트리거된 배치가 무엇을 개선할 수 있는지 LLM이 분류하고(`SKILL`/`DMN_RULE`/`PROCESS_DEFINITION`, 여러 개 동시 가능) target별 아티팩트를 생성 — 공통 관심사가 없으면 배치 폐기
+4. **승인/반려**: 각 target을 사용자가 개별적으로 승인/거절 (`POST /feedback-proposals/{id}/targets/{type}/approve|reject`)
+5. **`SKILL` target 승인 시** 피드백 매칭(LLM) → Deep Agent 분석 → 스킬 CRUD(HTTP API) 실행. 담당 에이전트가 없으면 활동 전용 경로로 실행되며, 스킬은 `proc_def.definition.activities[].skills`에 귀속된다.
+6. **`DMN_RULE` target 승인 시** 라이브 `proc_def.definition`을 조회해 artifact를 병합한 draft `proc_def_version` 행(JSON + DMN 1.3 XML `snapshot`)을 만들고, `resource_pull_requests`에 병합 요청(`resource_type='dmn'`, `status='OPEN'`)을 연다 — git 저장소는 없고 이 테이블 안에서만 리뷰/이력이 관리된다. 이 draft를 라이브 `proc_def`에 실제로 반영(머지)하는 단계는 아직 없다.
+7. **`PROCESS_DEFINITION` target 승인 시** 라이브 `proc_def.definition`을 조회해 artifact의 activities/sequences/gateways(`ADD`/`MODIFY`)를 사본에 병합한 draft `proc_def_version` 행(`version_tag='major'`)을 만들고, `resource_pull_requests`에 병합 요청(`resource_type='bpmn'`, `status='OPEN'`)을 연다. `DMN_RULE`과 마찬가지로 LLM 호출이나 검증기 없이 id 매칭만으로 병합하며, id가 매칭되지 않는 `MODIFY`는 새 요소로 강등된다(지어낸 id는 재사용하지 않음). 이 draft를 라이브 `proc_def`에 실제로 반영(머지)하는 단계도 아직 없다.
 
-**기본값 (`USE_BATCHED_FEEDBACK` 미설정/false) — 즉시 처리:**
-```
-Supabase 폴링(7초) → 피드백 매칭(LLM) → Deep Agent 분석 → 스킬 CRUD(HTTP API)
-```
-1. **피드백 폴링**: Supabase `agent_feedback_task` 테이블에서 피드백 작업 조회 (7초 간격)
-2. **피드백 매칭**: LLM이 피드백을 에이전트별로 분류하고 학습 후보 생성
-3. **Deep Agent 처리**: `create_deep_agent`로 에이전트를 생성하여 스킬 개선 수행
-4. **스킬 저장**: HTTP API를 통해 스킬 파일 업로드/수정/삭제
-
-**`USE_BATCHED_FEEDBACK=true` — 배치 수집 + 승인:**
-```
-배치 수집(7초) → 배치 트리거 확인(900초, 5건/3일) → 규칙 추출(LLM) → 제안(PROPOSED)
-  → 사용자 승인/반려 → (승인 시) 피드백 매칭(LLM) → Deep Agent 분석 → 스킬 CRUD(HTTP API)
-```
-- 승인 전까지는 어떤 스킬도 생성/수정/삭제되지 않는다.
-- 담당 에이전트가 없는 배치(활동 전용 스킬)는 현재 미지원 — 승인 시 `FAILED`로 처리됨(알려진 제약, `openspec/changes/add-feedback-batching/design.md` 참고).
+- 승인 전까지는 어떤 스킬도, 어떤 `proc_def`도 생성/수정/삭제되지 않는다.
+- `DMN_RULE`/`PROCESS_DEFINITION` draft를 라이브 `proc_def`에 반영(머지)하는 것과, `resource_pull_requests`/`proc_def_version` draft를 실제로 소비하는 리뷰 화면이 있는지는 이 서비스 스코프 밖 — `openspec/changes/add-feedback-proposal-apply/design.md`, `openspec/changes/add-process-definition-apply/design.md`의 Open Questions 참고.
 
 ### Deep Agent 구성
 
 | 구성 요소 | 설명 |
 |-----------|------|
 | **model** | LiteLLM Proxy 또는 OpenAI API를 통한 LLM |
-| **tools** | `search_similar_skills`, `get_skill_detail`, `commit_to_skill`, `attach_skills_to_agent` |
-| **skills** | `./skills/` 디렉토리 (skill-creator 스킬 참조) |
+| **tools** | `search_similar_skills`, `get_skill_detail`, `commit_to_skill`, `attach_skills_to_agent` (모두 HTTP API 전용, `SKILL_API_BASE_URL`) |
+| **skills** | `SKILLS_DIR/anthropics-skills` 디렉토리 (skill-creator 등 전역 내장 스킬 참조, deepagents progressive disclosure 용도). `SKILLS_DIR`는 환경변수로 오버라이드 가능(기본값: 레포 안 `./skills/`) |
 | **system_prompt** | 피드백 분석 및 스킬 개선 전문가 프롬프트 |
 
 ## 시작하기
@@ -67,7 +76,7 @@ Supabase 폴링(7초) → 피드백 매칭(LLM) → Deep Agent 분석 → 스킬
 - Python 3.12 이상
 - [uv](https://github.com/astral-sh/uv) 패키지 관리자
 - Supabase 계정 및 데이터베이스
-- 스킬 HTTP API 서버 (claude-skills backend)
+- 스킬 HTTP API 서버 (process-gpt-deepagents가 제공, `core/api/skills_router.py` — 별도 claude-skills 서비스 아님)
 - OpenAI API 키 또는 LiteLLM Proxy
 
 ### 설치
@@ -83,12 +92,13 @@ uv pip install -r requirements.txt
 
 ### 데이터베이스 마이그레이션
 
-Supabase SQL Editor에서 `function.sql` 실행:
-- `agent_feedback_task` 함수
-- `agent_knowledge_history`, `agent_knowledge_registry` 테이블
+이 리포는 마이그레이션 툴을 소유하지 않으므로, Supabase SQL Editor에서 아래 SQL을 순서대로 직접 실행하세요:
 
-배치 수집/제안 기능(`USE_BATCHED_FEEDBACK=true`)을 쓰려면 `skill_feedback_proposals.sql`도 함께 실행하세요:
-- `skill_feedback_proposals` 테이블, `append_feedback_to_batch` 함수
+1. `function.sql` — `agent_feedback_task` 함수, `agent_knowledge_history`/`agent_knowledge_registry` 테이블
+2. `skill_feedback_proposals.sql` — 배치 수집/제안 기능에 필요: `feedback_proposals` 테이블, `append_feedback_to_batch` 함수
+3. `feedback_collected_count.sql` — 같은 워크아이템에 피드백이 여러 번 추가되는 경우를 놓치지 않기 위한 `todolist.feedback_collected_count` 컬럼 + `agent_feedback_task` 갱신
+4. `feedback_proposal_targets.sql` — 제안의 target별 분류/독립 승인(`SKILL`/`DMN_RULE`/`PROCESS_DEFINITION`)에 필요: `feedback_proposals.targets` 컬럼, `decide_feedback_proposal_target` 함수
+5. (기존에 위 파일들을 `skill_feedback_proposals`라는 옛 이름으로 이미 실행해둔 인스턴스만) `rename_feedback_proposals_table.sql` — 테이블을 `feedback_proposals`로 이름 변경(SKILL 전용이 아니게 된 지 오래라 이름을 실제 역할에 맞춤) + `append_feedback_to_batch`/`decide_feedback_proposal_target` 함수를 새 이름으로 재생성. 새로 셋업하는 경우 2/4번 파일이 이미 새 이름으로 만들므로 이 파일은 필요 없다.
 
 ### 환경 설정
 
@@ -108,12 +118,8 @@ LLM_PROXY_API_KEY=sk-...
 # OpenAI API Key (선택, 프록시 없을 때 폴백)
 OPENAI_API_KEY=your_openai_api_key
 
-# 스킬 HTTP API 서버 (필수)
-SKILL_API_BASE_URL=http://localhost:8765
-
-# 피드백 배치 수집+승인 플로우 사용 여부 (선택, 기본값: false → 기존 즉시 처리)
-# true로 켜기 전 skill_feedback_proposals.sql 적용 필요. 레거시 즉시 처리 루프와 동시에 켜지 말 것.
-USE_BATCHED_FEEDBACK=false
+# 스킬 HTTP API 서버 (필수) — process-gpt-deepagents server.py 기본 포트
+SKILL_API_BASE_URL=http://localhost:8888
 
 # 서버 포트 (선택, 기본값: 6789)
 PORT=6789
@@ -139,8 +145,10 @@ process-gpt-agent-feedback/
 ├── core/                              # 핵심 로직
 │   ├── deep_agent.py                  # Deep Agent 생성 및 피드백 처리
 │   ├── skill_tools.py                 # Deep Agent용 스킬 도구 (search, detail, commit, attach)
-│   ├── feedback_processor.py          # 피드백 → 에이전트 매칭 (LLM)
-│   ├── polling_manager.py             # Supabase 피드백 폴링 및 처리
+│   ├── feedback_processor.py          # 피드백 → 에이전트 매칭 (LLM) + 배치 분류/target별 제안 생성 (LLM)
+│   ├── feedback_batch_manager.py      # 배치 수집/트리거 루프, 승인된 SKILL target 실행(apply_approved_proposal)
+│   ├── feedback_proposal_routes.py    # 제안 목록/target별 승인·거절 API (FastAPI)
+│   ├── polling_manager.py             # 에이전트 조회(get_agents_info) 및 스킬 개선 실행(process_feedback_task) — feedback_batch_manager와 수동 테스트 스크립트가 사용
 │   ├── skill_api_client.py            # 스킬 HTTP API 클라이언트
 │   ├── database.py                    # Supabase 데이터베이스 연결
 │   ├── llm.py                         # LLM 생성 유틸리티

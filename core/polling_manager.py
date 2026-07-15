@@ -1,10 +1,10 @@
-import asyncio
 import json
 from typing import Dict, List, Any, Optional
 from utils.logger import log, handle_error
 from core.database import (
     initialize_db,
-    fetch_feedback_task,
+    extract_new_feedback_items,
+    mark_feedback_collected_count,
     _get_agent_by_id,
     update_feedback_status,
     fetch_events_by_todo_id,
@@ -75,29 +75,19 @@ async def process_feedback_task(row: Dict):
     feedback_raw = row.get('feedback', '')
     description = row.get('description', '')
 
-    feedback = ''
-    if isinstance(feedback_raw, list):
-        try:
-            if len(feedback_raw) > 0:
-                sorted_feedback = sorted(
-                    feedback_raw,
-                    key=lambda x: x.get('time', ''),
-                    reverse=True
-                )
-                latest_feedback = sorted_feedback[0]
-                if isinstance(latest_feedback, dict):
-                    feedback = latest_feedback.get('content', '')
-                else:
-                    feedback = str(latest_feedback)
-        except Exception as e:
-            log(f"⚠️ 피드백 배열 처리 에러: {str(e)[:200]}...")
-            feedback = ''
-    elif isinstance(feedback_raw, str):
-        feedback = feedback_raw
-    elif feedback_raw:
-        feedback = str(feedback_raw)
+    # 같은 워크아이템에 피드백이 여러 번 추가될 수 있으므로, 이전에 처리한 뒤 새로
+    # 추가된 항목만 가져와 하나로 합친다 (최신 1건만 보고 나머지를 놓치지 않도록).
+    collected_count = row.get('feedback_collected_count') or 0
+    new_items = extract_new_feedback_items(feedback_raw, collected_count)
+    feedback = '\n\n'.join(content for content, _uid, _time in new_items if content)
+
+    if not feedback:
+        log(f"⚠️ 새로 수집할 피드백 없음, 건너뜀: todo_id={todo_id}")
+        await update_feedback_status(todo_id, 'FAILED')
+        return
 
     try:
+        await mark_feedback_collected_count(todo_id, collected_count + len(new_items))
         await update_feedback_status(todo_id, 'PROCESSING')
         log(f"피드백 작업 처리 시작: id={todo_id}")
 
@@ -179,41 +169,3 @@ async def process_feedback_task(row: Dict):
         except Exception:
             pass
 
-# ============================================================================
-# 폴링 실행
-# ============================================================================
-
-async def start_feedback_polling(interval: int = 7):
-    """피드백 작업 폴링 시작"""
-    log("피드백 작업 폴링 시작")
-
-    while True:
-        try:
-            row = await fetch_feedback_task()
-            if row:
-                await process_feedback_task(row)
-            else:
-                log("처리할 피드백 작업이 없음 (대기 중...)")
-
-        except KeyboardInterrupt:
-            log("피드백 폴링이 중단되었습니다.")
-            break
-        except BaseExceptionGroup as eg:
-            log(f"⚠️ 폴링 중 ExceptionGroup 발생 (계속 진행): {len(eg.exceptions)}개 예외")
-            for exc in eg.exceptions:
-                log(f"   - {type(exc).__name__}: {str(exc)[:200]}...")
-                try:
-                    handle_error("폴링실행_ExceptionGroup", exc)
-                except Exception:
-                    pass
-        except Exception as e:
-            log(f"⚠️ 폴링 중 에러 발생 (계속 진행): {str(e)[:200]}...")
-            try:
-                handle_error("폴링실행", e)
-            except Exception:
-                pass
-
-        try:
-            await asyncio.sleep(interval)
-        except Exception:
-            await asyncio.sleep(interval)

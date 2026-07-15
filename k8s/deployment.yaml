@@ -61,8 +61,6 @@ spec:
               name: my-secrets
         - name: LLM_MODEL
           value: "gpt-4o"
-        - name: LLM_TRANSLATOR_MODEL
-          value: "gpt-4o-mini"
         - name: LLM_PROXY_URL
           value: "http://litellm-proxy:4000"
         - name: LLM_PROXY_API_KEY
@@ -76,16 +74,8 @@ spec:
             secretKeyRef:
               key: OPENAI_API_KEY
               name: openai-secret
-        - name: MCP_SERVER_URL
-          value: "http://claude-skills:8765/mcp"
-        - name: MCP_SERVER_NAME
-          value: "claude-skills"
-        - name: USE_SKILL_CREATOR_WORKFLOW
-          value: "true"
-        - name: USE_SKILL_CREATOR_FALLBACK_TO_HTTP
-          value: "true"
-        - name: COMPUTER_USE_MCP_URL
-          value: "http://computer-use:8000/mcp"
+        - name: SKILL_API_BASE_URL
+          value: "http://process-gpt-deepagents:8888"
         - name: PORT
           value: "6789"
         resources:

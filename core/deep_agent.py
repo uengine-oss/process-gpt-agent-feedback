@@ -12,7 +12,15 @@ from core.skill_tools import create_skill_tools
 from utils.logger import log, handle_error
 
 
-SKILLS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "skills")
+# 스킬 루트: 실제 참조하는 건 <SKILLS_DIR>/anthropics-skills뿐 (skill-creator 등 전역 내장
+# 스킬, 항상 읽기 전용). 테넌트 등록 스킬 자체는 이 경로로 참조하지 않는다 — Deep Agent는
+# search_similar_skills/get_skill_detail/commit_to_skill(core/skill_tools.py, HTTP API 전용)로
+# 실제 스킬을 검색/조회/수정하며, 이 skills= 참조 디렉토리는 deepagents의 progressive
+# disclosure(스킬 작성법 등 메타 문서 노출)에만 쓰인다.
+SKILLS_DIR = os.getenv(
+    "SKILLS_DIR",
+    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "skills"),
+)
 
 
 SYSTEM_PROMPT = """당신은 에이전트 피드백을 분석하여 스킬(SKILL)을 개선하는 전문가입니다.
@@ -29,12 +37,13 @@ SYSTEM_PROMPT = """당신은 에이전트 피드백을 분석하여 스킬(SKILL
 **스킬 저장소:**
 - SKILL: 단계별 절차, 작업 순서 (예: "먼저 X를 하고, 그 다음 Y를 한다")
 - 스킬은 SKILL.md 파일과 부가 파일들로 구성됩니다.
-- 스킬 내용(SKILL.md, steps, additional_files)은 skill-creator가 생성합니다.
+- 스킬 내용(SKILL.md, additional_files)은 skill-creator의 작성 가이드(frontmatter + 섹션 구성)를
+  참고하여 당신이 직접 작성하고, commit_to_skill 호출 시 인자로 전달합니다.
 
 **사용 가능한 도구:**
 1. `search_similar_skills` - 피드백과 유사한 기존 스킬 검색
 2. `get_skill_detail` - 기존 스킬의 상세 내용 조회
-3. `commit_to_skill` - 스킬 생성/수정/삭제 (skill-creator가 내용 생성)
+3. `commit_to_skill` - 스킬 생성/수정/삭제 (skill_name/description/body_markdown 인자로 SKILL.md 내용을 직접 전달)
 4. `attach_skills_to_agent` - 기존 스킬을 에이전트에 적재
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -79,8 +88,8 @@ SYSTEM_PROMPT = """당신은 에이전트 피드백을 분석하여 스킬(SKILL
 
 ### [STEP 5] 작업 실행
 - **attach**: 기존 스킬로 충분할 때 → `attach_skills_to_agent`
-- **CREATE**: 새 절차 필요 → `commit_to_skill(operation="CREATE")`
-- **UPDATE**: 기존 수정 → `commit_to_skill(operation="UPDATE", skill_id="...")`
+- **CREATE**: 새 절차 필요 → `commit_to_skill(operation="CREATE", skill_name="...", description="...", body_markdown="...")`
+- **UPDATE**: 기존 수정 → `commit_to_skill(operation="UPDATE", skill_id="...", body_markdown="...")`
 - **DELETE**: 삭제 → `commit_to_skill(operation="DELETE", skill_id="...")`
 - **IGNORE**: 변경 불필요 시 아무 도구도 호출하지 않음
 
@@ -88,25 +97,50 @@ SYSTEM_PROMPT = """당신은 에이전트 피드백을 분석하여 스킬(SKILL
 ## ⚠️ 주의사항
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-- 스킬 내용(SKILL.md)은 직접 작성하지 마세요. skill-creator가 생성합니다.
+- CREATE/UPDATE 시 body_markdown(SKILL.md 본문)과, CREATE는 skill_name도 반드시 채워서
+  commit_to_skill에 전달하세요 — 비워두면 저장이 거부됩니다. skill-creator의 작성 가이드를
+  참고해 개요/단계별 절차 등을 포함한 완성된 본문을 직접 작성하세요.
 - commit_to_skill 호출 시 피드백 내용이 자동으로 전달됩니다.
 - UPDATE 시 skill_id는 반드시 기존 스킬 이름을 사용하세요.
 - 스킬 변경이 필요하면 반드시 도구를 호출하세요. 말로만 결론을 내면 안 됩니다.
 """
 
 
+# 담당 에이전트가 없는 배치용 시스템 프롬프트. SYSTEM_PROMPT에서 기계적으로 파생시켜
+# ("에이전트에 적재" → "활동에 적재") 두 프롬프트가 따로 놀지 않게 한다.
+NO_AGENT_SYSTEM_PROMPT = SYSTEM_PROMPT.replace(
+    "4. `attach_skills_to_agent` - 기존 스킬을 에이전트에 적재",
+    "4. `attach_skill_to_activity` - 기존 스킬을 프로세스 활동에 적재",
+).replace(
+    "- **attach**: 기존 스킬로 충분할 때 → `attach_skills_to_agent`",
+    "- **attach**: 기존 스킬로 충분할 때 → `attach_skill_to_activity`",
+)
+
+
 def _format_feedback_input(
-    agent_info: Dict,
     feedback_content: str,
     task_description: str = "",
     events: Optional[List[Dict[str, Any]]] = None,
+    agent_info: Optional[Dict] = None,
+    activity_ref: Optional[Dict[str, str]] = None,
+    bound_skill_name: Optional[str] = None,
 ) -> str:
-    agent_info_text = (
-        f"ID: {agent_info.get('id', '')}, "
-        f"이름: {agent_info.get('name', '')}, "
-        f"역할: {agent_info.get('role', '')}, "
-        f"목표: {agent_info.get('goal', '')}"
-    )
+    if agent_info:
+        owner_label = "에이전트 정보"
+        owner_text = (
+            f"ID: {agent_info.get('id', '')}, "
+            f"이름: {agent_info.get('name', '')}, "
+            f"역할: {agent_info.get('role', '')}, "
+            f"목표: {agent_info.get('goal', '')}"
+        )
+    else:
+        ref = activity_ref or {}
+        owner_label = "대상 활동 정보 (담당 에이전트 없음 — 활동 단위로 스킬을 적재/개선)"
+        owner_text = (
+            f"tenant_id: {ref.get('tenant_id', '')}, "
+            f"proc_def_id: {ref.get('proc_def_id', '')}, "
+            f"activity_id: {ref.get('activity_id', '')}"
+        )
 
     events_summary = "없음"
     if events:
@@ -128,14 +162,24 @@ def _format_feedback_input(
             lines.append(f"- time={ts}, type={ev_type}, status={status}, crew_type={crew_type}, data={data_str}")
         events_summary = "\n".join(lines)
 
-    return f"""다음 피드백을 분석하여 에이전트의 스킬을 개선해주세요:
+    bound_skill_section = ""
+    if bound_skill_name:
+        bound_skill_section = f"""
+**확정된 스킬 이름 (제안 승인 시점에 이미 결정됨):**
+{bound_skill_name}
+스킬을 생성/수정해야 한다면 반드시 이 이름을 그대로 사용하세요(다른 이름을 새로 짓지 마세요).
+`get_skill_detail("{bound_skill_name}")`로 이미 존재하는지 확인해 있으면 UPDATE, 없으면 CREATE로
+이 이름을 그대로 commit_to_skill의 skill_name/skill_id에 사용하세요.
+"""
+
+    return f"""다음 피드백을 분석하여 스킬을 개선해주세요:
 
 **피드백 내용:**
 {feedback_content}
 
-**에이전트 정보:**
-{agent_info_text}
-
+**{owner_label}:**
+{owner_text}
+{bound_skill_section}
 **작업 지시사항:**
 {task_description}
 
@@ -146,57 +190,71 @@ def _format_feedback_input(
 
 
 async def process_feedback_with_deep_agent(
-    agent_id: str,
-    agent_info: Dict,
     feedback_content: str,
+    agent_id: Optional[str] = None,
+    agent_info: Optional[Dict] = None,
     task_description: str = "",
     events: Optional[List[Dict[str, Any]]] = None,
+    activity_ref: Optional[Dict[str, str]] = None,
+    bound_skill_name: Optional[str] = None,
 ) -> Dict:
     """
     Deep Agent를 사용하여 피드백을 처리하고 스킬을 개선합니다.
 
+    agent_id가 없으면(담당 에이전트가 없는 배치) activity_ref로 지정된 프로세스 활동에
+    스킬을 귀속시키는 활동 전용 도구/프롬프트로 동작한다.
+
     Args:
-        agent_id: 에이전트 ID
-        agent_info: 에이전트 정보
         feedback_content: 피드백 내용
+        agent_id: 에이전트 ID (없으면 activity_ref 필요)
+        agent_info: 에이전트 정보
         task_description: 작업 지시사항
         events: 이벤트 로그
+        activity_ref: agent_id가 없을 때 스킬을 귀속시킬 활동 {"tenant_id", "proc_def_id", "activity_id"}
+        bound_skill_name: 제안 승인 시점에 이미 확정된 스킬 이름 — 주어지면 Deep Agent는
+            새 이름을 짓지 않고 이 이름 그대로 CREATE/UPDATE 여부만 판단한다.
 
     Returns:
         처리 결과 dict
     """
     try:
-        log(f"🤖 Deep Agent 기반 피드백 처리 시작: agent_id={agent_id}")
+        owner_desc = f"agent_id={agent_id}" if agent_id else f"activity_ref={activity_ref}"
+        log(f"🤖 Deep Agent 기반 피드백 처리 시작: {owner_desc}")
 
-        # 커스텀 스킬 도구 생성 (agent_id, feedback_content 바인딩)
-        skill_tools = create_skill_tools(agent_id, feedback_content=feedback_content)
+        # 커스텀 스킬 도구 생성 (agent_id 또는 activity_ref, feedback_content 바인딩)
+        skill_tools = create_skill_tools(agent_id=agent_id, feedback_content=feedback_content, activity_ref=activity_ref)
 
         # LLM 생성
         llm = create_llm(streaming=False, temperature=0)
 
-        # skills 디렉토리 설정
+        # skills 디렉토리 설정: 전역 내장 스킬(anthropics-skills)만 읽기 전용으로 참조한다.
+        # 실제 대상 스킬 검색/조회/수정은 core/skill_tools.py의 HTTP API 도구가 담당한다.
         skills_paths = []
-        if os.path.isdir(SKILLS_DIR):
-            skills_paths.append(SKILLS_DIR)
-            log(f"   📁 스킬 디렉토리 로드: {SKILLS_DIR}")
+
+        anthropics_dir = os.path.join(SKILLS_DIR, "anthropics-skills")
+        if os.path.isdir(anthropics_dir):
+            skills_paths.append(anthropics_dir)
+            log(f"   📁 기본 내장 스킬 로드: {anthropics_dir}")
         else:
-            log(f"   ⚠️ 스킬 디렉토리 없음: {SKILLS_DIR} (skills 파라미터 미사용)")
+            log(f"   ⚠️ 기본 내장 스킬 디렉토리 없음: {anthropics_dir} (skills 파라미터 미사용)")
 
         # Deep Agent 생성
         agent = create_deep_agent(
             model=llm,
             tools=skill_tools,
-            system_prompt=SYSTEM_PROMPT,
+            system_prompt=SYSTEM_PROMPT if agent_id else NO_AGENT_SYSTEM_PROMPT,
             skills=skills_paths if skills_paths else None,
             debug=os.environ.get("DEBUG", "").lower() in ("1", "true", "yes", "on"),
         )
 
         # 입력 텍스트 생성
         input_text = _format_feedback_input(
-            agent_info=agent_info,
             feedback_content=feedback_content,
             task_description=task_description,
             events=events,
+            agent_info=agent_info,
+            activity_ref=activity_ref,
+            bound_skill_name=bound_skill_name,
         )
 
         log(f"🔄 Deep Agent 실행 시작...")
