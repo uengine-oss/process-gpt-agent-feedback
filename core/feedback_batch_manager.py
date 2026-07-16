@@ -237,6 +237,19 @@ def _representative_feedback_author(collected_items: List[Dict[str, Any]]) -> Op
     return None
 
 
+def _feedback_author_ids(collected_items: List[Dict[str, Any]]) -> List[str]:
+    """피드백을 남긴 모든 user_id를 최초 기여 시각 순으로, 중복 없이 반환한다.
+    resource_pull_requests.requester_id(uuid[])에 그대로 들어간다 — 이 배치의
+    개선을 촉발한 사람들이 requester다(승인자는 reviewer_id로 별도 기록)."""
+    items_sorted = sorted(collected_items, key=lambda x: x.get("time", ""))
+    seen: Dict[str, None] = {}
+    for item in items_sorted:
+        uid = str(item.get("user_id") or "").strip()
+        if uid and uid not in seen:
+            seen[uid] = None
+    return list(seen.keys())
+
+
 async def _fill_target_identity(batch: Dict[str, Any], target: Dict[str, Any]) -> None:
     """target(SKILL/DMN_RULE/PROCESS_DEFINITION)에 실제 리소스를 가리키는 id/name을 채운다.
 
@@ -349,7 +362,10 @@ def _representative_description(rows: List[Dict[str, Any]]) -> str:
 
 
 async def apply_approved_proposal(
-    batch: Dict[str, Any], extracted_rule: str, bound_skill_name: Optional[str] = None
+    batch: Dict[str, Any],
+    extracted_rule: str,
+    bound_skill_name: Optional[str] = None,
+    approver_id: Optional[str] = None,
 ) -> None:
     """승인된 SKILL target을 기존 피드백→스킬 개선 파이프라인(process_feedback_with_deep_agent)에 태운다.
 
@@ -357,7 +373,9 @@ async def apply_approved_proposal(
     target 승인은 결정 기록만 하고 여기로 오지 않는다(core.feedback_proposal_routes 참고).
     extracted_rule은 그 SKILL target의 artifact(자연어 일반 규칙 텍스트)다. bound_skill_name은
     제안 생성 시점에 이미 확정된 스킬 이름(target.name)으로, 매칭된 모든 에이전트가 새 이름을
-    짓지 않고 이 이름을 그대로 쓰도록 강제한다.
+    짓지 않고 이 이름을 그대로 쓰도록 강제한다. approver_id는 이 target을 승인한 사람으로,
+    스킬 병합 요청의 reviewer가 된다 — requester는 batch의 피드백 작성자들이다
+    (fix-merge-request-requester).
 
     이 함수는 실행 결과를 배치 내 각 todo_id의 feedback_status에만 반영한다.
 
@@ -367,6 +385,7 @@ async def apply_approved_proposal(
     batch_id = batch["id"]
     items = batch.get("collected_items") or []
     todo_ids = [item.get("todo_id") for item in items if item.get("todo_id")]
+    requester_ids = _feedback_author_ids(items)
 
     if not extracted_rule:
         log(f"⚠️ 승인된 SKILL target에 artifact가 없음: batch_id={batch_id}")
@@ -417,6 +436,8 @@ async def apply_approved_proposal(
                     task_description=description,
                     events=events,
                     bound_skill_name=bound_skill_name,
+                    requester_ids=requester_ids,
+                    reviewer_id=approver_id,
                 )
                 if result.get("error"):
                     had_error = True
@@ -441,6 +462,8 @@ async def apply_approved_proposal(
                 events=events,
                 activity_ref=activity_ref,
                 bound_skill_name=bound_skill_name,
+                requester_ids=requester_ids,
+                reviewer_id=approver_id,
             )
             if result.get("error"):
                 had_error = True
@@ -477,7 +500,6 @@ async def apply_approved_dmn_target(
     batch: Dict[str, Any],
     artifact: Dict[str, Any],
     approver_id: Optional[str] = None,
-    approver_name: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """승인된 DMN_RULE target을 실제 DMN 리소스(들)에 반영한다.
 
@@ -487,11 +509,17 @@ async def apply_approved_dmn_target(
     최근 피드백 작성자로 지정한다. 라이브 proc_def는 쓰지 않는다: draft 생성과 PR
     오픈까지가 이 함수의 책임이다(add-feedback-proposal-apply design.md Non-Goals).
     여러 에이전트에 걸치면 여러 draft/PR이 만들어질 수 있어 결과를 리스트로 반환한다.
+
+    병합 요청의 requester는 배치의 피드백 작성자들(collected_items의 user_id,
+    중복 제거), reviewer는 approver_id다 — 여러 draft/PR로 팬아웃해도 모두 동일한
+    값을 쓴다(fix-merge-request-requester).
     """
     batch_id = batch.get("id")
     tenant_id = batch.get("tenant_id", "")
     decision_name = (artifact.get("decision") or {}).get("name", "")
-    todo_ids = [item.get("todo_id") for item in (batch.get("collected_items") or []) if item.get("todo_id")]
+    collected_items = batch.get("collected_items") or []
+    todo_ids = [item.get("todo_id") for item in collected_items if item.get("todo_id")]
+    requester_ids = _feedback_author_ids(collected_items)
 
     async def _apply_for_owner(
         dmn_id: Optional[str], owner_label: str, agent_id: Optional[str], owner_user_id: Optional[str]
@@ -544,8 +572,8 @@ async def apply_approved_dmn_target(
             proc_def_id=dmn_id,
             title=f"[Feedback] {dmn_id} DMN 규칙 개선: {decision_name}",
             description=description,
-            requester_id=approver_id,
-            requester_name=approver_name,
+            requester_ids=requester_ids,
+            reviewer_id=approver_id,
         )
         if not pr_row:
             log(f"⚠️ DMN 병합 요청 생성 실패: batch_id={batch_id}, dmn_id={dmn_id}")
@@ -609,7 +637,6 @@ async def apply_approved_process_definition_target(
     batch: Dict[str, Any],
     artifact: Dict[str, Any],
     approver_id: Optional[str] = None,
-    approver_name: Optional[str] = None,
 ) -> Dict[str, Any]:
     """승인된 PROCESS_DEFINITION target을 draft proc_def_version 행 +
     resource_pull_requests 병합 요청으로 반영한다. apply_approved_dmn_target과
@@ -617,6 +644,9 @@ async def apply_approved_process_definition_target(
     sequences/gateways를 live definition 복사본에 기계적으로 병합할 뿐이다.
     라이브 proc_def는 쓰지 않는다: draft 생성과 PR 오픈까지가 이 함수의
     책임이다(add-process-definition-apply design.md Non-Goals).
+
+    병합 요청의 requester/reviewer 귀속은 apply_approved_dmn_target과 동일하다
+    (fix-merge-request-requester).
     """
     batch_id = batch.get("id")
     tenant_id = batch.get("tenant_id", "")
@@ -635,7 +665,9 @@ async def apply_approved_process_definition_target(
     snapshot = json.dumps(merged_definition, ensure_ascii=False)
 
     summary = artifact.get("summary", "")
-    todo_ids = [item.get("todo_id") for item in (batch.get("collected_items") or []) if item.get("todo_id")]
+    collected_items = batch.get("collected_items") or []
+    todo_ids = [item.get("todo_id") for item in collected_items if item.get("todo_id")]
+    requester_ids = _feedback_author_ids(collected_items)
 
     version_row = insert_draft_proc_def_version(
         tenant_id=tenant_id,
@@ -661,8 +693,8 @@ async def apply_approved_process_definition_target(
         proc_def_id=proc_def_id,
         title=f"[Feedback] {proc_def_id} 프로세스 흐름 개선: {summary}",
         description=description,
-        requester_id=approver_id,
-        requester_name=approver_name,
+        requester_ids=requester_ids,
+        reviewer_id=approver_id,
     )
     if not pr_row:
         log(f"⚠️ PROCESS_DEFINITION 병합 요청 생성 실패: batch_id={batch_id}")

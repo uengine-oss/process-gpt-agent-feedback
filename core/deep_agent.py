@@ -197,6 +197,8 @@ async def process_feedback_with_deep_agent(
     events: Optional[List[Dict[str, Any]]] = None,
     activity_ref: Optional[Dict[str, str]] = None,
     bound_skill_name: Optional[str] = None,
+    requester_ids: Optional[List[str]] = None,
+    reviewer_id: Optional[str] = None,
 ) -> Dict:
     """
     Deep Agent를 사용하여 피드백을 처리하고 스킬을 개선합니다.
@@ -213,6 +215,9 @@ async def process_feedback_with_deep_agent(
         activity_ref: agent_id가 없을 때 스킬을 귀속시킬 활동 {"tenant_id", "proc_def_id", "activity_id"}
         bound_skill_name: 제안 승인 시점에 이미 확정된 스킬 이름 — 주어지면 Deep Agent는
             새 이름을 짓지 않고 이 이름 그대로 CREATE/UPDATE 여부만 판단한다.
+        requester_ids: 이 개선을 촉발한 피드백 작성자 user_id 목록(중복 제거) — 스킬
+            병합 요청의 requester로 전달된다(fix-merge-request-requester).
+        reviewer_id: 이 target을 승인한 사람 — 스킬 병합 요청의 reviewer로 전달된다.
 
     Returns:
         처리 결과 dict
@@ -221,8 +226,14 @@ async def process_feedback_with_deep_agent(
         owner_desc = f"agent_id={agent_id}" if agent_id else f"activity_ref={activity_ref}"
         log(f"🤖 Deep Agent 기반 피드백 처리 시작: {owner_desc}")
 
-        # 커스텀 스킬 도구 생성 (agent_id 또는 activity_ref, feedback_content 바인딩)
-        skill_tools = create_skill_tools(agent_id=agent_id, feedback_content=feedback_content, activity_ref=activity_ref)
+        # 커스텀 스킬 도구 생성 (agent_id 또는 activity_ref, feedback_content, requester/reviewer 바인딩)
+        skill_tools = create_skill_tools(
+            agent_id=agent_id,
+            feedback_content=feedback_content,
+            activity_ref=activity_ref,
+            requester_ids=requester_ids,
+            reviewer_id=reviewer_id,
+        )
 
         # LLM 생성
         llm = create_llm(streaming=False, temperature=0)

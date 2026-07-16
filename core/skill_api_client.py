@@ -184,6 +184,8 @@ def update_skill_file(
     file_path: str,
     content: str,
     tenant_id: str,
+    requester_ids: Optional[List[str]] = None,
+    reviewer_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     스킬 파일 업데이트 (git provider commit + PR 워크플로우 경유)
@@ -195,6 +197,18 @@ def update_skill_file(
     core/skills/git_providers/factory.py:get_provider). 로컬 전용 스킬을 덮어쓰는
     서버 라우트는 현재 없다 — upload_skill(CREATE)은 이미 존재하면 409를 반환한다.
 
+    requester_ids/reviewer_id는 이 커밋이 기본 브랜치를 대상으로 해 PR이 열릴 때
+    resource_pull_requests에 기록될 귀속 정보다(fix-merge-request-requester).
+    **서버(process-gpt-deepagents)는 현재 이 두 필드를 읽지 않는다** —
+    core/api/skills_router.py:commit_skill_file이 requester_id를 스칼라로 다루고
+    zero-uuid로 폴백하며, reviewer_id는 아예 파싱하지 않는다. 서버가 requester_id를
+    uuid[] 배열로, reviewer_id를 함께 받도록 고쳐지기 전까지는 이 값들이 전달돼도
+    무시되거나(reviewer_id) 서버 쪽 컬럼 타입과 어긋나 저장에 실패한다.
+    서버가 requester_id를 uuid[] 배열로, reviewer_id를 함께 받도록 고쳐지기 전까지는
+    이 계약이 유효하다. requester_ids가 빈 배열이면 아예 보내지 않는다 — 빈 배열을
+    보내면 falsy로 취급돼 서버가 zero-uuid 폴백을 쓰다 uuid[] 컬럼에 스칼라를
+    넣으려다 타입 에러가 나기 때문이다.
+
     Parameters
     ----------
     skill_name : str
@@ -205,6 +219,11 @@ def update_skill_file(
         텍스트 파일 내용
     tenant_id : str
         테넌트 ID (git provider 조회에 필수)
+    requester_ids : list[str], optional
+        이 개선을 촉발한 피드백 작성자 user_id 목록(중복 제거). 비어 있으면 요청
+        본문에 requester_id 키 자체를 생략한다.
+    reviewer_id : str, optional
+        이 개선을 승인한 사람의 id.
 
     Returns
     -------
@@ -214,11 +233,15 @@ def update_skill_file(
     encoded_skill_name = quote(skill_name)
     endpoint = f"/skills/{encoded_skill_name}/commit"
 
-    json_data = {
+    json_data: Dict[str, Any] = {
         "tenant_id": tenant_id,
         "file_path": file_path,
         "content": content,
     }
+    if requester_ids:
+        json_data["requester_id"] = requester_ids
+    if reviewer_id:
+        json_data["reviewer_id"] = reviewer_id
 
     log(f"✏️ 스킬 파일 커밋: {skill_name}/{file_path}")
 

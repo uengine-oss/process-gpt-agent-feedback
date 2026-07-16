@@ -17,11 +17,7 @@
 - 기존 스킬 재사용을 위한 에이전트 적재 기능
 - `skills/` 디렉토리의 skill-creator 스킬을 참조하여 스킬 내용 생성
 
-### 3. 변경 이력 관리
-- 모든 스킬 변경 이력 통합 관리 (`agent_knowledge_history` 테이블)
-- 변경 전후 상태 추적
-
-### 4. 피드백 배치 수집 → 분류 → 제안 승인
+### 3. 피드백 배치 수집 → 분류 → 제안 승인
 - 피드백을 즉시 처리하지 않고 `(tenant_id, proc_def_id, activity_id)` 기준 배치로 수집
 - 5건 또는 3일 중 먼저 오는 조건으로 배치 트리거
 - 트리거된 배치는 먼저 **무엇을 개선할 수 있는지 분류**된다 (LLM 한 콜, 한 배치가 여러 target에 동시에 해당할 수 있음):
@@ -92,13 +88,13 @@ uv pip install -r requirements.txt
 
 ### 데이터베이스 마이그레이션
 
-이 리포는 마이그레이션 툴을 소유하지 않으므로, Supabase SQL Editor에서 아래 SQL을 순서대로 직접 실행하세요:
+이 리포는 마이그레이션 툴을 소유하지 않으며, 셋업용 SQL 파일도 더 이상 함께 배포하지 않습니다(과거 일회성 스크립트는 이미 적용 후 제거됨). 새 인스턴스를 셋업하려면 아래 스키마를 Supabase에 직접 구성하세요:
 
-1. `function.sql` — `agent_feedback_task` 함수, `agent_knowledge_history`/`agent_knowledge_registry` 테이블
-2. `skill_feedback_proposals.sql` — 배치 수집/제안 기능에 필요: `feedback_proposals` 테이블, `append_feedback_to_batch` 함수
-3. `feedback_collected_count.sql` — 같은 워크아이템에 피드백이 여러 번 추가되는 경우를 놓치지 않기 위한 `todolist.feedback_collected_count` 컬럼 + `agent_feedback_task` 갱신
-4. `feedback_proposal_targets.sql` — 제안의 target별 분류/독립 승인(`SKILL`/`DMN_RULE`/`PROCESS_DEFINITION`)에 필요: `feedback_proposals.targets` 컬럼, `decide_feedback_proposal_target` 함수
-5. (기존에 위 파일들을 `skill_feedback_proposals`라는 옛 이름으로 이미 실행해둔 인스턴스만) `rename_feedback_proposals_table.sql` — 테이블을 `feedback_proposals`로 이름 변경(SKILL 전용이 아니게 된 지 오래라 이름을 실제 역할에 맞춤) + `append_feedback_to_batch`/`decide_feedback_proposal_target` 함수를 새 이름으로 재생성. 새로 셋업하는 경우 2/4번 파일이 이미 새 이름으로 만들므로 이 파일은 필요 없다.
+- `agent_feedback_task` 함수 — 피드백 작업 조회
+- `todolist.feedback_collected_count` 컬럼 — 같은 워크아이템에 피드백이 여러 번 추가되는 경우를 놓치지 않기 위함
+- `feedback_proposals` 테이블(`targets` 컬럼 포함) — 배치 수집/제안 기능, target별 분류/독립 승인(`SKILL`/`DMN_RULE`/`PROCESS_DEFINITION`)에 필요
+- `append_feedback_to_batch`, `decide_feedback_proposal_target` 함수
+- `proc_def_version`, `resource_pull_requests` 테이블 — DMN_RULE/PROCESS_DEFINITION target 승인 시 draft 및 병합 요청 저장. `resource_pull_requests.requester_id`는 `uuid[]`(배열) 타입이어야 한다 — 병합 요청을 촉발한 피드백 작성자 전원을 담고, 승인자는 별도 `reviewer_id` 컬럼에 기록한다.
 
 ### 환경 설정
 

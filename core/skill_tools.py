@@ -44,12 +44,18 @@ def create_skill_tools(
     agent_id: Optional[str] = None,
     feedback_content: Optional[str] = None,
     activity_ref: Optional[Dict[str, str]] = None,
+    requester_ids: Optional[List[str]] = None,
+    reviewer_id: Optional[str] = None,
 ) -> list:
     """agent_id 또는 activity_ref가 바인딩된 스킬 도구 목록 생성.
 
     agent_id가 있으면 기존 에이전트 귀속 동작을 그대로 사용한다. agent_id가 없으면
     activity_ref({"tenant_id", "proc_def_id", "activity_id"})로 지정된 프로세스 활동에
     스킬을 귀속시키는 활동 전용 도구 세트를 반환한다.
+
+    requester_ids/reviewer_id는 UPDATE 시 열리는 스킬 병합 요청의 귀속 정보로,
+    LLM이 채우는 도구 인자가 아니라 agent_id/activity_ref처럼 클로저에 바인딩된다
+    (fix-merge-request-requester).
     """
 
     @tool
@@ -65,8 +71,6 @@ def create_skill_tools(
         try:
             from core.database import (
                 _get_agent_by_id,
-                register_knowledge,
-                update_knowledge_access_time,
                 load_activity_skills,
             )
 
@@ -123,22 +127,6 @@ def create_skill_tools(
 
             if not results:
                 return f"관련된 기존 스킬이 없습니다. (검색 임계값: {threshold})\n새 스킬을 생성할지 판단하세요."
-
-            # 레지스트리 등록 — agent_knowledge_registry.agent_id는 NOT NULL이라 활동 전용
-            # 경로(agent_id 없음)에서는 등록을 건너뛴다.
-            for item in (results if agent_id else []):
-                try:
-                    register_knowledge(
-                        agent_id=agent_id,
-                        tenant_id=tenant_id,
-                        knowledge_type="SKILL",
-                        knowledge_id=item.get("id", ""),
-                        knowledge_name=item.get("name", ""),
-                        content_summary=item.get("description", ""),
-                    )
-                    update_knowledge_access_time(agent_id, "SKILL", item.get("id", ""))
-                except Exception:
-                    pass
 
             output_lines = [f"총 {len(results)}개의 스킬을 찾았습니다:\n"]
             for idx, item in enumerate(results[:15], start=1):
@@ -295,9 +283,10 @@ def create_skill_tools(
                 skill_artifact=skill_artifact,
                 operation=operation,
                 skill_id=skill_id,
-                feedback_content=feedback_content or "",
                 tenant_id=(activity_ref or {}).get("tenant_id") if not agent_id else None,
                 activity_ref=activity_ref if not agent_id else None,
+                requester_ids=requester_ids,
+                reviewer_id=reviewer_id,
             )
 
             owner_label = f"에이전트: {agent_id}" if agent_id else f"활동: {activity_ref}"
@@ -324,8 +313,6 @@ def create_skill_tools(
             from core.database import (
                 _get_agent_by_id,
                 update_agent_and_tenant_skills,
-                register_knowledge,
-                record_knowledge_history,
             )
 
             skill_names = _parse_skill_ids_input(skill_ids)
@@ -335,30 +322,11 @@ def create_skill_tools(
             agent_info = _get_agent_by_id(agent_id)
             if not agent_info:
                 return f"❌ 에이전트를 찾을 수 없습니다: {agent_id}"
-            tenant_id = agent_info.get("tenant_id")
 
             attached = []
             for sn in skill_names[:10]:
                 try:
                     update_agent_and_tenant_skills(agent_id, sn, "CREATE")
-                    register_knowledge(
-                        agent_id=agent_id,
-                        tenant_id=tenant_id,
-                        knowledge_type="SKILL",
-                        knowledge_id=sn,
-                        knowledge_name=sn,
-                        content_summary=f"기존 스킬 적재: {sn}",
-                    )
-                    record_knowledge_history(
-                        knowledge_type="SKILL",
-                        knowledge_id=sn,
-                        agent_id=agent_id,
-                        tenant_id=tenant_id,
-                        operation="CREATE",
-                        new_content={"source": "attach_existing_skill", "skill_name": sn},
-                        feedback_content=None,
-                        knowledge_name=sn,
-                    )
                     attached.append(sn)
                     log(f"✅ 스킬 적재 완료: {sn} (agent_id={agent_id})")
                 except Exception as e:

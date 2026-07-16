@@ -9,14 +9,12 @@ from core.database import (
     update_agent_and_tenant_skills,
     update_activity_skills,
     _get_agent_by_id,
-    record_knowledge_history,
 )
 from core.skill_api_client import (
     upload_skill,
     update_skill_file,
     delete_skill,
     check_skill_exists,
-    get_skill_file_content,
 )
 
 
@@ -43,28 +41,18 @@ def _sync_skill_attribution(
         log(f"   ⚠️ 스킬 동기화 실패 (무시): {e}")
 
 
-def _record_skill_history(agent_id: Optional[str], **kwargs) -> None:
-    """agent_knowledge_history.agent_id는 NOT NULL이므로 agent_id가 없는(활동 전용)
-    경로에서는 이력을 남기지 않는다 — 귀속은 proc_def.definition 쪽에만 기록된다."""
-    if not agent_id:
-        return
-    try:
-        record_knowledge_history(agent_id=agent_id, **kwargs)
-    except Exception as e:
-        log(f"   ⚠️ 변경 이력 기록 실패 (무시): {e}")
-
-
 async def commit_to_skill(
     agent_id: Optional[str] = None,
     skill_artifact: Optional[Dict] = None,
     operation: str = "CREATE",
     skill_id: str = None,
-    feedback_content: Optional[str] = None,
     merge_mode: Optional[str] = None,
     relationship_analysis: Optional[str] = None,
     related_skill_ids: Optional[str] = None,
     tenant_id: Optional[str] = None,
     activity_ref: Optional[Dict[str, str]] = None,
+    requester_ids: Optional[List[str]] = None,
+    reviewer_id: Optional[str] = None,
 ):
     """
     Skill CRUD 작업 수행 (HTTP API 경로).
@@ -75,12 +63,15 @@ async def commit_to_skill(
         skill_artifact: Skill 정보 (name, steps, description, overview, usage, additional_files)
         operation: "CREATE" | "UPDATE" | "DELETE"
         skill_id: UPDATE/DELETE 시 기존 스킬 이름
-        feedback_content: 원본 피드백
         merge_mode: UPDATE 시 MERGE | REPLACE
         relationship_analysis: 관계 분석 결과
         related_skill_ids: 관련 스킬 이름/ID
         tenant_id: agent_id가 없을 때 스킬을 저장할 테넌트 (배치에서 직접 전달, agent 조회로 유추하지 않음)
         activity_ref: agent_id가 없을 때 스킬을 귀속시킬 활동 {"tenant_id", "proc_def_id", "activity_id"}
+        requester_ids: UPDATE 시 열리는 스킬 병합 요청의 requester(피드백 작성자 user_id
+            목록, 중복 제거). CREATE는 git PR을 만들지 않으므로(upload_skill, ZIP 업로드)
+            쓰이지 않는다(fix-merge-request-requester).
+        reviewer_id: UPDATE 시 열리는 스킬 병합 요청의 reviewer(승인자).
     """
     try:
         agent_info = _get_agent_by_id(agent_id) if agent_id else None
@@ -103,17 +94,6 @@ async def commit_to_skill(
 
             log(f"🗑️ SKILL 삭제 시작: 귀속={agent_id or activity_ref}, skill_name={skill_name}")
 
-            previous_content = None
-            try:
-                if check_skill_exists(skill_name, resolved_tenant_id or ""):
-                    try:
-                        skill_file_info = get_skill_file_content(skill_name, "SKILL.md", resolved_tenant_id or "")
-                        previous_content = skill_file_info.get("content", "")
-                    except Exception as e:
-                        log(f"   ⚠️ 삭제 전 스킬 내용 조회 실패: {e}")
-            except Exception:
-                pass
-
             try:
                 if not check_skill_exists(skill_name, resolved_tenant_id or ""):
                     log(f"   ⚠️ 스킬이 존재하지 않습니다: {skill_name}")
@@ -126,33 +106,11 @@ async def commit_to_skill(
 
             _sync_skill_attribution(agent_id, activity_ref, skill_name, "DELETE")
 
-            _record_skill_history(
-                agent_id,
-                knowledge_type="SKILL",
-                knowledge_id=skill_name,
-                tenant_id=resolved_tenant_id,
-                operation="DELETE",
-                previous_content=previous_content,
-                feedback_content=feedback_content,
-                knowledge_name=skill_name,
-            )
-
         if operation == "UPDATE":
             if not skill_name:
                 raise ValueError("UPDATE 작업에는 skill_id(스킬 이름)가 필요합니다")
 
             log(f"✏️ SKILL 수정 시작: 귀속={agent_id or activity_ref}, skill_name={skill_name}")
-
-            previous_content = None
-            try:
-                if check_skill_exists(skill_name, resolved_tenant_id or ""):
-                    try:
-                        skill_file_info = get_skill_file_content(skill_name, "SKILL.md", resolved_tenant_id or "")
-                        previous_content = skill_file_info.get("content", "")
-                    except Exception as e:
-                        log(f"   ⚠️ 업데이트 전 스킬 내용 조회 실패: {e}")
-            except Exception:
-                pass
 
             try:
                 if not check_skill_exists(skill_name, resolved_tenant_id or ""):
@@ -162,32 +120,33 @@ async def commit_to_skill(
                     skill_document = _format_skill_document(
                         skill_name, steps, description=description, overview=overview, usage=usage, body_markdown=body_markdown
                     )
-                    new_content = skill_document
 
-                    result = update_skill_file(skill_name, "SKILL.md", skill_document, resolved_tenant_id or "")
+                    result = update_skill_file(
+                        skill_name,
+                        "SKILL.md",
+                        skill_document,
+                        resolved_tenant_id or "",
+                        requester_ids=requester_ids,
+                        reviewer_id=reviewer_id,
+                    )
                     log(f"   ✅ SKILL.md 업데이트 완료: {result.get('message', 'Success')}")
 
                     if additional_files:
                         for file_path, file_content in additional_files.items():
                             try:
-                                update_skill_file(skill_name, file_path, file_content, resolved_tenant_id or "")
+                                update_skill_file(
+                                    skill_name,
+                                    file_path,
+                                    file_content,
+                                    resolved_tenant_id or "",
+                                    requester_ids=requester_ids,
+                                    reviewer_id=reviewer_id,
+                                )
                                 log(f"   ✅ 파일 업데이트 완료: {file_path}")
                             except Exception as e:
                                 log(f"   ⚠️ 파일 업데이트 실패 ({file_path}): {e}")
 
                     log(f"   ✅ SKILL 수정 완료: skill_name={skill_name}")
-
-                    _record_skill_history(
-                        agent_id,
-                        knowledge_type="SKILL",
-                        knowledge_id=skill_name,
-                        tenant_id=resolved_tenant_id,
-                        operation="UPDATE",
-                        previous_content=previous_content,
-                        new_content=new_content,
-                        feedback_content=feedback_content,
-                        knowledge_name=skill_name,
-                    )
 
                     return
 
@@ -214,7 +173,6 @@ async def commit_to_skill(
                 skill_document = _format_skill_document(
                     skill_name, steps, description=description, overview=overview, usage=usage, body_markdown=body_markdown
                 )
-                new_content = skill_document
 
                 result = upload_skill(
                     skill_name=skill_name,
@@ -226,17 +184,6 @@ async def commit_to_skill(
                 log(f"   ✅ SKILL 저장 완료: skill_name={skill_name}")
 
                 _sync_skill_attribution(agent_id, activity_ref, skill_name, "CREATE")
-
-                _record_skill_history(
-                    agent_id,
-                    knowledge_type="SKILL",
-                    knowledge_id=skill_name,
-                    tenant_id=resolved_tenant_id,
-                    operation="CREATE",
-                    new_content=new_content,
-                    feedback_content=feedback_content,
-                    knowledge_name=skill_name,
-                )
 
             except Exception as e:
                 log(f"   ❌ SKILL 저장 실패: {e}")

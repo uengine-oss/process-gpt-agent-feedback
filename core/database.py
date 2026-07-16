@@ -1,7 +1,5 @@
 import os
 import socket
-import hashlib
-import json
 import random
 import string
 from typing import Optional, Dict, Any, List
@@ -208,60 +206,6 @@ def get_all_agents() -> List[Dict[str, Any]]:
 
 
 # ============================================================================
-# 에이전트 초기 지식 셋팅 로그
-# ============================================================================
-
-async def fetch_agents_needing_setup(limit: int = 1) -> List[Dict[str, Any]]:
-    """
-    초기 지식 셋팅이 아직 되지 않은 에이전트 조회.
-    users에서 is_agent=true, agent_type='agent', goal 있음 & agent_knowledge_setup_log에 없음.
-    """
-    try:
-        supabase = get_db_client()
-        resp = supabase.rpc('agent_needing_knowledge_setup', {'p_limit': limit}).execute()
-        rows = resp.data or []
-        agents = []
-        for agent in rows:
-            agent['name'] = agent.get('username', '')
-            agents.append(agent)
-        return agents
-    except Exception as e:
-        handle_error("에이전트셋팅대상조회", e)
-        return []
-
-
-def upsert_agent_knowledge_setup_log(
-    agent_id: str,
-    tenant_id: Optional[str] = None,
-    status: str = 'DONE'
-) -> bool:
-    """에이전트 초기 지식 셋팅 로그 upsert (시작 시 STARTED, 종료 시 DONE/FAILED)"""
-    try:
-        supabase = get_db_client()
-        supabase.table('agent_knowledge_setup_log').upsert(
-            {
-                'agent_id': agent_id,
-                'tenant_id': tenant_id,
-                'status': status
-            },
-            on_conflict='agent_id'
-        ).execute()
-        return True
-    except Exception as e:
-        handle_error("에이전트셋팅로그기록", e)
-        return False
-
-
-def insert_agent_knowledge_setup_log(
-    agent_id: str,
-    tenant_id: Optional[str] = None,
-    status: str = 'DONE'
-) -> bool:
-    """에이전트 초기 지식 셋팅 로그 기록 (upsert 호출)"""
-    return upsert_agent_knowledge_setup_log(agent_id, tenant_id, status)
-
-
-# ============================================================================
 # 스킬 동기화 (users / tenants 테이블)
 # ============================================================================
 
@@ -375,336 +319,6 @@ def update_agent_and_tenant_skills(agent_id: str, skill_name: str, operation: st
         except Exception as e:
             log(f"⚠️ agent_skills 동기화 실패 (무시하고 계속 진행): {e}")
             handle_error("agent_skills동기화", e)
-
-
-# ============================================================================
-# 에이전트 지식 변경 이력 기록 (통합)
-# ============================================================================
-
-def record_knowledge_history(
-    knowledge_type: str,  # "MEMORY" | "DMN_RULE" | "SKILL"
-    knowledge_id: str,  # MEMORY: memory_id, DMN_RULE: rule_id, SKILL: skill_name
-    agent_id: str,
-    tenant_id: Optional[str],
-    operation: str,  # "CREATE" | "UPDATE" | "DELETE" | "MOVE"
-    previous_content: Optional[Dict[str, Any]] = None,
-    new_content: Optional[Dict[str, Any]] = None,
-    feedback_content: Optional[str] = None,
-    knowledge_name: Optional[str] = None,  # DMN_RULE: rule name, SKILL: skill name
-    moved_from_storage: Optional[str] = None,  # MOVE인 경우
-    moved_to_storage: Optional[str] = None,  # MOVE인 경우
-    batch_job_id: Optional[str] = None,  # 배치 작업 ID
-    version_uuid: Optional[str] = None  # DMN_RULE 버전 UUID (프론트엔드에서 버전 정보 조회용)
-) -> Optional[str]:
-    """
-    에이전트 지식 변경 이력을 데이터베이스에 기록 (통합)
-    
-    Args:
-        knowledge_type: 지식 타입 ("MEMORY" | "DMN_RULE" | "SKILL")
-        knowledge_id: 지식 ID (MEMORY: memory_id, DMN_RULE: rule_id, SKILL: skill_name)
-        agent_id: 에이전트 ID
-        tenant_id: 테넌트 ID
-        operation: 작업 타입 ("CREATE" | "UPDATE" | "DELETE" | "MOVE")
-        previous_content: 이전 내용 (UPDATE/DELETE/MOVE 시)
-        new_content: 새 내용 (CREATE/UPDATE/MOVE 시)
-        feedback_content: 원본 피드백 내용 (선택적)
-        knowledge_name: 지식 이름 (DMN_RULE: rule name, SKILL: skill name, MEMORY: None)
-        moved_from_storage: 이동 전 저장소 (MOVE인 경우)
-        moved_to_storage: 이동 후 저장소 (MOVE인 경우)
-        batch_job_id: 배치 작업 ID (배치 작업으로 변경된 경우)
-        version_uuid: DMN_RULE 버전 UUID (프론트엔드에서 버전 정보 조회용, DMN_RULE인 경우만)
-    
-    Returns:
-        생성된 변경 이력의 UUID (version_uuid가 제공된 경우 해당 UUID 반환)
-    """
-    from utils.logger import log  # 순환 import 방지용 내부 import
-    
-    try:
-        supabase = get_db_client()
-        
-        # Dict를 JSON 문자열로 직렬화 (TEXT 타입 저장을 위해)
-        import json
-        previous_content_str = None
-        new_content_str = None
-        
-        if previous_content is not None:
-            if isinstance(previous_content, dict):
-                previous_content_str = json.dumps(previous_content, ensure_ascii=False)
-            else:
-                previous_content_str = str(previous_content)
-        
-        if new_content is not None:
-            if isinstance(new_content, dict):
-                new_content_str = json.dumps(new_content, ensure_ascii=False)
-            else:
-                new_content_str = str(new_content)
-        
-        # version_uuid가 제공된 경우 해당 UUID를 사용, 아니면 자동 생성
-        history_id = version_uuid if version_uuid else None
-        
-        # version_uuid가 제공된 경우 해당 UUID를 사용, 아니면 자동 생성
-        history_id = version_uuid if version_uuid else None
-        
-        record = {
-            "knowledge_type": knowledge_type.upper(),
-            "knowledge_id": knowledge_id,
-            "agent_id": agent_id,
-            "tenant_id": tenant_id,
-            "operation": operation.upper(),
-            "previous_content": previous_content_str,  # TEXT 타입으로 저장
-            "new_content": new_content_str,  # TEXT 타입으로 저장
-            "feedback_content": feedback_content,
-            "knowledge_name": knowledge_name,
-            "moved_from_storage": moved_from_storage,
-            "moved_to_storage": moved_to_storage,
-            "batch_job_id": batch_job_id
-        }
-        
-        # None 값 제거 (데이터베이스에 NULL로 저장되도록)
-        record = {k: v for k, v in record.items() if v is not None}
-        
-        # version_uuid가 제공된 경우 id로 지정하여 삽입 (변경 이력 UUID = 버전 UUID)
-        if history_id:
-            record["id"] = history_id
-        
-        resp = supabase.table("agent_knowledge_history").insert(record).execute()
-        
-        # 생성된 UUID 반환
-        result_uuid = None
-        if resp.data and len(resp.data) > 0:
-            result_uuid = resp.data[0].get("id")
-        elif history_id:
-            result_uuid = history_id
-        
-        log(f"📝 지식 변경 이력 기록 완료: type={knowledge_type}, id={knowledge_id}, operation={operation}, history_uuid={result_uuid}")
-        
-        return result_uuid
-        
-    except Exception as e:
-        # 변경 이력 기록 실패는 로그만 남기고 계속 진행 (작업 자체는 성공했을 수 있음)
-        import traceback
-        log(f"⚠️ 지식 변경 이력 기록 실패 (무시하고 계속 진행): {e}")
-        log(f"   상세 에러: {traceback.format_exc()}")
-
-
-# ============================================================================
-# 에이전트 지식 레지스트리 관리
-# ============================================================================
-
-def _hash_content(content: str) -> str:
-    """지식 내용의 해시 생성 (변경 감지용)"""
-    return hashlib.sha256(content.encode('utf-8')).hexdigest()
-
-
-def register_knowledge(
-    agent_id: str,
-    tenant_id: Optional[str],
-    knowledge_type: str,
-    knowledge_id: str,
-    knowledge_name: Optional[str] = None,
-    content_summary: Optional[str] = None,
-    content: Optional[str] = None
-) -> bool:
-    """
-    에이전트 지식 레지스트리에 지식 등록/업데이트 (UPSERT)
-    
-    Args:
-        agent_id: 에이전트 ID
-        tenant_id: 테넌트 ID
-        knowledge_type: 지식 타입
-        knowledge_id: 지식 ID
-        knowledge_name: 지식 이름
-        content_summary: 지식 내용 요약
-        content: 지식 전체 내용 (해시 생성용)
-    
-    Returns:
-        저장 성공 여부
-    """
-    try:
-        supabase = get_db_client()
-        
-        content_hash = None
-        if content:
-            content_hash = _hash_content(content)
-        
-        record = {
-            'agent_id': agent_id,
-            'tenant_id': tenant_id,
-            'knowledge_type': knowledge_type.upper(),
-            'knowledge_id': knowledge_id,
-            'knowledge_name': knowledge_name,
-            'content_summary': content_summary,
-            'content_hash': content_hash
-        }
-        
-        # None 값 제거
-        record = {k: v for k, v in record.items() if v is not None}
-        
-        # UPSERT
-        resp = (
-            supabase
-            .table('agent_knowledge_registry')
-            .upsert(record, on_conflict='agent_id,knowledge_type,knowledge_id')
-            .execute()
-        )
-        
-        log(f"✅ 지식 레지스트리 등록: {knowledge_type}:{knowledge_id} (agent_id={agent_id})")
-        return True
-        
-    except Exception as e:
-        handle_error("지식레지스트리등록", e)
-        return False
-
-
-def unregister_knowledge(
-    agent_id: str,
-    knowledge_type: str,
-    knowledge_id: str
-) -> bool:
-    """
-    에이전트 지식 레지스트리에서 지식 제거
-    
-    Args:
-        agent_id: 에이전트 ID
-        knowledge_type: 지식 타입
-        knowledge_id: 지식 ID
-    
-    Returns:
-        삭제 성공 여부
-    """
-    try:
-        supabase = get_db_client()
-        
-        (
-            supabase
-            .table('agent_knowledge_registry')
-            .delete()
-            .eq('agent_id', agent_id)
-            .eq('knowledge_type', knowledge_type.upper())
-            .eq('knowledge_id', knowledge_id)
-            .execute()
-        )
-        
-        log(f"🗑️ 지식 레지스트리 제거: {knowledge_type}:{knowledge_id} (agent_id={agent_id})")
-        return True
-        
-    except Exception as e:
-        handle_error("지식레지스트리제거", e)
-        return False
-
-
-def get_agent_knowledge_list(
-    agent_id: str,
-    knowledge_type: Optional[str] = None,
-    limit: Optional[int] = None
-) -> List[Dict[str, Any]]:
-    """
-    에이전트가 가진 모든 지식 목록 조회
-    
-    Args:
-        agent_id: 에이전트 ID
-        knowledge_type: 지식 타입 필터 (None이면 모든 타입)
-        limit: 조회 제한 수 (None이면 제한 없음)
-    
-    Returns:
-        지식 목록
-    """
-    try:
-        supabase = get_db_client()
-        
-        query = (
-            supabase
-            .table('agent_knowledge_registry')
-            .select('*')
-            .eq('agent_id', agent_id)
-            .order('updated_at', desc=True)
-        )
-        
-        if knowledge_type:
-            query = query.eq('knowledge_type', knowledge_type.upper())
-        
-        if limit:
-            query = query.limit(limit)
-        
-        resp = query.execute()
-        return resp.data if resp.data else []
-        
-    except Exception as e:
-        handle_error("지식목록조회", e)
-        return []
-
-
-def check_knowledge_exists(
-    agent_id: str,
-    knowledge_type: str,
-    knowledge_id: str
-) -> bool:
-    """
-    특정 지식이 레지스트리에 존재하는지 확인
-    
-    Args:
-        agent_id: 에이전트 ID
-        knowledge_type: 지식 타입
-        knowledge_id: 지식 ID
-    
-    Returns:
-        존재 여부
-    """
-    try:
-        supabase = get_db_client()
-        
-        resp = (
-            supabase
-            .table('agent_knowledge_registry')
-            .select('id')
-            .eq('agent_id', agent_id)
-            .eq('knowledge_type', knowledge_type.upper())
-            .eq('knowledge_id', knowledge_id)
-            .limit(1)
-            .execute()
-        )
-        
-        return len(resp.data) > 0 if resp.data else False
-        
-    except Exception as e:
-        handle_error("지식존재확인", e)
-        return False
-
-
-def update_knowledge_access_time(
-    agent_id: str,
-    knowledge_type: str,
-    knowledge_id: str
-) -> bool:
-    """
-    지식의 마지막 접근 시간 업데이트
-
-    Args:
-        agent_id: 에이전트 ID
-        knowledge_type: 지식 타입
-        knowledge_id: 지식 ID
-
-    Returns:
-        업데이트 성공 여부
-    """
-    try:
-        supabase = get_db_client()
-
-        (
-            supabase
-            .table('agent_knowledge_registry')
-            .update({'last_accessed_at': 'now()'})
-            .eq('agent_id', agent_id)
-            .eq('knowledge_type', knowledge_type.upper())
-            .eq('knowledge_id', knowledge_id)
-            .execute()
-        )
-
-        return True
-
-    except Exception as e:
-        handle_error("접근시간업데이트", e)
-        return False
 
 
 # ============================================================================
@@ -1266,17 +880,20 @@ def insert_dmn_merge_request(
     proc_def_id: str,
     title: str,
     description: str,
-    requester_id: Optional[str] = None,
-    requester_name: Optional[str] = None,
+    requester_ids: Optional[List[str]] = None,
+    reviewer_id: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """DMN_RULE target 승인 결과로 resource_pull_requests에 병합 요청 행을 연다.
 
     SKILL PR과 같은 테이블/행 모양을 재사용하지만 실제 git 저장소는 없다 —
     dmn/bpmn 리소스는 이 테이블 안에서만 승인/이력 관리가 이루어진다(직접 확인됨).
     그래서 git_pr_number/git_pr_url/git_repo_url은 의도적으로 NULL로 남긴다.
+
+    requester_ids는 이 병합 요청을 촉발한 피드백 작성자들(배치의 collected_items
+    user_id, 중복 제거)이고, reviewer_id는 target을 승인한 사람이다 — 승인자를
+    requester로 기록하던 이전 동작은 fix-merge-request-requester에서 뒤집혔다.
     """
     import time
-    import uuid as _uuid
 
     tid = (tenant_id or "").strip()
     pdid = (proc_def_id or "").strip()
@@ -1294,8 +911,8 @@ def insert_dmn_merge_request(
             "title": title,
             "description": description,
             "status": "OPEN",
-            "requester_id": requester_id or str(_uuid.UUID(int=0)),
-            "requester_name": requester_name,
+            "requester_id": requester_ids or [],
+            "reviewer_id": reviewer_id,
         }
         resp = supabase.table("resource_pull_requests").insert(row).execute()
         data = resp.data or []
@@ -1434,17 +1051,18 @@ def insert_bpmn_merge_request(
     proc_def_id: str,
     title: str,
     description: str,
-    requester_id: Optional[str] = None,
-    requester_name: Optional[str] = None,
+    requester_ids: Optional[List[str]] = None,
+    reviewer_id: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """PROCESS_DEFINITION target 승인 결과로 resource_pull_requests에 병합 요청 행을 연다.
 
     insert_dmn_merge_request와 동일한 테이블/행 모양을 재사용하지만
     resource_type='bpmn'이다 — 실제 git 저장소는 없다(DMN과 동일한 이유:
     dmn/bpmn 리소스는 이 테이블 안에서만 승인/이력 관리가 이루어진다).
+
+    requester_ids/reviewer_id 의미는 insert_dmn_merge_request와 동일하다.
     """
     import time
-    import uuid as _uuid
 
     tid = (tenant_id or "").strip()
     pdid = (proc_def_id or "").strip()
@@ -1462,8 +1080,8 @@ def insert_bpmn_merge_request(
             "title": title,
             "description": description,
             "status": "OPEN",
-            "requester_id": requester_id or str(_uuid.UUID(int=0)),
-            "requester_name": requester_name,
+            "requester_id": requester_ids or [],
+            "reviewer_id": reviewer_id,
         }
         resp = supabase.table("resource_pull_requests").insert(row).execute()
         data = resp.data or []

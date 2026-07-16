@@ -143,7 +143,9 @@ async def approve_feedback_proposal_target(proposal_id: str, target_type: str, b
         skill_target = _find_decided_target(batch, updated, "SKILL") or {}
         extracted_rule = skill_target.get("artifact", "")
         bound_skill_name = skill_target.get("name")
-        asyncio.create_task(apply_approved_proposal(updated, extracted_rule, bound_skill_name))
+        asyncio.create_task(
+            apply_approved_proposal(updated, extracted_rule, bound_skill_name, approver_id=body.approver_id)
+        )
         return {"approved": True, "id": proposal_id, "target": target_type, "applied": True}
 
     if target_type == "DMN_RULE":
@@ -156,7 +158,6 @@ async def approve_feedback_proposal_target(proposal_id: str, target_type: str, b
                 updated,
                 artifact,
                 approver_id=body.approver_id,
-                approver_name=body.approver_name,
             )
         )
         return {"approved": True, "id": proposal_id, "target": target_type, "applied": True}
@@ -169,7 +170,6 @@ async def approve_feedback_proposal_target(proposal_id: str, target_type: str, b
         updated,
         artifact,
         approver_id=body.approver_id,
-        approver_name=body.approver_name,
     )
     return {
         "approved": True,
