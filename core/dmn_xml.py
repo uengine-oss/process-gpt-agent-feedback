@@ -70,3 +70,87 @@ def dmn_decisions_rules_to_xml(
 
     raw_xml = ET.tostring(root, encoding="unicode")
     return minidom.parseString(raw_xml).toprettyxml(indent="  ")
+
+
+def xml_to_dmn_decisions_rules(xml_text: str) -> Dict[str, List[Dict[str, Any]]]:
+    """DMN 1.3 XML(dmn_decisions_rules_to_xml이 만든 형태)을 dmn_decisions/dmn_rules
+    JSON으로 역파싱한다. proc_def.type='dmn' 행은 definition이 아니라 bpmn 컬럼에만
+    규칙이 XML로 저장돼 있어(정의상 definition은 null), 기존 규칙을 읽으려면 이 경로가
+    유일하다.
+
+    손실 변환 주의: dmn_decisions_rules_to_xml은 rule의 condition/when을 같은
+    inputEntry 텍스트 한 칸에, target/then을 같은 outputEntry 텍스트 한 칸에 합쳐서
+    쓴다. 역파싱은 그 둘을 구분할 수 없으므로 condition==when, target==then으로
+    동일한 값을 채운다.
+
+    파싱 실패/빈 입력은 예외를 던지지 않고 빈 결과를 반환한다 — 호출부가 "아직 규칙
+    없는 빈 DMN"으로 자연스럽게 처리하게 하기 위함이다.
+    """
+    empty: Dict[str, List[Dict[str, Any]]] = {"dmn_decisions": [], "dmn_rules": []}
+    if not xml_text or not xml_text.strip():
+        return empty
+
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError:
+        return empty
+
+    ns = {"dmn": DMN_NAMESPACE}
+
+    def _find(el, tag):
+        found = el.find(f"dmn:{tag}", ns)
+        if found is None:
+            found = el.find(tag)
+        return found
+
+    def _findall(el, tag):
+        found = el.findall(f"dmn:{tag}", ns)
+        if not found:
+            found = el.findall(tag)
+        return found
+
+    decisions: List[Dict[str, Any]] = []
+    rules: List[Dict[str, Any]] = []
+
+    for decision_el in _findall(root, "decision"):
+        decision_id = decision_el.get("id", "")
+        decision_name = decision_el.get("name", "")
+        description_el = _find(decision_el, "description")
+        decisions.append({
+            "decision_id": decision_id,
+            "name": decision_name,
+            "description": description_el.text if description_el is not None and description_el.text else "",
+        })
+
+        table_el = _find(decision_el, "decisionTable")
+        if table_el is None:
+            continue
+
+        for rule_el in _findall(table_el, "rule"):
+            rule_id = rule_el.get("id", "")
+
+            input_entry_el = _find(rule_el, "inputEntry")
+            condition = ""
+            if input_entry_el is not None:
+                text_el = _find(input_entry_el, "text")
+                if text_el is not None and text_el.text:
+                    condition = text_el.text
+
+            output_entry_el = _find(rule_el, "outputEntry")
+            target = ""
+            if output_entry_el is not None:
+                text_el = _find(output_entry_el, "text")
+                if text_el is not None and text_el.text:
+                    target = text_el.text
+
+            rules.append({
+                "rule_id": rule_id,
+                "decision_id": decision_id,
+                "decision_name": decision_name,
+                "when": condition,
+                "then": target,
+                "condition": condition,
+                "target": target,
+            })
+
+    return {"dmn_decisions": decisions, "dmn_rules": rules}

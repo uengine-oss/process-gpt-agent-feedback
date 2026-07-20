@@ -40,8 +40,8 @@ from core.database import (
     mark_batch_proposed,
     mark_feedback_collected_count,
     update_feedback_status,
-    _generate_dmn_proc_def_id,
     _get_agent_by_id,
+    _get_dmn_definition_from_xml,
     _get_proc_def_definition,
     merge_dmn_artifact_into_definition,
     merge_process_definition_artifact_into_definition,
@@ -226,17 +226,6 @@ async def _representative_agent(rows: List[Dict[str, Any]]) -> Optional[Dict[str
     return None
 
 
-def _representative_feedback_author(collected_items: List[Dict[str, Any]]) -> Optional[str]:
-    """가장 최근 피드백을 남긴 사람의 user_id. 담당 에이전트가 없는 DMN_RULE CREATE의
-    owner로 쓴다."""
-    items_sorted = sorted(collected_items, key=lambda x: x.get("time", ""), reverse=True)
-    for item in items_sorted:
-        uid = str(item.get("user_id") or "").strip()
-        if uid:
-            return uid
-    return None
-
-
 def _feedback_author_ids(collected_items: List[Dict[str, Any]]) -> List[str]:
     """피드백을 남긴 모든 user_id를 최초 기여 시각 순으로, 중복 없이 반환한다.
     resource_pull_requests.requester_id(uuid[])에 그대로 들어간다 — 이 배치의
@@ -250,8 +239,13 @@ def _feedback_author_ids(collected_items: List[Dict[str, Any]]) -> List[str]:
     return list(seen.keys())
 
 
-async def _fill_target_identity(batch: Dict[str, Any], target: Dict[str, Any]) -> None:
-    """target(SKILL/DMN_RULE/PROCESS_DEFINITION)에 실제 리소스를 가리키는 id/name을 채운다.
+async def _fill_target_identity(batch: Dict[str, Any], target: Dict[str, Any]) -> bool:
+    """target(SKILL/DMN_RULE/PROCESS_DEFINITION)이 가리킬 수 있는 기존 리소스가 실제로
+    있는지 확인하고, 있으면 target["id"]/["name"]을 채운다.
+
+    이 시스템은 피드백 기반 "개선"만 다룬다 — 신규 생성 경로는 없다. 매칭되는 기존
+    리소스가 없거나(PASS 판정) 이미 삭제된 경우 False를 반환해 호출부가 이 target을
+    제안에서 아예 제외하게 한다.
 
     PROCESS_DEFINITION은 배치의 proc_def_id 자체이므로 바로 확정된다. SKILL/DMN_RULE은
     배치의 대표 에이전트(없으면 활동 귀속) 기준으로 한 번만 계산하는 미리보기 값이다 —
@@ -262,9 +256,12 @@ async def _fill_target_identity(batch: Dict[str, Any], target: Dict[str, Any]) -
 
     if ttype == "PROCESS_DEFINITION":
         proc_def_id = batch.get("proc_def_id", "")
+        name = fetch_proc_def_name(tenant_id, proc_def_id)
+        if not name:
+            return False
         target["id"] = proc_def_id
-        target["name"] = fetch_proc_def_name(tenant_id, proc_def_id)
-        return
+        target["name"] = name
+        return True
 
     items = batch.get("collected_items") or []
     todo_ids = [item.get("todo_id") for item in items if item.get("todo_id")]
@@ -282,23 +279,32 @@ async def _fill_target_identity(batch: Dict[str, Any], target: Dict[str, Any]) -
             )
         candidates = [{"name": n, "description": ""} for n in candidate_names]
         resolved = await resolve_skill_identity(str(target.get("artifact") or ""), candidates)
+        if resolved["decision"] != "UPDATE":
+            return False
         target["id"] = resolved["name"]
         target["name"] = resolved["name"]
-        return
+        # skill_name: process-gpt-vue3의 이미 배포된 skill-proposal-indicator 기능이
+        # 사이드바/스킬 관리 페이지의 "!" 배지를 이 필드(tenant_skills.skill_name과 동일
+        # 문자열)로 매칭한다(useSkillProposals.js buildSkillProposalMap). id/name과 항상
+        # 같은 값이지만, 그 기존 계약을 깨지 않기 위해 별도로 채운다.
+        target["skill_name"] = resolved["name"]
+        return True
 
     if ttype == "DMN_RULE":
+        # DMN은 agent_id로만 후보를 조회한다(list_agent_dmn_rules) — 담당 에이전트가
+        # 없으면 비교할 기존 리소스가 애초에 없으므로 PASS 외의 결과가 나올 수 없다.
+        if not agent:
+            return False
         artifact = target.get("artifact") or {}
-        decision_name = (artifact.get("decision") or {}).get("name", "")
-        if agent:
-            candidates = list_agent_dmn_rules(tenant_id, agent.get("id", ""))
-            resolved = await resolve_dmn_identity(artifact, candidates)
-            if resolved["decision"] == "UPDATE" and resolved.get("id"):
-                target["id"] = resolved["id"]
-                target["name"] = resolved["name"]
-                return
-            decision_name = resolved.get("name") or decision_name
-        target["id"] = None
-        target["name"] = f"(신규 생성 예정) {decision_name}".strip()
+        candidates = list_agent_dmn_rules(tenant_id, agent.get("id", ""))
+        resolved = await resolve_dmn_identity(artifact, candidates)
+        if resolved["decision"] != "UPDATE" or not resolved.get("id"):
+            return False
+        target["id"] = resolved["id"]
+        target["name"] = resolved["name"]
+        return True
+
+    return False
 
 
 async def _process_triggered_batch(batch: Dict[str, Any]) -> None:
@@ -307,22 +313,31 @@ async def _process_triggered_batch(batch: Dict[str, Any]) -> None:
 
     targets = await classify_and_extract_proposal(items, task_description="")
 
-    if not targets:
+    async def _discard(reason: str) -> None:
         if await mark_batch_discarded(batch_id):
             for item in items:
                 todo_id = item.get("todo_id")
                 if todo_id:
                     await update_feedback_status(todo_id, "REJECTED")
-            log(f"배치 폐기(공통 관심사 없음): batch_id={batch_id}")
+            log(f"배치 폐기({reason}): batch_id={batch_id}")
+
+    if not targets:
+        await _discard("공통 관심사 없음")
         return
 
+    kept_targets = []
     for target in targets:
-        await _fill_target_identity(batch, target)
+        if await _fill_target_identity(batch, target):
+            kept_targets.append(target)
+
+    if not kept_targets:
+        await _discard("개선할 기존 리소스 없음")
+        return
 
     # candidate_skill_names: SKILL target.id/name이 대표값을 이미 담으므로 더는 계산하지
     # 않는다. 컬럼/응답 필드 자체는 다른 소비자를 위해 남겨두고 항상 빈 배열만 전달한다.
-    if await mark_batch_proposed(batch_id, targets, []):
-        target_types = [t.get("type") for t in targets]
+    if await mark_batch_proposed(batch_id, kept_targets, []):
+        target_types = [t.get("type") for t in kept_targets]
         log(f"배치 제안 생성: batch_id={batch_id}, targets={target_types}")
 
 
@@ -501,14 +516,16 @@ async def apply_approved_dmn_target(
     artifact: Dict[str, Any],
     approver_id: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    """승인된 DMN_RULE target을 실제 DMN 리소스(들)에 반영한다.
+    """승인된 DMN_RULE target을 기존 DMN 리소스(들)에 반영한다.
 
     배치 워크아이템의 담당 에이전트마다 그 에이전트가 소유한 기존 DMN(agent_id=해당
-    에이전트, type='dmn')이 이번 피드백과 관련 있는지 판단해 있으면 UPDATE, 없으면
-    새 DMN을 CREATE한다. 담당 에이전트가 없으면 새 DMN 1건을 만들고 owner를 가장
-    최근 피드백 작성자로 지정한다. 라이브 proc_def는 쓰지 않는다: draft 생성과 PR
-    오픈까지가 이 함수의 책임이다(add-feedback-proposal-apply design.md Non-Goals).
-    여러 에이전트에 걸치면 여러 draft/PR이 만들어질 수 있어 결과를 리스트로 반환한다.
+    에이전트, type='dmn') 중 이번 피드백과 관련된 것을 찾아 UPDATE한다 — 신규 DMN
+    생성 경로는 없다: 피드백 기반 "개선"만 다루는 이 시스템에서, 비교할 기존 DMN이
+    없으면(PASS 판정) 그 에이전트는 건너뛴다. 담당 에이전트가 아예 없으면 애초에
+    비교할 기존 리소스가 없으므로 이 배치의 DMN_RULE은 통째로 건너뛴다. 라이브
+    proc_def는 쓰지 않는다: draft 생성과 PR 오픈까지가 이 함수의 책임이다
+    (add-feedback-proposal-apply design.md Non-Goals). 여러 에이전트에 걸치면 여러
+    draft/PR이 만들어질 수 있어 결과를 리스트로 반환한다.
 
     병합 요청의 requester는 배치의 피드백 작성자들(collected_items의 user_id,
     중복 제거), reviewer는 approver_id다 — 여러 draft/PR로 팬아웃해도 모두 동일한
@@ -521,26 +538,13 @@ async def apply_approved_dmn_target(
     todo_ids = [item.get("todo_id") for item in collected_items if item.get("todo_id")]
     requester_ids = _feedback_author_ids(collected_items)
 
-    async def _apply_for_owner(
-        dmn_id: Optional[str], owner_label: str, agent_id: Optional[str], owner_user_id: Optional[str]
-    ) -> Dict[str, Any]:
-        is_new = dmn_id is None
-        if is_new:
-            dmn_id = _generate_dmn_proc_def_id()
-            live_definition: Dict[str, Any] = {}
-            parent_version = None
-        else:
-            live_definition = _get_proc_def_definition(tenant_id, dmn_id) or {}
-            parent_version = live_definition.get("version")
+    async def _apply_for_owner(dmn_id: str, owner_label: str) -> Dict[str, Any]:
+        live_definition = _get_dmn_definition_from_xml(tenant_id, dmn_id)
+        if live_definition is None:
+            log(f"⚠️ 개선 대상 DMN이 더는 존재하지 않음, 건너뜀: batch_id={batch_id}, dmn_id={dmn_id}")
+            return {"applied": False, "error": "dmn_not_found", "owner": owner_label}
 
         merged_definition = merge_dmn_artifact_into_definition(live_definition, artifact)
-        if is_new:
-            # 아직 라이브 proc_def 행이 없으므로 귀속 정보를 definition에 함께 남긴다 —
-            # 이 draft가 나중에 머지될 때 실제 proc_def 행(agent_id/owner/name)을
-            # 만드는 데 필요하다.
-            merged_definition["name"] = decision_name
-            merged_definition["agent_id"] = agent_id
-            merged_definition["owner"] = owner_user_id
 
         new_version = compute_next_draft_version(tenant_id, dmn_id)
         xml_snapshot = dmn_decisions_rules_to_xml(
@@ -556,7 +560,7 @@ async def apply_approved_dmn_target(
             definition=merged_definition,
             snapshot=xml_snapshot,
             message=f"피드백 기반 DMN 규칙 제안({owner_label}): {decision_name}",
-            parent_version=parent_version,
+            parent_version=None,
             source_todolist_id=todo_ids[0] if todo_ids else None,
         )
         if not version_row:
@@ -564,8 +568,6 @@ async def apply_approved_dmn_target(
             return {"applied": False, "error": "draft_version_failed", "owner": owner_label}
 
         description = f"피드백 기반 자동 DMN 규칙 제안입니다({owner_label}). draft version={new_version}"
-        if is_new:
-            description += " — 신규 DMN, 머지 시 proc_def 행 생성 필요"
 
         pr_row = insert_dmn_merge_request(
             tenant_id=tenant_id,
@@ -602,27 +604,25 @@ async def apply_approved_dmn_target(
 
     results: List[Dict[str, Any]] = []
 
-    if agents:
-        matching = await match_feedback_to_agents(_dmn_artifact_as_text(artifact), agents)
-        agent_feedbacks = matching.get("agent_feedbacks", [])
-        if not agent_feedbacks:
-            log(f"매칭된 DMN 담당 에이전트 없음: batch_id={batch_id}")
-        for fb_item in agent_feedbacks:
-            aid = fb_item.get("agent_id")
-            aname = fb_item.get("agent_name", "Unknown")
-            if not aid:
-                continue
-            candidates = list_agent_dmn_rules(tenant_id, aid)
-            resolved = await resolve_dmn_identity(artifact, candidates)
-            existing_id = resolved.get("id") if resolved.get("decision") == "UPDATE" else None
-            results.append(
-                await _apply_for_owner(existing_id, f"에이전트: {aname}", agent_id=aid, owner_user_id=None)
-            )
-    else:
-        owner_user_id = _representative_feedback_author(batch.get("collected_items") or [])
-        results.append(
-            await _apply_for_owner(None, f"작성자: {owner_user_id}", agent_id=None, owner_user_id=owner_user_id)
-        )
+    if not agents:
+        log(f"담당 에이전트 없음 — 개선할 기존 DMN을 특정할 수 없어 건너뜀: batch_id={batch_id}")
+        return results
+
+    matching = await match_feedback_to_agents(_dmn_artifact_as_text(artifact), agents)
+    agent_feedbacks = matching.get("agent_feedbacks", [])
+    if not agent_feedbacks:
+        log(f"매칭된 DMN 담당 에이전트 없음: batch_id={batch_id}")
+    for fb_item in agent_feedbacks:
+        aid = fb_item.get("agent_id")
+        aname = fb_item.get("agent_name", "Unknown")
+        if not aid:
+            continue
+        candidates = list_agent_dmn_rules(tenant_id, aid)
+        resolved = await resolve_dmn_identity(artifact, candidates)
+        if resolved.get("decision") != "UPDATE" or not resolved.get("id"):
+            log(f"매칭되는 기존 DMN 없음, 건너뜀: batch_id={batch_id}, agent={aname}")
+            continue
+        results.append(await _apply_for_owner(resolved["id"], f"에이전트: {aname}"))
 
     return results
 

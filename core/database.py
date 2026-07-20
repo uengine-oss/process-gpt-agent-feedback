@@ -400,9 +400,15 @@ async def mark_batch_proposed(
 ) -> bool:
     """분류된 target(s)을 반영해 COLLECTING → PROPOSED로 전환 (중복 트리거 방지를 위해 COLLECTING인 것만).
 
-    targets: [{"type": "SKILL"|"DMN_RULE"|"PROCESS_DEFINITION", "artifact": ...}, ...]
-    각 항목에 status=PENDING과 빈 결정 필드를 채워 저장한다 — 결정은 target별로 독립적으로 이뤄진다
-    (core.database.mark_target_decision).
+    targets: [{"type": "SKILL"|"DMN_RULE"|"PROCESS_DEFINITION", "artifact": ..., "id": ..., "name": ...,
+    "skill_name": ... (SKILL만)}, ...]
+    id/name은 _fill_target_identity가 채운, 이 target이 가리키는 실제 기존 리소스의
+    식별자다 — 클라이언트가 사이드바/상세 화면에 제안 배지를 매칭시키는 데 쓰므로
+    반드시 그대로 보존해야 한다(이전에 여기서 빠뜨려 클라이언트에 전달되지 않던 버그
+    수정). skill_name은 SKILL target에서 process-gpt-vue3의 기존 skill-proposal-indicator
+    기능이 요구하는 매칭 키(id/name과 동일 값)이므로 함께 보존한다. 각 항목에
+    status=PENDING과 빈 결정 필드를 채워 저장한다 — 결정은 target별로 독립적으로
+    이뤄진다(core.database.mark_target_decision).
     """
     try:
         supabase = get_db_client()
@@ -410,6 +416,9 @@ async def mark_batch_proposed(
             {
                 "type": t.get("type"),
                 "artifact": t.get("artifact"),
+                "id": t.get("id"),
+                "name": t.get("name"),
+                "skill_name": t.get("skill_name"),
                 "status": "PENDING",
                 "decided_by": None,
                 "decided_by_name": None,
@@ -543,6 +552,7 @@ def _get_proc_def_definition(tenant_id: str, proc_def_id: str) -> Optional[Dict[
             .select("definition")
             .eq("tenant_id", tid)
             .eq("id", pdid)
+            .eq("isdeleted", False)
             .limit(1)
             .execute()
         )
@@ -556,7 +566,8 @@ def _get_proc_def_definition(tenant_id: str, proc_def_id: str) -> Optional[Dict[
 
 
 def fetch_proc_def_name(tenant_id: str, proc_def_id: str) -> Optional[str]:
-    """proc_def.name 조회. PROCESS_DEFINITION/DMN_RULE target의 name 채우기에 쓴다."""
+    """proc_def.name 조회. PROCESS_DEFINITION/DMN_RULE target의 name 채우기에 쓴다.
+    isdeleted=True인 행은 "존재하지 않음"으로 취급해 None을 반환한다."""
     tid = (tenant_id or "").strip()
     pdid = (proc_def_id or "").strip()
     if not (tid and pdid):
@@ -568,6 +579,7 @@ def fetch_proc_def_name(tenant_id: str, proc_def_id: str) -> Optional[str]:
             .select("name")
             .eq("tenant_id", tid)
             .eq("id", pdid)
+            .eq("isdeleted", False)
             .limit(1)
             .execute()
         )
@@ -578,11 +590,48 @@ def fetch_proc_def_name(tenant_id: str, proc_def_id: str) -> Optional[str]:
         return None
 
 
+def _get_dmn_definition_from_xml(tenant_id: str, proc_def_id: str) -> Optional[Dict[str, Any]]:
+    """type='dmn' proc_def 행의 실제 규칙을 조회한다.
+
+    이 타입의 행은 definition이 null인 게 정상 설계다 — 규칙은 bpmn 컬럼에 DMN 1.3
+    XML로만 저장된다(process-gpt-deepagents의 get_process_detail과 동일 컨벤션).
+    isdeleted=True거나 행이 없으면 "개선 대상이 더는 존재하지 않음" 신호로 None을
+    반환한다 — 호출부가 draft/PR 생성을 건너뛰게 하기 위함이다. 행은 있는데 bpmn이
+    비어 있으면(아직 규칙 없는 빈 DMN) 빈 규칙 dict를 반환한다.
+    """
+    tid = (tenant_id or "").strip()
+    pdid = (proc_def_id or "").strip()
+    if not (tid and pdid):
+        return None
+    try:
+        supabase = get_db_client()
+        resp = (
+            supabase.table("proc_def")
+            .select("bpmn")
+            .eq("tenant_id", tid)
+            .eq("id", pdid)
+            .eq("type", "dmn")
+            .eq("isdeleted", False)
+            .limit(1)
+            .execute()
+        )
+        rows = resp.data or []
+        if not rows:
+            return None
+        xml_text = rows[0].get("bpmn")
+        from core.dmn_xml import xml_to_dmn_decisions_rules
+        return xml_to_dmn_decisions_rules(xml_text or "")
+    except Exception as e:
+        handle_error("DMN XML조회", e)
+        return None
+
+
 def list_agent_dmn_rules(tenant_id: str, agent_id: str) -> List[Dict[str, Any]]:
     """특정 에이전트가 소유한 DMN 규칙 목록(proc_def.type='dmn', agent_id=agent_id) 조회.
 
-    search_similar_skills와 같은 모양({"id","name","description"})으로 반환해
-    resolve_dmn_identity에 후보로 그대로 넘길 수 있게 한다.
+    resolve_dmn_identity에 후보({"id","name"})로 그대로 넘길 수 있게 한다. proc_def에는
+    description 컬럼이 없으므로 조회하지 않는다 — resolve_dmn_identity는 description이
+    없으면 빈 문자열로 처리한다.
     """
     tid = (tenant_id or "").strip()
     aid = (agent_id or "").strip()
@@ -592,7 +641,7 @@ def list_agent_dmn_rules(tenant_id: str, agent_id: str) -> List[Dict[str, Any]]:
         supabase = get_db_client()
         resp = (
             supabase.table("proc_def")
-            .select("id,name,description")
+            .select("id,name")
             .eq("tenant_id", tid)
             .eq("agent_id", aid)
             .eq("type", "dmn")
@@ -603,12 +652,6 @@ def list_agent_dmn_rules(tenant_id: str, agent_id: str) -> List[Dict[str, Any]]:
     except Exception as e:
         handle_error("에이전트DMN목록조회", e)
         return []
-
-
-def _generate_dmn_proc_def_id() -> str:
-    """새 DMN proc_def id 생성. 실측된 컨벤션(dmn_<16자리 hex>)을 따른다."""
-    import secrets
-    return f"dmn_{secrets.token_hex(8)}"
 
 
 def load_activity_skills(tenant_id: str, proc_def_id: str, activity_id: str) -> List[str]:

@@ -11,7 +11,6 @@ from core.database import (
     _get_agent_by_id,
 )
 from core.skill_api_client import (
-    upload_skill,
     update_skill_file,
     delete_skill,
     check_skill_exists,
@@ -61,7 +60,9 @@ async def commit_to_skill(
         agent_id: 에이전트 ID. None이면 담당 에이전트가 없는 배치용 경로로 동작하며,
             tenant_id/activity_ref가 대신 필요하다.
         skill_artifact: Skill 정보 (name, steps, description, overview, usage, additional_files)
-        operation: "CREATE" | "UPDATE" | "DELETE"
+        operation: "CREATE" | "UPDATE" | "DELETE" — CREATE는 지원하지 않는다(피드백 기반
+            기존 스킬 개선만 다루는 시스템 정책). UPDATE 대상이 존재하지 않을 때도 내부적으로
+            operation이 "CREATE"로 바뀌지만, 이 경우도 포함해 아무 것도 하지 않고 건너뛴다.
         skill_id: UPDATE/DELETE 시 기존 스킬 이름
         merge_mode: UPDATE 시 MERGE | REPLACE
         relationship_analysis: 관계 분석 결과
@@ -69,8 +70,7 @@ async def commit_to_skill(
         tenant_id: agent_id가 없을 때 스킬을 저장할 테넌트 (배치에서 직접 전달, agent 조회로 유추하지 않음)
         activity_ref: agent_id가 없을 때 스킬을 귀속시킬 활동 {"tenant_id", "proc_def_id", "activity_id"}
         requester_ids: UPDATE 시 열리는 스킬 병합 요청의 requester(피드백 작성자 user_id
-            목록, 중복 제거). CREATE는 git PR을 만들지 않으므로(upload_skill, ZIP 업로드)
-            쓰이지 않는다(fix-merge-request-requester).
+            목록, 중복 제거)(fix-merge-request-requester).
         reviewer_id: UPDATE 시 열리는 스킬 병합 요청의 reviewer(승인자).
     """
     try:
@@ -114,7 +114,7 @@ async def commit_to_skill(
 
             try:
                 if not check_skill_exists(skill_name, resolved_tenant_id or ""):
-                    log(f"   ⚠️ 스킬이 존재하지 않습니다. CREATE로 전환: {skill_name}")
+                    log(f"   ⚠️ 스킬이 존재하지 않습니다. 생성 미지원 — 건너뜀: {skill_name}")
                     operation = "CREATE"
                 else:
                     skill_document = _format_skill_document(
@@ -151,43 +151,15 @@ async def commit_to_skill(
                     return
 
             except Exception as e:
-                log(f"   ⚠️ 스킬 수정 실패, CREATE로 전환: {e}")
+                log(f"   ⚠️ 스킬 수정 실패, 생성 미지원 — 건너뜀: {e}")
                 operation = "CREATE"
 
         if operation == "CREATE":
-            log(f"✅ SKILL 저장 시작: 귀속={agent_id or activity_ref}, skill_name={skill_name}")
-
-            try:
-                if agent_id and not agent_info:
-                    raise ValueError(f"에이전트를 찾을 수 없습니다: agent_id={agent_id}")
-                if not resolved_tenant_id:
-                    raise ValueError(
-                        f"tenant_id를 확인할 수 없습니다: agent_id={agent_id}, tenant_id={tenant_id}"
-                    )
-                if not agent_id and not activity_ref:
-                    raise ValueError("agent_id가 없으면 activity_ref(귀속 대상 활동)가 필요합니다.")
-
-                if check_skill_exists(skill_name, resolved_tenant_id or ""):
-                    raise ValueError(f"스킬 '{skill_name}'이(가) 이미 존재합니다. 수정하려면 UPDATE를 사용하세요.")
-
-                skill_document = _format_skill_document(
-                    skill_name, steps, description=description, overview=overview, usage=usage, body_markdown=body_markdown
-                )
-
-                result = upload_skill(
-                    skill_name=skill_name,
-                    skill_content=skill_document,
-                    tenant_id=resolved_tenant_id,
-                    additional_files=additional_files if additional_files else None,
-                )
-
-                log(f"   ✅ SKILL 저장 완료: skill_name={skill_name}")
-
-                _sync_skill_attribution(agent_id, activity_ref, skill_name, "CREATE")
-
-            except Exception as e:
-                log(f"   ❌ SKILL 저장 실패: {e}")
-                raise
+            # 이 시스템은 피드백 기반 기존 스킬 개선만 다룬다 — 신규 생성 경로는 없다.
+            # UPDATE 대상이 존재하지 않을 때도(위 두 분기) 여기로 흘러들어오므로, 두
+            # 경우 모두 조용히 건너뛴다.
+            log(f"⏭️ 스킬 생성 미지원, 건너뜀: 귀속={agent_id or activity_ref}, skill_name={skill_name}")
+            return
 
     except Exception as e:
         handle_error(f"SKILL{operation}", e)

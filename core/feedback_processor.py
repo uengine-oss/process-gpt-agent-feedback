@@ -250,11 +250,14 @@ async def classify_and_extract_proposal(
 
 
 async def resolve_skill_identity(artifact_text: str, candidates: List[Dict[str, Any]]) -> Dict[str, str]:
-    """SKILL target이 CREATE(새 스킬)인지 UPDATE(기존 스킬)인지, 어떤 이름을 쓸지 결정한다.
+    """SKILL target이 UPDATE(기존 스킬 개선) 대상인지, 겹치는 기존 스킬이 없어 건너뛰어야
+    (PASS) 하는지 판단한다. 이 시스템은 피드백 기반 기존 스킬 개선만 다룬다 — 새 스킬
+    생성 경로는 없으므로 "새 스킬이 필요하다"는 판단은 CREATE가 아니라 PASS(개선할 대상
+    없음, 호출부가 target을 폐기)로 표현한다.
 
     candidates는 유사도 점수로 미리 걸러내지 않고 이름+설명 전체를 그대로 LLM에 보여준다
     (progressive disclosure) — 임베딩 유사도 검색 대신 LLM이 직접 읽고 판단하게 한다.
-    실패 시 CREATE + artifact 요약 기반 이름으로 폴백한다(항상 결과를 반환).
+    실패 시 PASS로 폴백한다(항상 결과를 반환).
     """
     llm = create_llm(streaming=False, temperature=0)
 
@@ -263,7 +266,8 @@ async def resolve_skill_identity(artifact_text: str, candidates: List[Dict[str, 
     ) or "없음"
 
     prompt = f"""
-아래 피드백(스킬 절차 규칙)이 기존 스킬 중 하나를 고치는 것인지, 새 스킬이 필요한지 판단하세요.
+아래 피드백(스킬 절차 규칙)이 기존 스킬 중 하나를 고치는 것인지 판단하세요. 이 시스템은
+기존 스킬 개선만 다루며 새 스킬을 만들지 않습니다.
 
 **피드백(제안된 규칙):**
 {artifact_text}
@@ -273,32 +277,34 @@ async def resolve_skill_identity(artifact_text: str, candidates: List[Dict[str, 
 
 **판단 기준:**
 - 기존 스킬 중 하나와 다루는 절차/범위가 명확히 겹치면 UPDATE, 그 스킬의 정확한 이름을 그대로 쓰세요.
-- 겹치는 기존 스킬이 없으면 CREATE, 피드백 내용을 짧고 명확하게 나타내는 새 이름을 지으세요
-  (소문자, 하이픈으로 구분된 kebab-case, 예: minwon-urgency-evidence-protocol).
+- 겹치는 기존 스킬이 없으면 PASS로 응답하세요 (새 이름을 짓지 마세요 — 이 시스템은 새 스킬을 생성하지 않습니다).
 
 **응답 형식(JSON만):**
-{{"decision": "CREATE 또는 UPDATE", "name": "스킬 이름"}}
+{{"decision": "PASS 또는 UPDATE", "name": "UPDATE일 때 기존 스킬 이름, PASS면 빈 문자열"}}
 """
 
     try:
         response = await llm.ainvoke(prompt)
         parsed = json.loads(clean_json_response(response.content))
-        decision = (parsed.get("decision") or "CREATE").strip().upper()
+        decision = (parsed.get("decision") or "PASS").strip().upper()
         name = (parsed.get("name") or "").strip()
-        if not name:
-            raise ValueError("빈 이름 응답")
-        return {"decision": decision if decision in ("CREATE", "UPDATE") else "CREATE", "name": name}
+        if decision == "UPDATE" and not name:
+            decision = "PASS"
+        return {"decision": decision if decision in ("PASS", "UPDATE") else "PASS", "name": name}
     except Exception as e:
         handle_error("스킬식별판단", e)
-        return {"decision": "CREATE", "name": (artifact_text or "새 스킬")[:40].strip()}
+        return {"decision": "PASS", "name": ""}
 
 
 async def resolve_dmn_identity(artifact: Dict[str, Any], candidates: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """DMN_RULE target이 CREATE(새 DMN)인지 UPDATE(기존 DMN)인지, 어떤 id/name을 쓸지 결정한다.
+    """DMN_RULE target이 UPDATE(기존 DMN 개선) 대상인지, 겹치는 기존 DMN이 없어
+    건너뛰어야(PASS) 하는지, 어떤 id/name을 쓸지 결정한다. 이 시스템은 피드백 기반 기존
+    DMN 개선만 다룬다 — 새 DMN 생성 경로는 없으므로 "새 DMN이 필요하다"는 판단은 CREATE가
+    아니라 PASS(개선할 대상 없음, 호출부가 target/에이전트를 건너뜀)로 표현한다.
 
     candidates는 특정 에이전트가 소유한 기존 DMN 목록({"id","name","description"}) —
     이름+설명 전체를 LLM에 보여주고 판단하게 한다(progressive disclosure, 유사도 검색 아님).
-    실패 시 CREATE + artifact의 decision.name으로 폴백한다(항상 결과를 반환).
+    실패 시 PASS로 폴백한다(항상 결과를 반환).
     """
     llm = create_llm(streaming=False, temperature=0)
 
@@ -312,8 +318,8 @@ async def resolve_dmn_identity(artifact: Dict[str, Any], candidates: List[Dict[s
     ) or "없음"
 
     prompt = f"""
-아래 새 DMN 규칙 제안이 이 에이전트가 이미 가지고 있는 DMN 규칙 중 하나를 고치는 것인지,
-새 DMN 규칙이 필요한지 판단하세요.
+아래 새 DMN 규칙 제안이 이 에이전트가 이미 가지고 있는 DMN 규칙 중 하나를 고치는 것인지
+판단하세요. 이 시스템은 기존 DMN 개선만 다루며 새 DMN을 만들지 않습니다.
 
 **제안된 DMN 규칙:**
 이름: {artifact_name}
@@ -324,21 +330,21 @@ async def resolve_dmn_identity(artifact: Dict[str, Any], candidates: List[Dict[s
 
 **판단 기준:**
 - 기존 규칙 중 하나와 판단 대상/범위가 명확히 겹치면 UPDATE, 그 규칙의 정확한 id를 그대로 쓰세요.
-- 겹치는 기존 규칙이 없으면 CREATE로 응답하세요 (id는 비워둠).
+- 겹치는 기존 규칙이 없으면 PASS로 응답하세요 (id는 비워둠).
 
 **응답 형식(JSON만):**
-{{"decision": "CREATE 또는 UPDATE", "id": "UPDATE일 때 기존 id, CREATE면 빈 문자열", "name": "규칙 이름"}}
+{{"decision": "PASS 또는 UPDATE", "id": "UPDATE일 때 기존 id, PASS면 빈 문자열", "name": "규칙 이름"}}
 """
 
     try:
         response = await llm.ainvoke(prompt)
         parsed = json.loads(clean_json_response(response.content))
-        decision = (parsed.get("decision") or "CREATE").strip().upper()
+        decision = (parsed.get("decision") or "PASS").strip().upper()
         rid = (parsed.get("id") or "").strip() or None
-        name = (parsed.get("name") or artifact_name or "새 DMN 규칙").strip()
+        name = (parsed.get("name") or artifact_name or "").strip()
         if decision == "UPDATE" and not rid:
-            decision = "CREATE"
-        return {"decision": decision if decision in ("CREATE", "UPDATE") else "CREATE", "id": rid, "name": name}
+            decision = "PASS"
+        return {"decision": decision if decision in ("PASS", "UPDATE") else "PASS", "id": rid, "name": name}
     except Exception as e:
         handle_error("DMN식별판단", e)
-        return {"decision": "CREATE", "id": None, "name": artifact_name or "새 DMN 규칙"}
+        return {"decision": "PASS", "id": None, "name": artifact_name}

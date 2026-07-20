@@ -19,21 +19,14 @@ class TestSkillArtifactProcessing:
     
     @pytest.mark.asyncio
     @patch('core.learning_committers.skill_committer._get_agent_by_id')
-    @patch('core.learning_committers.skill_committer.upload_skill')
     @patch('core.learning_committers.skill_committer.update_agent_and_tenant_skills')
-    async def test_commit_skill_with_all_fields(self, mock_update_skills, mock_upload, mock_get_agent):
-        """모든 필드가 포함된 스킬 생성 테스트"""
-        # Mock 설정
+    async def test_commit_skill_create_is_noop(self, mock_update_skills, mock_get_agent):
+        """CREATE는 지원하지 않는다 — 아무 것도 생성/귀속하지 않고 조용히 건너뛴다."""
         mock_get_agent.return_value = {
             "id": "test_agent",
             "tenant_id": "test_tenant"
         }
-        mock_upload.return_value = {
-            "status": "ok",
-            "skills_added": ["테스트 스킬"],
-            "total_skills": 1
-        }
-        
+
         skill_artifact = {
             "name": "테스트 스킬",
             "description": "스킬 설명",
@@ -48,76 +41,46 @@ class TestSkillArtifactProcessing:
                 "scripts/helper.py": "def helper_function():\n    pass"
             }
         }
-        
+
         await commit_to_skill(
             agent_id="test_agent",
             skill_artifact=skill_artifact,
             operation="CREATE"
         )
-        
-        # upload_skill이 호출되었는지 확인
-        mock_upload.assert_called_once()
-        call_args = mock_upload.call_args
-        
-        # skill_content에 개요가 포함되어야 함
-        skill_content = call_args.kwargs['skill_content']
-        assert "## 개요" in skill_content
-        assert skill_artifact["overview"] in skill_content
-        
-        # skill_content에 사용법이 포함되어야 함
-        assert "## 사용법" in skill_content
-        assert skill_artifact["usage"] in skill_content
-        
-        # additional_files가 전달되어야 함
-        assert call_args.kwargs['additional_files'] == skill_artifact["additional_files"]
-    
+
+        # 생성/귀속 어느 쪽도 호출되지 않아야 함
+        mock_update_skills.assert_not_called()
+
     @pytest.mark.asyncio
     @patch('core.learning_committers.skill_committer._get_agent_by_id')
-    @patch('core.learning_committers.skill_committer.upload_skill')
+    @patch('core.learning_committers.skill_committer.check_skill_exists')
+    @patch('core.learning_committers.skill_committer.update_skill_file')
     @patch('core.learning_committers.skill_committer.update_agent_and_tenant_skills')
-    async def test_commit_skill_without_optional_fields(self, mock_update_skills, mock_upload, mock_get_agent):
-        """선택적 필드 없이 스킬 생성 테스트"""
-        # Mock 설정
+    async def test_commit_skill_update_missing_skill_is_noop(
+        self, mock_update_skills, mock_update_file, mock_check_exists, mock_get_agent
+    ):
+        """UPDATE 대상 스킬이 존재하지 않으면 CREATE로 전환하지 않고 건너뛴다."""
         mock_get_agent.return_value = {
             "id": "test_agent",
             "tenant_id": "test_tenant"
         }
-        mock_upload.return_value = {
-            "status": "ok",
-            "skills_added": ["테스트 스킬"],
-            "total_skills": 1
-        }
-        
+        mock_check_exists.return_value = False
+
         skill_artifact = {
             "name": "테스트 스킬",
             "description": "스킬 설명",
-            "steps": [
-                "1단계: 데이터 수집",
-                "2단계: 데이터 분석"
-            ]
+            "steps": ["1단계: 데이터 수집"]
         }
-        
+
         await commit_to_skill(
             agent_id="test_agent",
             skill_artifact=skill_artifact,
-            operation="CREATE"
+            operation="UPDATE",
+            skill_id="테스트 스킬",
         )
-        
-        # upload_skill이 호출되었는지 확인
-        mock_upload.assert_called_once()
-        call_args = mock_upload.call_args
-        
-        # skill_content 확인
-        skill_content = call_args.kwargs['skill_content']
-        assert "## 개요" in skill_content
-        # description이 개요로 사용되어야 함
-        assert skill_artifact["description"] in skill_content
-        
-        # 사용법 섹션이 없어야 함
-        assert "## 사용법" not in skill_content
-        
-        # additional_files가 None이어야 함
-        assert call_args.kwargs['additional_files'] is None
+
+        mock_update_file.assert_not_called()
+        mock_update_skills.assert_not_called()
     
     @pytest.mark.asyncio
     @patch('core.learning_committers.skill_committer._get_agent_by_id')

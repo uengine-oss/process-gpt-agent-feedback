@@ -246,6 +246,8 @@ def create_skill_tools(
         try:
             from core.learning_committers import commit_to_skill as _commit
 
+            if operation == "CREATE":
+                return "❌ 새 스킬 생성은 지원하지 않습니다 — 기존 스킬 개선만 수행합니다. 관련 기존 스킬이 없으면 아무 작업도 하지 마세요."
             if operation == "DELETE" and not (skill_id and str(skill_id).strip()):
                 return "❌ DELETE에는 skill_id(기존 스킬 이름)가 필요합니다."
             if operation == "UPDATE" and not (skill_id and str(skill_id).strip()):
