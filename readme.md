@@ -43,7 +43,7 @@
   → 제안(PROPOSED, target 1개 이상) → 사용자가 target별로 승인/반려
   → (SKILL 승인 시) 피드백 매칭(LLM) → Deep Agent 분석 → 스킬 CRUD(HTTP API) — 담당 에이전트 없으면 활동 귀속
   → (DMN_RULE 승인 시) draft proc_def_version(JSON+XML) + resource_pull_requests 병합 요청 생성 (라이브 proc_def는 그대로)
-  → (PROCESS_DEFINITION 승인 시) draft proc_def_version(activities/sequences/gateways 병합) + resource_pull_requests 병합 요청 생성 (라이브 proc_def는 그대로)
+  → (PROCESS_DEFINITION 승인 시) draft proc_def_version(activities/sequences/gateways 병합, 라이브 BPMN XML 있으면 XML도 병합) + resource_pull_requests 병합 요청 생성 (라이브 proc_def는 그대로)
 ```
 1. **배치 수집**: Supabase `agent_feedback_task` 테이블에서 피드백 작업을 조회해 `(tenant_id, proc_def_id, activity_id)` 기준 배치에 적재 (7초 간격) — 즉시 처리하지 않음
 2. **배치 트리거**: 5건 또는 3일 중 먼저 오는 조건으로 배치를 트리거 대상으로 확인 (900초 간격)
@@ -51,7 +51,7 @@
 4. **승인/반려**: 각 target을 사용자가 개별적으로 승인/거절 (`POST /feedback-proposals/{id}/targets/{type}/approve|reject`)
 5. **`SKILL` target 승인 시** 피드백 매칭(LLM) → Deep Agent 분석 → 스킬 CRUD(HTTP API) 실행. 담당 에이전트가 없으면 활동 전용 경로로 실행되며, 스킬은 `proc_def.definition.activities[].skills`에 귀속된다.
 6. **`DMN_RULE` target 승인 시** 라이브 `proc_def.definition`을 조회해 artifact를 병합한 draft `proc_def_version` 행(JSON + DMN 1.3 XML `snapshot`)을 만들고, `resource_pull_requests`에 병합 요청(`resource_type='dmn'`, `status='OPEN'`)을 연다 — git 저장소는 없고 이 테이블 안에서만 리뷰/이력이 관리된다. 이 draft를 라이브 `proc_def`에 실제로 반영(머지)하는 단계는 아직 없다.
-7. **`PROCESS_DEFINITION` target 승인 시** 라이브 `proc_def.definition`을 조회해 artifact의 activities/sequences/gateways(`ADD`/`MODIFY`)를 사본에 병합한 draft `proc_def_version` 행(`version_tag='major'`)을 만들고, `resource_pull_requests`에 병합 요청(`resource_type='bpmn'`, `status='OPEN'`)을 연다. `DMN_RULE`과 마찬가지로 LLM 호출이나 검증기 없이 id 매칭만으로 병합하며, id가 매칭되지 않는 `MODIFY`는 새 요소로 강등된다(지어낸 id는 재사용하지 않음). 이 draft를 라이브 `proc_def`에 실제로 반영(머지)하는 단계도 아직 없다.
+7. **`PROCESS_DEFINITION` target 승인 시** 라이브 `proc_def.definition`을 조회해 artifact의 activities/sequences/gateways(`ADD`/`MODIFY`)를 사본에 병합한 draft `proc_def_version` 행(`version_tag='minor'`)을 만들고, `resource_pull_requests`에 병합 요청(`resource_type='bpmn'`, `status='OPEN'`)을 연다. `DMN_RULE`과 마찬가지로 LLM 호출이나 검증기 없이 id 매칭만으로 병합하며, id가 매칭되지 않는 `MODIFY`는 새 요소로 강등된다(지어낸 id는 재사용하지 않음). draft의 `snapshot`은 라이브 `proc_def.bpmn`에 실제 BPMN XML이 있으면 같은 변경을 그 XML에 반영해 채우고(`core.bpmn_xml.merge_process_definition_artifact_into_xml`), 라이브 XML이 없거나 병합에 실패하면 병합된 definition의 JSON 문자열로 폴백한다. 이 draft를 라이브 `proc_def`에 실제로 반영(머지)하는 단계도 아직 없다.
 
 - 승인 전까지는 어떤 스킬도, 어떤 `proc_def`도 생성/수정/삭제되지 않는다.
 - `DMN_RULE`/`PROCESS_DEFINITION` draft를 라이브 `proc_def`에 반영(머지)하는 것과, `resource_pull_requests`/`proc_def_version` draft를 실제로 소비하는 리뷰 화면이 있는지는 이 서비스 스코프 밖 — `openspec/changes/add-feedback-proposal-apply/design.md`, `openspec/changes/add-process-definition-apply/design.md`의 Open Questions 참고.

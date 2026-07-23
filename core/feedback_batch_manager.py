@@ -43,6 +43,7 @@ from core.database import (
     _get_agent_by_id,
     _get_dmn_definition_from_xml,
     _get_proc_def_definition,
+    _get_proc_def_bpmn_xml,
     merge_dmn_artifact_into_definition,
     merge_process_definition_artifact_into_definition,
     compute_next_draft_version,
@@ -59,6 +60,7 @@ from core.feedback_processor import (
 from core.polling_manager import get_agents_info
 from core.deep_agent import process_feedback_with_deep_agent
 from core.dmn_xml import dmn_decisions_rules_to_xml
+from core.bpmn_xml import merge_process_definition_artifact_into_xml
 
 # 배치 트리거 임계값 — 5건 또는 3일 중 먼저 오는 조건 (튜닝 가능한 전역 상수로 시작)
 BATCH_TRIGGER_COUNT = 5
@@ -498,8 +500,9 @@ async def apply_approved_proposal(
 # ---------------------------------------------------------------------------
 # 4. 승인된 DMN_RULE target 실행 — 실제 DMN 리소스(proc_def.type='dmn')에 draft
 #    proc_def_version + resource_pull_requests 병합 요청을 만든다. 라이브 proc_def는
-#    건드리지 않는다. SKILL(apply_approved_proposal)과 동일하게 배치 워크아이템의
-#    담당 에이전트별로 팬아웃한다 — DMN은 agent_id로 에이전트에 귀속되기 때문이다.
+#    건드리지 않는다. 이미 승인된 target["id"]에 먼저 적용하고, SKILL(apply_approved_
+#    proposal)과 동일하게 그 외 담당 에이전트에 대해서만 추가로 팬아웃한다 — DMN은
+#    agent_id로 에이전트에 귀속되기 때문이다.
 # ---------------------------------------------------------------------------
 
 def _dmn_artifact_as_text(artifact: Dict[str, Any]) -> str:
@@ -513,19 +516,26 @@ def _dmn_artifact_as_text(artifact: Dict[str, Any]) -> str:
 
 async def apply_approved_dmn_target(
     batch: Dict[str, Any],
-    artifact: Dict[str, Any],
+    target: Dict[str, Any],
     approver_id: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """승인된 DMN_RULE target을 기존 DMN 리소스(들)에 반영한다.
 
-    배치 워크아이템의 담당 에이전트마다 그 에이전트가 소유한 기존 DMN(agent_id=해당
-    에이전트, type='dmn') 중 이번 피드백과 관련된 것을 찾아 UPDATE한다 — 신규 DMN
-    생성 경로는 없다: 피드백 기반 "개선"만 다루는 이 시스템에서, 비교할 기존 DMN이
-    없으면(PASS 판정) 그 에이전트는 건너뛴다. 담당 에이전트가 아예 없으면 애초에
-    비교할 기존 리소스가 없으므로 이 배치의 DMN_RULE은 통째로 건너뛴다. 라이브
-    proc_def는 쓰지 않는다: draft 생성과 PR 오픈까지가 이 함수의 책임이다
-    (add-feedback-proposal-apply design.md Non-Goals). 여러 에이전트에 걸치면 여러
-    draft/PR이 만들어질 수 있어 결과를 리스트로 반환한다.
+    target["id"]/["name"]은 제안 생성 시점(_fill_target_identity)에 대표 에이전트
+    기준으로 이미 식별되어 사람이 승인한 기존 DMN이다 — 그 매칭을 여기서 다시 LLM으로
+    재판단하지 않고 그대로 적용한다. resolve_dmn_identity는 이름만으로(proc_def에
+    description 컬럼이 없음) 판단하는 약한 근거의 LLM 호출이라 같은 입력에도 매번 같은
+    결론을 보장하지 않는데, 승인 시점에 다시 돌리면 이미 승인된 매칭이 조용히 PASS로
+    뒤집혀 개선이 통째로 스킵될 수 있었다(실제 발생 사례: batch_id=a4a21f45-e3e1-4edd-
+    b96a-6817a4a0fc8a).
+
+    배치가 대표 에이전트 외의 다른 에이전트에도 걸쳐 있을 수 있으므로, 그 외 에이전트가
+    소유한 기존 DMN(agent_id=해당 에이전트, type='dmn') 중 이번 피드백과 겹치는 것이
+    있는지는 추가로 찾아 팬아웃한다(이미 적용한 dmn_id는 건너뜀) — 신규 DMN 생성 경로는
+    없다: 피드백 기반 "개선"만 다루는 이 시스템에서, 비교할 기존 DMN이 없으면(PASS 판정)
+    그 에이전트는 건너뛴다. 라이브 proc_def는 쓰지 않는다: draft 생성과 PR 오픈까지가 이
+    함수의 책임이다(add-feedback-proposal-apply design.md Non-Goals). 여러 에이전트에
+    걸치면 여러 draft/PR이 만들어질 수 있어 결과를 리스트로 반환한다.
 
     병합 요청의 requester는 배치의 피드백 작성자들(collected_items의 user_id,
     중복 제거), reviewer는 approver_id다 — 여러 draft/PR로 팬아웃해도 모두 동일한
@@ -533,6 +543,7 @@ async def apply_approved_dmn_target(
     """
     batch_id = batch.get("id")
     tenant_id = batch.get("tenant_id", "")
+    artifact = target.get("artifact") or {}
     decision_name = (artifact.get("decision") or {}).get("name", "")
     collected_items = batch.get("collected_items") or []
     todo_ids = [item.get("todo_id") for item in collected_items if item.get("todo_id")]
@@ -572,6 +583,7 @@ async def apply_approved_dmn_target(
         pr_row = insert_dmn_merge_request(
             tenant_id=tenant_id,
             proc_def_id=dmn_id,
+            version=new_version,
             title=f"[Feedback] {dmn_id} DMN 규칙 개선: {decision_name}",
             description=description,
             requester_ids=requester_ids,
@@ -599,18 +611,27 @@ async def apply_approved_dmn_target(
             "owner": owner_label,
         }
 
+    results: List[Dict[str, Any]] = []
+    applied_dmn_ids: set = set()
+
+    approved_id = target.get("id")
+    if approved_id:
+        results.append(
+            await _apply_for_owner(approved_id, f"승인된 대상: {target.get('name') or approved_id}")
+        )
+        applied_dmn_ids.add(approved_id)
+
     rows = await fetch_todolist_rows_by_ids(todo_ids)
     agents = await get_agents_info(_union_user_ids(rows), _union_assignees(rows))
 
-    results: List[Dict[str, Any]] = []
-
     if not agents:
-        log(f"담당 에이전트 없음 — 개선할 기존 DMN을 특정할 수 없어 건너뜀: batch_id={batch_id}")
+        if not results:
+            log(f"담당 에이전트 없음 — 개선할 기존 DMN을 특정할 수 없어 건너뜀: batch_id={batch_id}")
         return results
 
     matching = await match_feedback_to_agents(_dmn_artifact_as_text(artifact), agents)
     agent_feedbacks = matching.get("agent_feedbacks", [])
-    if not agent_feedbacks:
+    if not agent_feedbacks and not results:
         log(f"매칭된 DMN 담당 에이전트 없음: batch_id={batch_id}")
     for fb_item in agent_feedbacks:
         aid = fb_item.get("agent_id")
@@ -620,8 +641,10 @@ async def apply_approved_dmn_target(
         candidates = list_agent_dmn_rules(tenant_id, aid)
         resolved = await resolve_dmn_identity(artifact, candidates)
         if resolved.get("decision") != "UPDATE" or not resolved.get("id"):
-            log(f"매칭되는 기존 DMN 없음, 건너뜀: batch_id={batch_id}, agent={aname}")
             continue
+        if resolved["id"] in applied_dmn_ids:
+            continue
+        applied_dmn_ids.add(resolved["id"])
         results.append(await _apply_for_owner(resolved["id"], f"에이전트: {aname}"))
 
     return results
@@ -645,6 +668,10 @@ async def apply_approved_process_definition_target(
     라이브 proc_def는 쓰지 않는다: draft 생성과 PR 오픈까지가 이 함수의
     책임이다(add-process-definition-apply design.md Non-Goals).
 
+    draft의 snapshot은 라이브 proc_def.bpmn XML이 있으면 그 XML에 같은 변경을
+    반영해 채운다(merge_process_definition_artifact_into_xml) — 라이브 XML이
+    없거나 병합에 실패하면 병합된 definition의 JSON 문자열로 폴백한다.
+
     병합 요청의 requester/reviewer 귀속은 apply_approved_dmn_target과 동일하다
     (fix-merge-request-requester).
     """
@@ -662,7 +689,14 @@ async def apply_approved_process_definition_target(
         live_definition, artifact
     )
     new_version = compute_next_draft_version(tenant_id, proc_def_id)
-    snapshot = json.dumps(merged_definition, ensure_ascii=False)
+
+    live_bpmn_xml = _get_proc_def_bpmn_xml(tenant_id, proc_def_id)
+    xml_snapshot = (
+        merge_process_definition_artifact_into_xml(live_bpmn_xml, live_definition, merged_definition)
+        if live_bpmn_xml
+        else None
+    )
+    snapshot = xml_snapshot or json.dumps(merged_definition, ensure_ascii=False)
 
     summary = artifact.get("summary", "")
     collected_items = batch.get("collected_items") or []
@@ -678,7 +712,7 @@ async def apply_approved_process_definition_target(
         message=f"피드백 기반 프로세스 흐름 변경 제안: {summary}",
         parent_version=parent_version,
         source_todolist_id=todo_ids[0] if todo_ids else None,
-        version_tag="major",
+        version_tag="minor",
     )
     if not version_row:
         log(f"⚠️ PROCESS_DEFINITION draft 버전 생성 실패: batch_id={batch_id}")
@@ -691,6 +725,7 @@ async def apply_approved_process_definition_target(
     pr_row = insert_bpmn_merge_request(
         tenant_id=tenant_id,
         proc_def_id=proc_def_id,
+        version=new_version,
         title=f"[Feedback] {proc_def_id} 프로세스 흐름 개선: {summary}",
         description=description,
         requester_ids=requester_ids,

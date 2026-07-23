@@ -149,14 +149,14 @@ async def approve_feedback_proposal_target(proposal_id: str, target_type: str, b
         return {"approved": True, "id": proposal_id, "target": target_type, "applied": True}
 
     if target_type == "DMN_RULE":
-        # 에이전트 매칭 + 기존 DMN 식별에 LLM 호출이 필요해 SKILL과 동일하게 백그라운드로
-        # 넘긴다 — 승인 응답은 target 결정 반영까지만 동기로 처리한다.
+        # 추가 에이전트 매칭(팬아웃)에 LLM 호출이 필요해 SKILL과 동일하게 백그라운드로
+        # 넘긴다 — 승인 응답은 target 결정 반영까지만 동기로 처리한다. dmn_target 자체
+        # (id/name 포함)를 넘겨서 이미 승인된 매칭을 apply 단계에서 재판단하지 않는다.
         dmn_target = _find_decided_target(batch, updated, "DMN_RULE") or {}
-        artifact = dmn_target.get("artifact") or {}
         asyncio.create_task(
             apply_approved_dmn_target(
                 updated,
-                artifact,
+                dmn_target,
                 approver_id=body.approver_id,
             )
         )

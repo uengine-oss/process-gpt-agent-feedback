@@ -75,7 +75,7 @@ class TestDmnMergeRequestAttribution:
             ]
         )
 
-        await apply_approved_dmn_target(batch, _ARTIFACT, approver_id="approver-x")
+        await apply_approved_dmn_target(batch, {"artifact": _ARTIFACT}, approver_id="approver-x")
 
         mock_insert_pr.assert_called_once()
         _, kwargs = mock_insert_pr.call_args
@@ -119,7 +119,7 @@ class TestDmnMergeRequestAttribution:
             ]
         )
 
-        await apply_approved_dmn_target(batch, _ARTIFACT, approver_id="both-user")
+        await apply_approved_dmn_target(batch, {"artifact": _ARTIFACT}, approver_id="both-user")
 
         _, kwargs = mock_insert_pr.call_args
         assert kwargs["reviewer_id"] == "both-user"
@@ -134,7 +134,7 @@ class TestDmnMergeRequestAttribution:
         """담당 에이전트가 없으면 비교할 기존 DMN이 없으므로 아무 것도 만들지 않는다."""
         batch = _batch_with_items([{"user_id": "author-a", "time": "2026-07-01T00:00:00Z"}])
 
-        results = await apply_approved_dmn_target(batch, _ARTIFACT, approver_id="approver-x")
+        results = await apply_approved_dmn_target(batch, {"artifact": _ARTIFACT}, approver_id="approver-x")
 
         assert results == []
         mock_insert_pr.assert_not_called()
@@ -152,10 +152,54 @@ class TestDmnMergeRequestAttribution:
         """에이전트는 매칭됐지만 겹치는 기존 DMN이 없으면(PASS 판정) 그 에이전트는 건너뛴다."""
         batch = _batch_with_items([{"user_id": "author-a", "time": "2026-07-01T00:00:00Z"}])
 
-        results = await apply_approved_dmn_target(batch, _ARTIFACT, approver_id="approver-x")
+        results = await apply_approved_dmn_target(batch, {"artifact": _ARTIFACT}, approver_id="approver-x")
 
         assert results == []
         mock_insert_pr.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch("core.feedback_batch_manager.insert_dmn_merge_request")
+    @patch("core.feedback_batch_manager.insert_draft_proc_def_version")
+    @patch("core.feedback_batch_manager.dmn_decisions_rules_to_xml", return_value="<xml/>")
+    @patch("core.feedback_batch_manager.compute_next_draft_version", return_value="1.0")
+    @patch("core.feedback_batch_manager.merge_dmn_artifact_into_definition", return_value={})
+    @patch("core.feedback_batch_manager._get_dmn_definition_from_xml", return_value={})
+    @patch("core.feedback_batch_manager.resolve_dmn_identity", new_callable=AsyncMock, return_value={"decision": "PASS", "id": None, "name": "결정1"})
+    @patch("core.feedback_batch_manager.list_agent_dmn_rules", return_value=_CANDIDATES)
+    @patch("core.feedback_batch_manager.match_feedback_to_agents", new_callable=AsyncMock, return_value=_MATCHING)
+    @patch("core.feedback_batch_manager.get_agents_info", new_callable=AsyncMock, return_value=_AGENTS)
+    @patch("core.feedback_batch_manager.fetch_todolist_rows_by_ids", new_callable=AsyncMock, return_value=[])
+    async def test_approved_target_id_applies_even_when_apply_time_reresolution_would_pass(
+        self,
+        mock_fetch_rows,
+        mock_get_agents,
+        mock_matching,
+        mock_list_candidates,
+        mock_resolve,
+        mock_get_definition,
+        mock_merge,
+        mock_next_version,
+        mock_xml,
+        mock_insert_version,
+        mock_insert_pr,
+    ):
+        """제안 승인 시점에 이미 확정된 target["id"]는, apply 시점의 재판단(resolve_dmn_identity)이
+        PASS를 반환하더라도 그대로 적용된다 — 재판단이 이미 승인된 매칭을 뒤집어 개선이 조용히
+        스킵되던 회귀(batch_id=a4a21f45-...)의 재발 방지 테스트."""
+        mock_insert_version.return_value = {"uuid": "v1"}
+        mock_insert_pr.return_value = {"id": "pr1"}
+
+        batch = _batch_with_items([{"user_id": "author-a", "time": "2026-07-01T00:00:00Z"}])
+        target = {"id": "customer_benefit_decision", "name": "고객 혜택 결정", "artifact": _ARTIFACT}
+
+        results = await apply_approved_dmn_target(batch, target, approver_id="approver-x")
+
+        assert len(results) == 1
+        assert results[0]["applied"] is True
+        assert results[0]["dmn_id"] == "customer_benefit_decision"
+        mock_insert_pr.assert_called_once()
+        _, kwargs = mock_insert_pr.call_args
+        assert kwargs["proc_def_id"] == "customer_benefit_decision"
 
     @pytest.mark.asyncio
     @patch("core.feedback_batch_manager.insert_dmn_merge_request")
@@ -178,7 +222,7 @@ class TestDmnMergeRequestAttribution:
         """식별된 기존 DMN이 적용 직전 삭제된 것으로 확인되면(레이스 컨디션) 건너뛴다."""
         batch = _batch_with_items([{"user_id": "author-a", "time": "2026-07-01T00:00:00Z"}])
 
-        results = await apply_approved_dmn_target(batch, _ARTIFACT, approver_id="approver-x")
+        results = await apply_approved_dmn_target(batch, {"artifact": _ARTIFACT}, approver_id="approver-x")
 
         assert results == [{"applied": False, "error": "dmn_not_found", "owner": "에이전트: 에이전트1"}]
         mock_insert_pr.assert_not_called()

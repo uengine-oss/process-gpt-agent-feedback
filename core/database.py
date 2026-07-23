@@ -565,6 +565,41 @@ def _get_proc_def_definition(tenant_id: str, proc_def_id: str) -> Optional[Dict[
         return None
 
 
+def _get_proc_def_bpmn_xml(tenant_id: str, proc_def_id: str) -> Optional[str]:
+    """proc_def.bpmn 컬럼(있다면 라이브 프로세스의 실제 BPMN 2.0 XML)을 조회한다.
+
+    PROCESS_DEFINITION target 적용 시 draft `proc_def_version.snapshot`을 JSON
+    직렬화 대신 이 실제 XML에 병합하기 위해 쓴다(add-process-definition-apply
+    design.md의 "확립된 BPMN XML 컨벤션 없음" 판단과 달리, 해당 proc_def_id의
+    라이브 XML이 실제로 있으면 그걸 템플릿 삼아 병합할 수 있다 — 표준 태그를
+    새로 지어내지 않는다). 라이브 XML이 없으면(컬럼 비어있음/행 없음) None을
+    반환해 호출부가 JSON snapshot으로 폴백하게 한다.
+    """
+    tid = (tenant_id or "").strip()
+    pdid = (proc_def_id or "").strip()
+    if not (tid and pdid):
+        return None
+    try:
+        supabase = get_db_client()
+        resp = (
+            supabase.table("proc_def")
+            .select("bpmn")
+            .eq("tenant_id", tid)
+            .eq("id", pdid)
+            .eq("isdeleted", False)
+            .limit(1)
+            .execute()
+        )
+        rows = resp.data or []
+        if not rows:
+            return None
+        bpmn = rows[0].get("bpmn")
+        return bpmn if isinstance(bpmn, str) and bpmn.strip() else None
+    except Exception as e:
+        handle_error("proc_def_BPMN조회", e)
+        return None
+
+
 def fetch_proc_def_name(tenant_id: str, proc_def_id: str) -> Optional[str]:
     """proc_def.name 조회. PROCESS_DEFINITION/DMN_RULE target의 name 채우기에 쓴다.
     isdeleted=True인 행은 "존재하지 않음"으로 취급해 None을 반환한다."""
@@ -886,8 +921,7 @@ def insert_draft_proc_def_version(
     행일 뿐이다.
 
     version_tag 기본값은 'minor'다(개별 DMN 규칙 추가는 major 변경이 아니라는
-    기존 DMN_RULE 호출부 동작을 그대로 유지). PROCESS_DEFINITION 호출부는
-    'major'를 명시해서 넘긴다 — 흐름 자체의 구조적 변경이기 때문(design.md 참고).
+    기존 DMN_RULE 호출부 동작을 그대로 유지).
     arcv_id는 실측된 컨벤션(`{proc_def_id}_{version}`)을 따른다.
     """
     tid = (tenant_id or "").strip()
@@ -921,6 +955,7 @@ def insert_draft_proc_def_version(
 def insert_dmn_merge_request(
     tenant_id: str,
     proc_def_id: str,
+    version: str,
     title: str,
     description: str,
     requester_ids: Optional[List[str]] = None,
@@ -932,12 +967,15 @@ def insert_dmn_merge_request(
     dmn/bpmn 리소스는 이 테이블 안에서만 승인/이력 관리가 이루어진다(직접 확인됨).
     그래서 git_pr_number/git_pr_url/git_repo_url은 의도적으로 NULL로 남긴다.
 
+    branch_name에는 이 병합 요청이 가리키는 draft proc_def_version.version 값을
+    그대로 담는다 — 리뷰어가 어떤 draft 행에 대한 요청인지 branch_name만으로
+    바로 알 수 있게 하기 위함이다(draft version 자체가 이미 유일한 접미사를
+    가지므로 타임스탬프로 별도 유일성을 보장할 필요가 없다).
+
     requester_ids는 이 병합 요청을 촉발한 피드백 작성자들(배치의 collected_items
     user_id, 중복 제거)이고, reviewer_id는 target을 승인한 사람이다 — 승인자를
     requester로 기록하던 이전 동작은 fix-merge-request-requester에서 뒤집혔다.
     """
-    import time
-
     tid = (tenant_id or "").strip()
     pdid = (proc_def_id or "").strip()
     if not (tid and pdid):
@@ -949,7 +987,7 @@ def insert_dmn_merge_request(
             "tenant_id": tid,
             "resource_type": "dmn",
             "resource_id": pdid,
-            "branch_name": f"feedback/{pdid}/{int(time.time())}",
+            "branch_name": version,
             "base_branch": "main",
             "title": title,
             "description": description,
@@ -1092,6 +1130,7 @@ def merge_process_definition_artifact_into_definition(
 def insert_bpmn_merge_request(
     tenant_id: str,
     proc_def_id: str,
+    version: str,
     title: str,
     description: str,
     requester_ids: Optional[List[str]] = None,
@@ -1103,10 +1142,9 @@ def insert_bpmn_merge_request(
     resource_type='bpmn'이다 — 실제 git 저장소는 없다(DMN과 동일한 이유:
     dmn/bpmn 리소스는 이 테이블 안에서만 승인/이력 관리가 이루어진다).
 
-    requester_ids/reviewer_id 의미는 insert_dmn_merge_request와 동일하다.
+    branch_name/requester_ids/reviewer_id 의미는 insert_dmn_merge_request와
+    동일하다 — branch_name에는 draft proc_def_version.version 값을 그대로 담는다.
     """
-    import time
-
     tid = (tenant_id or "").strip()
     pdid = (proc_def_id or "").strip()
     if not (tid and pdid):
@@ -1118,7 +1156,7 @@ def insert_bpmn_merge_request(
             "tenant_id": tid,
             "resource_type": "bpmn",
             "resource_id": pdid,
-            "branch_name": f"feedback/{pdid}/{int(time.time())}",
+            "branch_name": version,
             "base_branch": "main",
             "title": title,
             "description": description,

@@ -11,6 +11,19 @@ from xml.etree import ElementTree as ET
 from xml.dom import minidom
 
 DMN_NAMESPACE = "https://www.omg.org/spec/DMN/20191111/MODEL/"
+DMNDI_NAMESPACE = "https://www.omg.org/spec/DMN/20191111/DMNDI/"
+DC_NAMESPACE = "http://www.omg.org/spec/DMN/20180521/DC/"
+DI_NAMESPACE = "http://www.omg.org/spec/DMN/20180521/DI/"
+
+# dmn-js가 여러 decision을 가진 DRD를 렌더링/탐색하려면 dmndi:DMNShape 좌표가
+# 필요하다(없으면 하나의 decision table만 열리고 나머지로 이동할 방법이 없다) —
+# informationRequirement 관계는 이 JSON 스키마가 추적하지 않으므로 grid 배치로
+# 결정 상자 위치만 채운다.
+_DMNDI_COLUMNS = 3
+_DMNDI_H_SPACING = 220
+_DMNDI_V_SPACING = 150
+_DMNDI_SHAPE_WIDTH = 180
+_DMNDI_SHAPE_HEIGHT = 80
 
 
 def dmn_decisions_rules_to_xml(
@@ -25,9 +38,17 @@ def dmn_decisions_rules_to_xml(
     행(rule)으로 채운다. 각 행은 condition(또는 when)을 단일 입력, target(또는
     then)을 단일 출력으로 매핑한다 — 이 시스템의 rule 표현이 자연어 위주라
     엄밀한 FEEL 표현식 대신 텍스트 그대로 옮긴다.
+
+    decision마다 dmndi:DMNShape도 함께 만든다(grid 배치) — dmn-js는 DMNDI 없이는
+    DRD를 그리지 못해 decision이 여럿이어도 그중 하나의 decision table만 열리고
+    나머지로 전환할 길이 없다(실제 발생 사례: customer_benefit_decision 개선
+    draft가 5개 decision 중 1개만 보이던 문제).
     """
     root = ET.Element("definitions", {
         "xmlns": DMN_NAMESPACE,
+        "xmlns:dmndi": DMNDI_NAMESPACE,
+        "xmlns:dc": DC_NAMESPACE,
+        "xmlns:di": DI_NAMESPACE,
         "id": f"definitions_{proc_def_id or 'process'}",
         "name": proc_def_id or "process",
         "namespace": f"https://process-gpt/{proc_def_id or 'process'}",
@@ -39,10 +60,12 @@ def dmn_decisions_rules_to_xml(
             continue
         rules_by_decision.setdefault(rule.get("decision_id", ""), []).append(rule)
 
+    decision_ids_in_order: List[str] = []
     for decision in decisions or []:
         if not isinstance(decision, dict):
             continue
         decision_id = decision.get("decision_id", "")
+        decision_ids_in_order.append(decision_id)
         decision_el = ET.SubElement(root, "decision", {
             "id": decision_id,
             "name": decision.get("name", ""),
@@ -67,6 +90,25 @@ def dmn_decisions_rules_to_xml(
             ET.SubElement(input_entry_el, "text").text = rule.get("condition") or rule.get("when", "")
             output_entry_el = ET.SubElement(rule_el, "outputEntry", {"id": f"{rule_id}_out"})
             ET.SubElement(output_entry_el, "text").text = rule.get("target") or rule.get("then", "")
+
+    if decision_ids_in_order:
+        dmndi_el = ET.SubElement(root, "dmndi:DMNDI")
+        diagram_el = ET.SubElement(dmndi_el, "dmndi:DMNDiagram", {
+            "id": f"DMNDiagram_{proc_def_id or 'process'}",
+        })
+        for idx, decision_id in enumerate(decision_ids_in_order):
+            col = idx % _DMNDI_COLUMNS
+            row = idx // _DMNDI_COLUMNS
+            shape_el = ET.SubElement(diagram_el, "dmndi:DMNShape", {
+                "id": f"DMNShape_{decision_id}",
+                "dmnElementRef": decision_id,
+            })
+            ET.SubElement(shape_el, "dc:Bounds", {
+                "height": str(_DMNDI_SHAPE_HEIGHT),
+                "width": str(_DMNDI_SHAPE_WIDTH),
+                "x": str(60 + col * _DMNDI_H_SPACING),
+                "y": str(60 + row * _DMNDI_V_SPACING),
+            })
 
     raw_xml = ET.tostring(root, encoding="unicode")
     return minidom.parseString(raw_xml).toprettyxml(indent="  ")
