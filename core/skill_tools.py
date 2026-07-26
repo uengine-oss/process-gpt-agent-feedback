@@ -46,6 +46,8 @@ def create_skill_tools(
     activity_ref: Optional[Dict[str, str]] = None,
     requester_ids: Optional[List[str]] = None,
     reviewer_id: Optional[str] = None,
+    contributor_user_ids: Optional[List[str]] = None,
+    contribution_source: str = "direct",
 ) -> list:
     """agent_id 또는 activity_ref가 바인딩된 스킬 도구 목록 생성.
 
@@ -56,6 +58,8 @@ def create_skill_tools(
     requester_ids/reviewer_id는 UPDATE 시 열리는 스킬 병합 요청의 귀속 정보로,
     LLM이 채우는 도구 인자가 아니라 agent_id/activity_ref처럼 클로저에 바인딩된다
     (fix-merge-request-requester).
+    contributor_user_ids/contribution_source는 이 도구 세트로 이뤄지는 commit_to_skill
+    호출에 그대로 바인딩되어 스킬 기여 이력(skill_contributions)에 반영된다.
     """
 
     @tool
@@ -289,6 +293,8 @@ def create_skill_tools(
                 activity_ref=activity_ref if not agent_id else None,
                 requester_ids=requester_ids,
                 reviewer_id=reviewer_id,
+                contributor_user_ids=contributor_user_ids,
+                contribution_source=contribution_source,
             )
 
             owner_label = f"에이전트: {agent_id}" if agent_id else f"활동: {activity_ref}"

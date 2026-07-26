@@ -23,6 +23,7 @@ add-process-definition-apply design.md 참고).
 
 import asyncio
 import json
+import os
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
@@ -68,6 +69,39 @@ BATCH_TRIGGER_MAX_AGE = timedelta(days=3)
 
 # 배치 전체 이벤트 로그 상한 (여러 워크아이템의 이벤트를 합치므로 최신순으로 상한을 둔다)
 _MAX_EVENTS_PER_BATCH = 100
+_STRATEGY_SERVICE_URL = os.getenv("STRATEGY_SERVICE_URL", "http://localhost:8014")
+
+
+def _target_alignment_description(target: Dict[str, Any]) -> str:
+    artifact = target.get("artifact")
+    if isinstance(artifact, str):
+        return artifact
+    return json.dumps(artifact or {}, ensure_ascii=False)
+
+
+async def _attach_alignment_evidence(batch: Dict[str, Any], target: Dict[str, Any]) -> None:
+    """승인 가능한 SKILL/PROCESS_DEFINITION target에 정합성 근거를 붙인다."""
+    if target.get("type") == "DMN_RULE":
+        return
+    body = {"description": _target_alignment_description(target)}
+    if target.get("type") == "PROCESS_DEFINITION":
+        body["proc_def_id"] = batch.get("proc_def_id")
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=5.0)) as client:
+            response = await client.post(
+                f"{_STRATEGY_SERVICE_URL.rstrip('/')}/api/ai/alignment",
+                params={"tenant_id": batch.get("tenant_id", "")}, json=body,
+            )
+            response.raise_for_status()
+            target["alignment_evidence"] = response.json()
+    except Exception as exc:  # 조회 실패가 제안 생성을 막아서는 안 된다.
+        target["alignment_evidence"] = {
+            "status": "unavailable",
+            "candidates": [],
+            "existing_connections": [],
+            "reason": f"전략 정합성 확인 불가: {type(exc).__name__}",
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -330,6 +364,7 @@ async def _process_triggered_batch(batch: Dict[str, Any]) -> None:
     kept_targets = []
     for target in targets:
         if await _fill_target_identity(batch, target):
+            await _attach_alignment_evidence(batch, target)
             kept_targets.append(target)
 
     if not kept_targets:
@@ -383,6 +418,7 @@ async def apply_approved_proposal(
     extracted_rule: str,
     bound_skill_name: Optional[str] = None,
     approver_id: Optional[str] = None,
+    approver_name: Optional[str] = None,
 ) -> None:
     """승인된 SKILL target을 기존 피드백→스킬 개선 파이프라인(process_feedback_with_deep_agent)에 태운다.
 
@@ -391,8 +427,9 @@ async def apply_approved_proposal(
     extracted_rule은 그 SKILL target의 artifact(자연어 일반 규칙 텍스트)다. bound_skill_name은
     제안 생성 시점에 이미 확정된 스킬 이름(target.name)으로, 매칭된 모든 에이전트가 새 이름을
     짓지 않고 이 이름을 그대로 쓰도록 강제한다. approver_id는 이 target을 승인한 사람으로,
-    스킬 병합 요청의 reviewer가 된다 — requester는 batch의 피드백 작성자들이다
-    (fix-merge-request-requester).
+    스킬 병합 요청의 reviewer가 되며(requester는 batch의 피드백 작성자들이다,
+    fix-merge-request-requester), 배치의 원 피드백 작성자들과 함께 스킬 기여 이력
+    (skill_contributions)에도 기록된다(agent-feedback_skill-contribution-tracking).
 
     이 함수는 실행 결과를 배치 내 각 todo_id의 feedback_status에만 반영한다.
 
@@ -414,6 +451,11 @@ async def apply_approved_proposal(
     user_ids = _union_user_ids(rows)
     assignees = _union_assignees(rows)
     description = _representative_description(rows)
+
+    # 스킬 기여자 = 원 피드백 작성자들 + 이 target을 승인한 사람(중복 제거, 순서 유지).
+    contributor_user_ids = list(
+        dict.fromkeys([u for u in user_ids.split(",") if u] + ([approver_id] if approver_id else []))
+    )
 
     from core.database import fetch_events_by_todo_id
     events: List[Dict[str, Any]] = []
@@ -455,6 +497,8 @@ async def apply_approved_proposal(
                     bound_skill_name=bound_skill_name,
                     requester_ids=requester_ids,
                     reviewer_id=approver_id,
+                    contributor_user_ids=contributor_user_ids,
+                    contribution_source="proposal_approval",
                 )
                 if result.get("error"):
                     had_error = True
@@ -481,6 +525,8 @@ async def apply_approved_proposal(
                 bound_skill_name=bound_skill_name,
                 requester_ids=requester_ids,
                 reviewer_id=approver_id,
+                contributor_user_ids=contributor_user_ids,
+                contribution_source="proposal_approval",
             )
             if result.get("error"):
                 had_error = True

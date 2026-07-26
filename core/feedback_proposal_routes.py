@@ -144,7 +144,10 @@ async def approve_feedback_proposal_target(proposal_id: str, target_type: str, b
         extracted_rule = skill_target.get("artifact", "")
         bound_skill_name = skill_target.get("name")
         asyncio.create_task(
-            apply_approved_proposal(updated, extracted_rule, bound_skill_name, approver_id=body.approver_id)
+            apply_approved_proposal(
+                updated, extracted_rule, bound_skill_name,
+                approver_id=body.approver_id, approver_name=body.approver_name,
+            )
         )
         return {"approved": True, "id": proposal_id, "target": target_type, "applied": True}
 

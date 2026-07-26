@@ -322,6 +322,56 @@ def update_agent_and_tenant_skills(agent_id: str, skill_name: str, operation: st
 
 
 # ============================================================================
+# 스킬 기여 이력 (agent-feedback_skill-contribution-tracking)
+# ============================================================================
+
+def record_skill_contribution(
+    tenant_id: str,
+    skill_name: str,
+    contributor_user_id: str,
+    contribution_type: str,  # "CREATED" | "MODIFIED" | "PROPOSAL_APPROVED"
+    contributor_name: Optional[str] = None,
+    source_proposal_id: Optional[str] = None,
+) -> None:
+    """스킬 생성/수정/제안승인에 기여한 사람을 skill_contributions 에 1건 기록.
+
+    실패는 로그만 남기고 계속 진행한다(스킬 커밋 자체를 막지 않는다).
+    """
+    try:
+        supabase = get_db_client()
+        record = {
+            "tenant_id": tenant_id,
+            "skill_name": skill_name,
+            "contributor_user_id": contributor_user_id,
+            "contribution_type": contribution_type.upper(),
+        }
+        if contributor_name:
+            record["contributor_name"] = contributor_name
+        if source_proposal_id:
+            record["source_proposal_id"] = source_proposal_id
+        supabase.table("skill_contributions").insert(record).execute()
+    except Exception as e:
+        log(f"⚠️ 스킬 기여 이력 기록 실패 (무시): skill={skill_name}, contributor={contributor_user_id}, {e}")
+
+
+def fetch_skill_contributors(tenant_id: str, skill_name: str) -> List[Dict[str, Any]]:
+    """스킬의 기여 이력 전체(시각순)를 조회한다. 비중 계산은 호출 측에서 집계한다."""
+    try:
+        supabase = get_db_client()
+        resp = (
+            supabase.table("skill_contributions")
+            .select("*")
+            .eq("tenant_id", tenant_id)
+            .eq("skill_name", skill_name)
+            .execute()
+        )
+        return resp.data or []
+    except Exception as e:
+        handle_error("스킬기여이력조회", e)
+        return []
+
+
+# ============================================================================
 # 피드백 배치(feedback_proposals) — 수집/트리거/제안/승인·반려
 # ============================================================================
 
@@ -414,6 +464,7 @@ async def mark_batch_proposed(
         supabase = get_db_client()
         normalized_targets = [
             {
+                **t,
                 "type": t.get("type"),
                 "artifact": t.get("artifact"),
                 "id": t.get("id"),
@@ -1170,5 +1221,4 @@ def insert_bpmn_merge_request(
     except Exception as e:
         handle_error("BPMN병합요청생성", e)
         return None
-
 

@@ -9,6 +9,7 @@ from core.database import (
     update_agent_and_tenant_skills,
     update_activity_skills,
     _get_agent_by_id,
+    record_skill_contribution,
 )
 from core.skill_api_client import (
     update_skill_file,
@@ -40,6 +41,38 @@ def _sync_skill_attribution(
         log(f"   ⚠️ 스킬 동기화 실패 (무시): {e}")
 
 
+def _record_skill_contribution(
+    tenant_id: Optional[str],
+    skill_name: str,
+    operation: str,
+    contributor_user_ids: Optional[List[str]],
+    contribution_source: str,
+) -> None:
+    """CREATE/UPDATE 에 기여한 사람을 skill_contributions 에 기록한다.
+
+    contributor_user_ids가 없으면(귀속 가능한 사람을 식별할 수 없는 경로) 아무 것도
+    기록하지 않는다 — 근거 없는 기여자 추정을 피한다. contribution_source가
+    "proposal_approval"이면 피드백 제안 승인으로 반영된 것이므로 PROPOSAL_APPROVED로,
+    그 외(에이전트 채팅 등 직접 호출)에는 CREATE/UPDATE 그대로 CREATED/MODIFIED 로 남긴다.
+    """
+    if not tenant_id or not contributor_user_ids:
+        return
+    if contribution_source == "proposal_approval":
+        contribution_type = "PROPOSAL_APPROVED"
+    else:
+        contribution_type = "CREATED" if operation == "CREATE" else "MODIFIED"
+    for uid in dict.fromkeys(u for u in contributor_user_ids if u):
+        try:
+            record_skill_contribution(
+                tenant_id=tenant_id,
+                skill_name=skill_name,
+                contributor_user_id=uid,
+                contribution_type=contribution_type,
+            )
+        except Exception as e:
+            log(f"   ⚠️ 스킬 기여 이력 기록 실패 (무시): {e}")
+
+
 async def commit_to_skill(
     agent_id: Optional[str] = None,
     skill_artifact: Optional[Dict] = None,
@@ -52,6 +85,8 @@ async def commit_to_skill(
     activity_ref: Optional[Dict[str, str]] = None,
     requester_ids: Optional[List[str]] = None,
     reviewer_id: Optional[str] = None,
+    contributor_user_ids: Optional[List[str]] = None,
+    contribution_source: str = "direct",
 ):
     """
     Skill CRUD 작업 수행 (HTTP API 경로).
@@ -72,6 +107,10 @@ async def commit_to_skill(
         requester_ids: UPDATE 시 열리는 스킬 병합 요청의 requester(피드백 작성자 user_id
             목록, 중복 제거)(fix-merge-request-requester).
         reviewer_id: UPDATE 시 열리는 스킬 병합 요청의 reviewer(승인자).
+        contributor_user_ids: 이 UPDATE 에 기여한 사람(user_id) 목록 — 피드백 원 작성자
+            및(제안 승인 경로라면) 승인자. 식별 불가하면 None(기여 이력 미기록).
+        contribution_source: "direct"(에이전트 채팅 등 직접 호출) | "proposal_approval"
+            (피드백 제안 승인 반영) — skill_contributions.contribution_type 결정에 사용.
     """
     try:
         agent_info = _get_agent_by_id(agent_id) if agent_id else None
@@ -147,6 +186,11 @@ async def commit_to_skill(
                                 log(f"   ⚠️ 파일 업데이트 실패 ({file_path}): {e}")
 
                     log(f"   ✅ SKILL 수정 완료: skill_name={skill_name}")
+
+                    _record_skill_contribution(
+                        resolved_tenant_id, skill_name, "UPDATE",
+                        contributor_user_ids, contribution_source,
+                    )
 
                     return
 

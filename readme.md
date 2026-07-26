@@ -95,6 +95,7 @@ uv pip install -r requirements.txt
 - `feedback_proposals` 테이블(`targets` 컬럼 포함) — 배치 수집/제안 기능, target별 분류/독립 승인(`SKILL`/`DMN_RULE`/`PROCESS_DEFINITION`)에 필요
 - `append_feedback_to_batch`, `decide_feedback_proposal_target` 함수
 - `proc_def_version`, `resource_pull_requests` 테이블 — DMN_RULE/PROCESS_DEFINITION target 승인 시 draft 및 병합 요청 저장. `resource_pull_requests.requester_id`는 `uuid[]`(배열) 타입이어야 한다 — 병합 요청을 촉발한 피드백 작성자 전원을 담고, 승인자는 별도 `reviewer_id` 컬럼에 기록한다.
+- `skill_contributions` 테이블 — 스킬별 사람 기여 이력(`GET /api/skills/{skill_name}/contributors`)에 필요
 
 ### 환경 설정
 

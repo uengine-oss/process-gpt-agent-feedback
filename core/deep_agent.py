@@ -200,6 +200,8 @@ async def process_feedback_with_deep_agent(
     bound_skill_name: Optional[str] = None,
     requester_ids: Optional[List[str]] = None,
     reviewer_id: Optional[str] = None,
+    contributor_user_ids: Optional[List[str]] = None,
+    contribution_source: str = "direct",
 ) -> Dict:
     """
     Deep Agent를 사용하여 피드백을 처리하고 스킬을 개선합니다.
@@ -219,6 +221,9 @@ async def process_feedback_with_deep_agent(
         requester_ids: 이 개선을 촉발한 피드백 작성자 user_id 목록(중복 제거) — 스킬
             병합 요청의 requester로 전달된다(fix-merge-request-requester).
         reviewer_id: 이 target을 승인한 사람 — 스킬 병합 요청의 reviewer로 전달된다.
+        contributor_user_ids: 이 처리로 인한 스킬 CREATE/UPDATE 에 기여자로 기록할
+            사람(user_id) 목록(피드백 원 작성자·승인자 등). None 이면 기여 이력을 남기지 않는다.
+        contribution_source: "direct" | "proposal_approval" — skill_contributions.contribution_type 결정에 사용.
 
     Returns:
         처리 결과 dict
@@ -227,13 +232,16 @@ async def process_feedback_with_deep_agent(
         owner_desc = f"agent_id={agent_id}" if agent_id else f"activity_ref={activity_ref}"
         log(f"🤖 Deep Agent 기반 피드백 처리 시작: {owner_desc}")
 
-        # 커스텀 스킬 도구 생성 (agent_id 또는 activity_ref, feedback_content, requester/reviewer 바인딩)
+        # 커스텀 스킬 도구 생성 (agent_id 또는 activity_ref, feedback_content, requester/reviewer,
+        # contributor 바인딩)
         skill_tools = create_skill_tools(
             agent_id=agent_id,
             feedback_content=feedback_content,
             activity_ref=activity_ref,
             requester_ids=requester_ids,
             reviewer_id=reviewer_id,
+            contributor_user_ids=contributor_user_ids,
+            contribution_source=contribution_source,
         )
 
         # LLM 생성

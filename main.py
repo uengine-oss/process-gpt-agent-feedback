@@ -39,6 +39,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from core.polling_manager import initialize_connections
 from core.feedback_batch_manager import start_feedback_batch_collection, start_feedback_batch_trigger
 from core.feedback_proposal_routes import router as feedback_proposals_router
+from core.skill_contributor_routes import router as skill_contributors_router
 from utils.logger import log
 
 
@@ -82,6 +83,7 @@ app.add_middleware(
 )
 
 app.include_router(feedback_proposals_router)
+app.include_router(skill_contributors_router)
 
 # ============================================================================
 # 서버 실행
