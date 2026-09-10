@@ -608,6 +608,9 @@ async def apply_approved_dmn_target(
             merged_definition.get("dmn_decisions", []),
             merged_definition.get("dmn_rules", []),
             proc_def_id=dmn_id,
+            # 표가 읽는 변수의 출처다 — 빠뜨리면 규칙 하나 더한 draft 가 입력 데이터를
+            # 통째로 지운 것으로 저장된다.
+            input_data=merged_definition.get("dmn_input_data") or [],
         )
 
         version_row = insert_draft_proc_def_version(
