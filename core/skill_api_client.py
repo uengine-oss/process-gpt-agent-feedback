@@ -7,6 +7,7 @@ HTTP 엔드포인트를 호출하는 기능을 제공합니다. 별도 claude-sk
 import os
 import io
 import zipfile
+from contextvars import ContextVar
 from typing import Dict, List, Optional, Any
 from urllib.parse import quote
 
@@ -22,6 +23,18 @@ load_dotenv()
 # ============================================================================
 
 SKILL_API_BASE_URL = os.getenv("SKILL_API_BASE_URL", "http://localhost:8888")
+
+
+# 스킬 API(process-gpt-deepagents)는 요청자의 Supabase JWT로 테넌트 소속을 검증한다
+# (processgpt_agent_sdk.tenant_auth.tenant_guard) — 토큰 없는 서비스 호출은 401이다.
+# 승인된 target을 적용할 때는 승인자의 토큰을 이 ContextVar에 걸어 두고, 그 적용
+# 태스크 안의 모든 스킬 API 호출(Deep Agent 도구 포함)이 승인자 권한으로 나가게 한다.
+_auth_token: ContextVar[Optional[str]] = ContextVar("skill_api_auth_token", default=None)
+
+
+def use_auth_token(token: Optional[str]) -> None:
+    """현재 태스크(컨텍스트)의 스킬 API 호출에 실을 Bearer 토큰을 정한다."""
+    _auth_token.set((token or "").strip() or None)
 
 
 def _get_base_url() -> str:
@@ -66,7 +79,9 @@ def _make_request(
         HTTP 요청 실패 시
     """
     url = f"{_get_base_url()}{endpoint}"
-    
+    token = _auth_token.get()
+    headers = {"Authorization": f"Bearer {token}"} if token else None
+
     try:
         response = requests.request(
             method=method,
@@ -75,6 +90,7 @@ def _make_request(
             json=json_data,
             files=files,
             data=data,
+            headers=headers,
             timeout=30,
         )
         response.raise_for_status()
@@ -186,6 +202,8 @@ def update_skill_file(
     tenant_id: str,
     requester_ids: Optional[List[str]] = None,
     reviewer_id: Optional[str] = None,
+    branch: Optional[str] = None,
+    message: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     스킬 파일 업데이트 (git provider commit + PR 워크플로우 경유)
@@ -224,6 +242,12 @@ def update_skill_file(
         본문에 requester_id 키 자체를 생략한다.
     reviewer_id : str, optional
         이 개선을 승인한 사람의 id.
+    branch : str, optional
+        커밋할 브랜치. 비우면 기본 브랜치로 요청해 서버가 피처 브랜치와 PR을 새로 만든다.
+        한 번의 개선에서 여러 파일을 고칠 때는 첫 응답의 branch를 넘겨 같은 브랜치(같은 PR)에
+        이어서 커밋한다 — 그러지 않으면 파일마다 브랜치와 PR이 따로 생긴다.
+    message : str, optional
+        커밋 메시지. 새 PR이 열릴 때 그 제목이 된다(비우면 서버 기본값 "update <파일>").
 
     Returns
     -------
@@ -242,8 +266,12 @@ def update_skill_file(
         json_data["requester_id"] = requester_ids
     if reviewer_id:
         json_data["reviewer_id"] = reviewer_id
+    if branch:
+        json_data["branch"] = branch
+    if message:
+        json_data["message"] = message
 
-    log(f"✏️ 스킬 파일 커밋: {skill_name}/{file_path}")
+    log(f"✏️ 스킬 파일 커밋: {skill_name}/{file_path}" + (f" (branch={branch})" if branch else ""))
 
     return _make_request("POST", endpoint, json_data=json_data)
 

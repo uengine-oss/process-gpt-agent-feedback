@@ -284,7 +284,7 @@ def create_skill_tools(
                     "additional_files": parsed_files or {},
                 }
 
-            await _commit(
+            commit_result = await _commit(
                 agent_id=agent_id,
                 skill_artifact=skill_artifact,
                 operation=operation,
@@ -298,9 +298,11 @@ def create_skill_tools(
             )
 
             owner_label = f"에이전트: {agent_id}" if agent_id else f"활동: {activity_ref}"
+            if operation == "UPDATE" and isinstance(commit_result, dict) and not commit_result.get("pr_created"):
+                return f"⚠️ 스킬 변경은 브랜치({commit_result.get('branch')})에 커밋됐지만 병합 요청이 만들어지지 않았습니다: {commit_result.get('error')}"
             msgs = {
                 "CREATE": f"✅ 스킬이 성공적으로 생성되었습니다. ({owner_label})",
-                "UPDATE": f"✅ 스킬이 성공적으로 수정되었습니다. (ID: {skill_id}, {owner_label})",
+                "UPDATE": f"✅ 스킬 수정 병합 요청을 열었습니다. (ID: {skill_id}, {owner_label})",
                 "DELETE": f"✅ 스킬이 성공적으로 삭제되었습니다. (ID: {skill_id}, {owner_label})",
             }
             return msgs.get(operation, f"⚠️ 알 수 없는 작업: {operation}")

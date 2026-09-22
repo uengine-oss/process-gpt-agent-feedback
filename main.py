@@ -48,10 +48,13 @@ async def lifespan(app: FastAPI):
     """애플리케이션 생명주기 관리"""
     initialize_connections()
 
-    log("서버 시작 - 연결 초기화, 피드백 배치 수집(7s) + 배치 트리거 확인(900s) 시작")
+    # 배치 트리거 확인 주기. 운영은 900초면 충분하지만(3일 기한 대비), 로컬 검증에서는
+    # 5건이 찬 배치가 분류되기까지 15분을 기다리게 되므로 환경 변수로 줄일 수 있게 한다.
+    trigger_interval = int(os.environ.get("FEEDBACK_BATCH_TRIGGER_INTERVAL", "900"))
+    log(f"서버 시작 - 연결 초기화, 피드백 배치 수집(7s) + 배치 트리거 확인({trigger_interval}s) 시작")
     tasks = [
         asyncio.create_task(start_feedback_batch_collection(interval=7)),
-        asyncio.create_task(start_feedback_batch_trigger(interval=900)),
+        asyncio.create_task(start_feedback_batch_trigger(interval=trigger_interval)),
     ]
 
     yield

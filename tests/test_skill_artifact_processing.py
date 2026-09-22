@@ -59,7 +59,10 @@ class TestSkillArtifactProcessing:
     async def test_commit_skill_update_missing_skill_is_noop(
         self, mock_update_skills, mock_update_file, mock_check_exists, mock_get_agent
     ):
-        """UPDATE 대상 스킬이 존재하지 않으면 CREATE로 전환하지 않고 건너뛴다."""
+        """UPDATE 대상 스킬이 존재하지 않으면 CREATE로 전환하지 않고, 실패로 드러낸다.
+
+        예전에는 조용히 건너뛰어 병합 요청 없이도 피드백이 반영 완료로 찍혔다.
+        """
         mock_get_agent.return_value = {
             "id": "test_agent",
             "tenant_id": "test_tenant"
@@ -72,21 +75,27 @@ class TestSkillArtifactProcessing:
             "steps": ["1단계: 데이터 수집"]
         }
 
-        await commit_to_skill(
-            agent_id="test_agent",
-            skill_artifact=skill_artifact,
-            operation="UPDATE",
-            skill_id="테스트 스킬",
-        )
+        from core.apply_tracking import start_skill_commit_log
+        commit_log = start_skill_commit_log()
 
+        with pytest.raises(LookupError):
+            await commit_to_skill(
+                agent_id="test_agent",
+                skill_artifact=skill_artifact,
+                operation="UPDATE",
+                skill_id="테스트 스킬",
+            )
+
+        assert commit_log and commit_log[0]["committed"] is False
         mock_update_file.assert_not_called()
         mock_update_skills.assert_not_called()
     
     @pytest.mark.asyncio
+    @patch('core.learning_committers.skill_committer.find_resource_pull_request', return_value=None)
     @patch('core.learning_committers.skill_committer._get_agent_by_id')
     @patch('core.learning_committers.skill_committer.update_skill_file')
     @patch('core.learning_committers.skill_committer.check_skill_exists')
-    async def test_update_skill_with_all_fields(self, mock_check_exists, mock_update_file, mock_get_agent):
+    async def test_update_skill_with_all_fields(self, mock_check_exists, mock_update_file, mock_get_agent, _mock_find_pr):
         """모든 필드가 포함된 스킬 업데이트 테스트"""
         # Mock 설정
         mock_get_agent.return_value = {
@@ -94,7 +103,7 @@ class TestSkillArtifactProcessing:
             "tenant_id": "test_tenant"
         }
         mock_check_exists.return_value = True
-        mock_update_file.return_value = {"message": "Success"}
+        mock_update_file.return_value = {"message": "Success", "branch": "skill/테스트 스킬/1", "pr_created": True}
         
         skill_artifact = {
             "name": "테스트 스킬",
@@ -127,7 +136,11 @@ class TestSkillArtifactProcessing:
                 break
         
         assert skill_md_call is not None
-        skill_content = skill_md_call[1]['content']
+        skill_content = skill_md_call[0][2]
+
+        # 부가 파일은 SKILL.md가 만든 브랜치에 이어서 커밋돼야 같은 병합 요청에 담긴다
+        extra_call = next(c for c in mock_update_file.call_args_list if c[0][1] == "scripts/updated.py")
+        assert extra_call[1]["branch"] == "skill/테스트 스킬/1"
         
         # 개요와 사용법이 포함되어야 함
         assert "## 개요" in skill_content

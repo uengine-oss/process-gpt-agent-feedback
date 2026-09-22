@@ -23,7 +23,7 @@ def _batch(**overrides):
         "tenant_id": "tenant1",
         "proc_def_id": "proc1",
         "activity_id": "activity1",
-        "collected_items": [{"todo_id": "todo1", "user_id": "author-a", "time": "2026-07-01T00:00:00Z"}],
+        "collected_items": [{"todo_id": "todo1", "user_id": "author-a", "time": "2026-07-01T00:00:00Z", "content": "결과는 표로 정리해 주세요"}],
     }
     base.update(overrides)
     return base

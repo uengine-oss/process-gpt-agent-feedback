@@ -388,40 +388,91 @@ async def fetch_todolist_rows_by_ids(todo_ids: List[str]) -> List[Dict[str, Any]
         return []
 
 
-async def append_feedback_to_batch(
+async def append_workitem_feedback_to_batch(
     tenant_id: str,
     proc_def_id: str,
     activity_id: str,
-    todo_id: str,
-    content: str,
-    time: str,
-    user_id: str,
+    items: List[Dict[str, Any]],
 ) -> Optional[Dict[str, Any]]:
-    """(tenant_id, proc_def_id, activity_id) 기준 COLLECTING 배치에 피드백을 원자적으로 적재.
+    """워크아이템 하나에서 새로 생긴 피드백 전부를 한 번에 COLLECTING 배치에 적재한다.
 
-    해당 배치가 없으면 새로 만든다 (append_feedback_to_batch DB 함수, 부분 유니크 인덱스 기반 upsert).
+    한 건씩 적재하면 그 사이에 배치가 분류(CLASSIFYING)로 넘어가 한 워크아이템의 피드백이
+    두 회차로 갈라질 수 있다 — append_workitem_feedback_to_batch DB 함수가 한 문장으로 넣는다.
+    items: [{"todo_id", "content", "time", "user_id"}, ...]
     """
+    if not items:
+        return None
     try:
         supabase = get_db_client()
         resp = supabase.rpc(
-            "append_feedback_to_batch",
+            "append_workitem_feedback_to_batch",
             {
                 "p_tenant_id": tenant_id,
                 "p_proc_def_id": proc_def_id,
                 "p_activity_id": activity_id,
-                "p_todo_id": todo_id,
-                "p_content": content,
-                "p_time": time,
-                "p_user_id": user_id,
+                "p_items": items,
             },
         ).execute()
         data = resp.data
         if isinstance(data, list):
-            return data[0] if data else None
+            data = data[0] if data else None
+        if not data or not data.get("id"):
+            return None
         return data
     except Exception as e:
-        handle_error("피드백배치적재", e)
+        handle_error("워크아이템피드백배치적재", e)
         return None
+
+
+async def claim_batch_for_classification(batch_id: str) -> Optional[Dict[str, Any]]:
+    """COLLECTING 배치를 CLASSIFYING으로 닫고, 닫은 시점의 행을 돌려준다(이미 누가 닫았으면 None).
+
+    닫은 뒤에 같은 활동에 남긴 피드백은 새 COLLECTING 배치로 가서 다음 회차에 처리된다 —
+    분류 도중 들어온 피드백이 분류되지 않은 채 이 배치의 결과로 처리되는 것을 막는다.
+    """
+    try:
+        supabase = get_db_client()
+        resp = (
+            supabase.table("feedback_proposals")
+            .update({"status": "CLASSIFYING"})
+            .eq("id", batch_id)
+            .eq("status", "COLLECTING")
+            .execute()
+        )
+        rows = resp.data or []
+        return rows[0] if rows else None
+    except Exception as e:
+        handle_error("배치분류시작", e)
+        return None
+
+
+async def fetch_stale_classifying_batches(older_than_minutes: int) -> List[Dict[str, Any]]:
+    """분류 중에 서버가 내려가거나 분류 호출이 실패해 CLASSIFYING에 멈춘 배치들."""
+    from datetime import datetime, timedelta, timezone
+    cutoff = (datetime.now(timezone.utc) - timedelta(minutes=older_than_minutes)).isoformat()
+    try:
+        supabase = get_db_client()
+        resp = (
+            supabase.table("feedback_proposals")
+            .select("*")
+            .eq("status", "CLASSIFYING")
+            .lt("updated_at", cutoff)
+            .execute()
+        )
+        return resp.data or []
+    except Exception as e:
+        handle_error("멈춘분류배치조회", e)
+        return []
+
+
+def touch_classifying_batch(batch_id: str) -> None:
+    """분류 재시도 시각을 갱신한다(updated_at 트리거) — 실패가 반복돼도 매 틱 재시도하지 않게."""
+    try:
+        get_db_client().table("feedback_proposals").update({"status": "CLASSIFYING"}).eq("id", batch_id).eq(
+            "status", "CLASSIFYING"
+        ).execute()
+    except Exception as e:
+        handle_error("분류배치시각갱신", e)
 
 
 async def fetch_collecting_batches(tenant_id: str = "") -> List[Dict[str, Any]]:
@@ -447,8 +498,9 @@ async def mark_batch_proposed(
     batch_id: str,
     targets: List[Dict[str, Any]],
     candidate_skill_names: Optional[List[str]] = None,
+    dropped_targets: Optional[List[Dict[str, Any]]] = None,
 ) -> bool:
-    """분류된 target(s)을 반영해 COLLECTING → PROPOSED로 전환 (중복 트리거 방지를 위해 COLLECTING인 것만).
+    """분류된 target(s)을 반영해 CLASSIFYING → PROPOSED로 전환 (분류를 시작한 배치만).
 
     targets: [{"type": "SKILL"|"DMN_RULE"|"PROCESS_DEFINITION", "artifact": ..., "id": ..., "name": ...,
     "skill_name": ... (SKILL만)}, ...]
@@ -486,9 +538,10 @@ async def mark_batch_proposed(
                 "targets": normalized_targets,
                 "proposed_at": _now_iso(),
                 "candidate_skill_names": candidate_skill_names or [],
+                "dropped_targets": dropped_targets or [],
             })
             .eq("id", batch_id)
-            .eq("status", "COLLECTING")
+            .eq("status", "CLASSIFYING")
             .execute()
         )
         return bool(resp.data)
@@ -497,15 +550,28 @@ async def mark_batch_proposed(
         return False
 
 
-async def mark_batch_discarded(batch_id: str) -> bool:
-    """공통 규칙 없음 판정 시 COLLECTING → DISCARDED로 전환"""
+async def mark_batch_discarded(
+    batch_id: str,
+    reason: Optional[str] = None,
+    dropped_targets: Optional[List[Dict[str, Any]]] = None,
+) -> bool:
+    """CLASSIFYING → DISCARDED로 전환한다.
+
+    reason은 피드백 작성자에게 그대로 보여줄 폐기 사유이고, dropped_targets는 분류는
+    됐지만 개선할 기존 리소스를 찾지 못해 빠진 target들이다 — 폐기돼도 "무엇으로
+    분류됐는지"는 남겨야 작성자가 자기 피드백의 행방을 알 수 있다.
+    """
     try:
         supabase = get_db_client()
         resp = (
             supabase.table("feedback_proposals")
-            .update({"status": "DISCARDED"})
+            .update({
+                "status": "DISCARDED",
+                "discard_reason": reason,
+                "dropped_targets": dropped_targets or [],
+            })
             .eq("id", batch_id)
-            .eq("status", "COLLECTING")
+            .eq("status", "CLASSIFYING")
             .execute()
         )
         return bool(resp.data)
@@ -547,6 +613,7 @@ async def mark_target_decision(
     decided_by_name: Optional[str] = None,
     decided_by_email: Optional[str] = None,
     decision_note: Optional[str] = None,
+    target_index: Optional[int] = None,
 ) -> Optional[Dict[str, Any]]:
     """PROPOSED 제안 안의 특정 target 하나만 APPROVED/REJECTED로 결정한다 (다른 target에는 영향 없음).
 
@@ -561,21 +628,27 @@ async def mark_target_decision(
     PostgREST/supabase-py를 거치면 진짜 NULL이 아니라 모든 필드가 None인 dict로 올 수 있다. 그런 dict는
     파이썬에서 비어있지 않아 truthy이므로, id(NOT NULL 기본키)가 실제로 채워져 있는지까지 확인해야
     "이미 결정된 target을 다시 승인" 같은 경우를 정상적으로 실패 처리할 수 있다.
+
+    target_index가 주어지면 decide_feedback_proposal_target_at RPC로 그 위치의 target만
+    결정한다 — 같은 type의 target이 여럿일 때 사용자가 누른 것과 다른 target이 결정되지
+    않게 하기 위함이다. 없으면 기존처럼 그 type의 첫 PENDING을 결정한다.
     """
+    params = {
+        "p_batch_id": batch_id,
+        "p_target_type": target_type,
+        "p_status": status,
+        "p_decided_by": decided_by,
+        "p_decided_by_name": decided_by_name,
+        "p_decided_by_email": decided_by_email,
+        "p_decision_note": decision_note,
+    }
+    rpc_name = "decide_feedback_proposal_target"
+    if target_index is not None:
+        rpc_name = "decide_feedback_proposal_target_at"
+        params["p_target_index"] = target_index
     try:
         supabase = get_db_client()
-        resp = supabase.rpc(
-            "decide_feedback_proposal_target",
-            {
-                "p_batch_id": batch_id,
-                "p_target_type": target_type,
-                "p_status": status,
-                "p_decided_by": decided_by,
-                "p_decided_by_name": decided_by_name,
-                "p_decided_by_email": decided_by_email,
-                "p_decision_note": decision_note,
-            },
-        ).execute()
+        resp = supabase.rpc(rpc_name, params).execute()
         data = resp.data
         if isinstance(data, list):
             data = data[0] if data else None
@@ -585,6 +658,251 @@ async def mark_target_decision(
     except Exception as e:
         handle_error("배치결정반영", e)
         return None
+
+
+def patch_target(batch_id: str, target_index: int, patch: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """제안의 target 하나에 필드를 덧붙인다(적용 상태·결과 기록). status는 바꾸지 않는다.
+
+    patch_feedback_proposal_target RPC가 행 잠금 안에서 그 위치만 고치므로, 같은 배치의
+    다른 target이 동시에 결과를 써도 서로 덮지 않는다.
+    """
+    try:
+        supabase = get_db_client()
+        resp = supabase.rpc(
+            "patch_feedback_proposal_target",
+            {"p_batch_id": batch_id, "p_target_index": target_index, "p_patch": patch},
+        ).execute()
+        data = resp.data
+        if isinstance(data, list):
+            data = data[0] if data else None
+        if not data or not data.get("id"):
+            return None
+        return data
+    except Exception as e:
+        handle_error("target적용결과기록", e)
+        return None
+
+
+def find_resource_pull_request(
+    tenant_id: str, resource_type: str, resource_id: str, branch_name: str
+) -> Optional[Dict[str, Any]]:
+    """스킬 커밋 API가 연 병합 요청 행을 브랜치 이름으로 찾는다.
+
+    커밋 API 응답에는 git PR 번호만 있고 resource_pull_requests.id는 없다 — 제안에
+    적용 결과로 남기려면 행 id가 필요해 브랜치로 다시 찾는다.
+    """
+    if not (tenant_id and resource_id and branch_name):
+        return None
+    try:
+        supabase = get_db_client()
+        resp = (
+            supabase.table("resource_pull_requests")
+            .select("id,title,status,branch_name,git_pr_url,created_at")
+            .eq("tenant_id", tenant_id)
+            .eq("resource_type", resource_type)
+            .eq("resource_id", resource_id)
+            .eq("branch_name", branch_name)
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        rows = resp.data or []
+        return rows[0] if rows else None
+    except Exception as e:
+        handle_error("병합요청조회", e)
+        return None
+
+
+def fetch_resource_pull_requests_by_ids(ids: List[str]) -> Dict[str, Dict[str, Any]]:
+    ids = [i for i in dict.fromkeys(ids) if i]
+    if not ids:
+        return {}
+    try:
+        supabase = get_db_client()
+        resp = (
+            supabase.table("resource_pull_requests")
+            .select("id,resource_type,resource_id,title,status,branch_name,git_pr_url,created_at,merged_at")
+            .in_("id", ids)
+            .execute()
+        )
+        return {r["id"]: r for r in (resp.data or [])}
+    except Exception as e:
+        handle_error("병합요청목록조회", e)
+        return {}
+
+
+_IN_CHUNK = 50
+
+
+def _has_feedback(row: Dict[str, Any]) -> bool:
+    fb = row.get("feedback")
+    return isinstance(fb, list) and len(fb) > 0
+
+
+_FEEDBACK_ROW_COLUMNS = (
+    "id,tenant_id,proc_def_id,activity_id,activity_name,proc_inst_id,status,user_id,"
+    "feedback,feedback_status,feedback_collected_count,end_date,updated_at"
+)
+
+
+def fetch_todolist_rows_with_feedback_by_user(tenant_id: str, user_id: str) -> List[Dict[str, Any]]:
+    """user_id가 남긴 피드백 항목을 하나라도 가진 워크아이템들."""
+    if not (tenant_id and user_id):
+        return []
+    import json as _json
+    try:
+        supabase = get_db_client()
+        resp = (
+            supabase.table("todolist")
+            .select(_FEEDBACK_ROW_COLUMNS)
+            .eq("tenant_id", tenant_id)
+            .filter("feedback", "cs", _json.dumps([{"user_id": user_id}]))
+            .execute()
+        )
+        return resp.data or []
+    except Exception as e:
+        handle_error("내피드백워크아이템조회", e)
+        return []
+
+
+def fetch_participating_proc_inst_ids(tenant_id: str, user_id: str) -> List[str]:
+    """user_id가 참여자(bpm_proc_inst.participants)로 들어 있는 인스턴스 id들."""
+    if not (tenant_id and user_id):
+        return []
+    try:
+        supabase = get_db_client()
+        resp = (
+            supabase.table("bpm_proc_inst")
+            .select("proc_inst_id")
+            .eq("tenant_id", tenant_id)
+            .filter("participants", "cs", "{" + user_id + "}")
+            .execute()
+        )
+        return [r["proc_inst_id"] for r in (resp.data or []) if r.get("proc_inst_id")]
+    except Exception as e:
+        handle_error("참여인스턴스조회", e)
+        return []
+
+
+def fetch_feedback_rows_by_proc_inst_ids(tenant_id: str, proc_inst_ids: List[str]) -> List[Dict[str, Any]]:
+    """인스턴스들의 워크아이템 중 피드백이 있는 것. id 목록이 길면 URL이 넘치므로 나눠 조회한다."""
+    ids = [i for i in dict.fromkeys(proc_inst_ids) if i]
+    rows: List[Dict[str, Any]] = []
+    try:
+        supabase = get_db_client()
+        for n in range(0, len(ids), _IN_CHUNK):
+            resp = (
+                supabase.table("todolist")
+                .select(_FEEDBACK_ROW_COLUMNS)
+                .eq("tenant_id", tenant_id)
+                .in_("proc_inst_id", ids[n:n + _IN_CHUNK])
+                .execute()
+            )
+            rows.extend(r for r in (resp.data or []) if _has_feedback(r))
+    except Exception as e:
+        handle_error("인스턴스워크아이템조회", e)
+    return rows
+
+
+def fetch_feedback_rows_assigned_to(tenant_id: str, user_id: str) -> List[Dict[str, Any]]:
+    """user_id가 담당자(todolist.user_id, 쉼표 구분)인 워크아이템 중 피드백이 있는 것."""
+    if not (tenant_id and user_id):
+        return []
+    try:
+        supabase = get_db_client()
+        resp = (
+            supabase.table("todolist")
+            .select(_FEEDBACK_ROW_COLUMNS)
+            .eq("tenant_id", tenant_id)
+            .ilike("user_id", f"%{user_id}%")
+            .execute()
+        )
+        return [r for r in (resp.data or []) if _has_feedback(r)]
+    except Exception as e:
+        handle_error("담당워크아이템조회", e)
+        return []
+
+
+def fetch_batches_for_proc_defs(tenant_id: str, proc_def_ids: List[str]) -> List[Dict[str, Any]]:
+    """프로세스 정의들에 속한 배치 전부(상태 무관). 호출부가 todo_id로 워크아이템과 짝짓는다."""
+    ids = [i for i in dict.fromkeys(proc_def_ids) if i]
+    rows: List[Dict[str, Any]] = []
+    try:
+        supabase = get_db_client()
+        for n in range(0, len(ids), _IN_CHUNK):
+            resp = (
+                supabase.table("feedback_proposals")
+                .select("*")
+                .eq("tenant_id", tenant_id)
+                .in_("proc_def_id", ids[n:n + _IN_CHUNK])
+                .execute()
+            )
+            rows.extend(resp.data or [])
+    except Exception as e:
+        handle_error("프로세스배치조회", e)
+    return rows
+
+
+def fetch_user_briefs(tenant_id: str, user_ids: List[str]) -> Dict[str, Dict[str, Any]]:
+    """사용자 id → {name, profile}. 피드백 작성자를 아바타와 이름으로 보여줄 때 쓴다."""
+    ids = [i for i in dict.fromkeys(user_ids) if i]
+    if not ids:
+        return {}
+    out: Dict[str, Dict[str, Any]] = {}
+    try:
+        supabase = get_db_client()
+        for n in range(0, len(ids), _IN_CHUNK):
+            resp = (
+                supabase.table("users")
+                .select("id,username,email,profile")
+                .eq("tenant_id", tenant_id)
+                .in_("id", ids[n:n + _IN_CHUNK])
+                .execute()
+            )
+            for r in resp.data or []:
+                out[str(r["id"])] = {
+                    "name": r.get("username") or r.get("email") or "",
+                    "profile": r.get("profile") or None,
+                }
+    except Exception as e:
+        handle_error("사용자목록조회", e)
+    return out
+
+
+def fetch_proc_inst_summaries(tenant_id: str, proc_inst_ids: List[str]) -> Dict[str, Dict[str, Any]]:
+    """인스턴스 id → {name, status}. 내 피드백 목록이 "어느 인스턴스의 워크아이템인지"를 보여줄 때 쓴다."""
+    ids = [i for i in dict.fromkeys(proc_inst_ids) if i]
+    if not (tenant_id and ids):
+        return {}
+    try:
+        supabase = get_db_client()
+        resp = (
+            supabase.table("bpm_proc_inst")
+            .select("proc_inst_id,proc_inst_name,status")
+            .eq("tenant_id", tenant_id)
+            .in_("proc_inst_id", ids)
+            .execute()
+        )
+        return {
+            r["proc_inst_id"]: {"name": r.get("proc_inst_name"), "status": r.get("status")}
+            for r in (resp.data or [])
+        }
+    except Exception as e:
+        handle_error("인스턴스이름목록조회", e)
+        return {}
+
+
+def fetch_proc_def_names(tenant_id: str, proc_def_ids: List[str]) -> Dict[str, str]:
+    ids = [i for i in dict.fromkeys(proc_def_ids) if i]
+    if not (tenant_id and ids):
+        return {}
+    try:
+        supabase = get_db_client()
+        resp = supabase.table("proc_def").select("id,name").eq("tenant_id", tenant_id).in_("id", ids).execute()
+        return {r["id"]: r.get("name") or r["id"] for r in (resp.data or [])}
+    except Exception as e:
+        handle_error("proc_def이름목록조회", e)
+        return {}
 
 
 # ============================================================================

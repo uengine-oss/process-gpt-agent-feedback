@@ -1,4 +1,5 @@
 import json
+import re
 from typing import Dict, List, Any, Optional
 from utils.logger import log, handle_error
 from core.llm import create_llm
@@ -123,10 +124,31 @@ async def match_feedback_to_agents(
 _VALID_TARGET_TYPES = {"SKILL", "DMN_RULE", "PROCESS_DEFINITION"}
 
 
+# 업무 내용 없이 칭찬·감사·재실행만 요청하는 피드백. 분류에 넣으면 LLM이 이것만으로
+# "재실행 옵션을 제시한다" 같은 규칙을 지어내 제안이 만들어졌다 — 분류 전에 걸러낸다.
+_NOISE_FEEDBACK_PATTERNS = [
+    r"(다시|한\s*번\s*더|재)\s*(해|시도|실행|수행|작성|생성)?\s*(줘|주세요|해줘|해\s*주세요|요|바람|부탁)?",
+    r"(잘|좋|훌륭|완벽)\S*",
+    r"(고마|감사|수고)\S*",
+    r"(ok|okay|good|great|thanks?|thank you|retry|again|redo)",
+    r"(네|예|응|넵|확인|알겠\S*)",
+]
+_NOISE_FEEDBACK_RE = re.compile(
+    r"^\s*(?:" + "|".join(_NOISE_FEEDBACK_PATTERNS) + r")(?:[\s,.!~^]*(?:" + "|".join(_NOISE_FEEDBACK_PATTERNS) + r"))*[\s.!~^]*$",
+    re.IGNORECASE,
+)
+
+
+def is_noise_feedback(content: str) -> bool:
+    """칭찬·감사·단순 재실행 요청처럼 개선할 업무 내용이 없는 피드백인지."""
+    text = (content or "").strip()
+    return not text or bool(_NOISE_FEEDBACK_RE.match(text))
+
+
 async def classify_and_extract_proposal(
     collected_items: List[Dict],
     task_description: str = "",
-) -> List[Dict[str, Any]]:
+) -> Optional[List[Dict[str, Any]]]:
     """트리거된 배치의 피드백이 무엇을 개선할 수 있는지 먼저 분류하고, 분류된 target마다 제안
     아티팩트를 만든다. 분류와 target별 생성은 한 번의 LLM 호출로 처리한다.
 
@@ -142,17 +164,24 @@ async def classify_and_extract_proposal(
 
     한 배치가 서로 다른 관심사를 동시에 담고 있으면 여러 target을 함께 반환할 수 있다(MIXED).
     피드백들 사이에 공통 관심사가 전혀 없으면 빈 리스트를 반환한다(억지로 만들어내지 않는다).
+    분류 호출 자체가 실패하면 None을 반환한다 — 호출부는 이를 "공통점 없음"과 구분해 폐기하지 않는다.
     """
     llm = create_llm(streaming=False, temperature=0)
 
-    items_sorted = sorted(collected_items, key=lambda x: x.get("time", ""))
+    # 워크아이템별로 묶어 보여준다 — 한 워크아이템의 피드백 여러 건은 한 업무에 대한 한 사람의
+    # 의견이고, 서로 다른 워크아이템에서 반복되는 내용이 공통 관심사다.
+    by_workitem: Dict[str, List[Dict]] = {}
+    for item in sorted(collected_items, key=lambda x: x.get("time", "")):
+        by_workitem.setdefault(str(item.get("todo_id") or ""), []).append(item)
     items_summary = "\n".join(
-        f"- time={item.get('time', '')}, content={item.get('content', '')}"
-        for item in items_sorted
+        f"[워크아이템 {n}]\n" + "\n".join(
+            f"  - time={item.get('time', '')}, content={item.get('content', '')}" for item in feedbacks
+        )
+        for n, feedbacks in enumerate(by_workitem.values(), start=1)
     ) or "없음"
 
     prompt = f"""
-같은 업무 활동 단계에서 수집된 여러 워크아이템의 사용자 피드백입니다.
+같은 업무 활동 단계에서 수집된 여러 워크아이템의 사용자 피드백입니다. 워크아이템별로 묶여 있습니다.
 이 피드백들이 무엇을 개선하기 위한 것인지 먼저 분류한 뒤, 분류된 대상마다 그에 맞는 제안 내용을 만드세요.
 
 **작업 지시사항 (참고용):**
@@ -180,6 +209,10 @@ async def classify_and_extract_proposal(
 - 아직 실제로 스킬/DMN/프로세스 정의를 조회하거나 수정하는 단계가 아닙니다. 기존 스킬 이름이나 기존
   프로세스 정의의 실제 내용을 안다고 가정하지 마세요 (조회 없이 피드백만으로 판단하세요).
 - 피드백들 사이에 명확한 공통 관심사가 없다면 억지로 만들어내지 마세요 — 이 경우 targets를 빈 배열로 응답하세요.
+- 한 워크아이템 안의 피드백 여러 건은 한 업무에 대한 의견입니다. 여러 워크아이템에서 되풀이되는 내용일수록
+  일반 규칙으로 만들 근거가 강합니다.
+- 칭찬·감사("잘했어요", "고마워요")나 단순 재실행 요청("다시 해줘", "한 번 더")은 업무 내용이 없으므로
+  개선 근거가 아닙니다. 이런 피드백으로 "재실행 옵션을 제시한다" 같은 대화 방식 규칙을 만들지 마세요.
 - 최신(time이 늦은) 피드백이 이전 피드백과 상충하면 최신 것을 우선하되, 이전 것도 맥락으로 반영하세요.
 - 서로 다른 관심사(예: 절차 문제 하나 + 비즈니스 규칙 문제 하나)가 섞여 있으면 각각 별도 target으로
   분리해 응답하세요. 같은 관심사를 여러 target에 중복으로 넣지 마세요.
@@ -243,10 +276,10 @@ async def classify_and_extract_proposal(
         return targets
     except json.JSONDecodeError as e:
         handle_error("피드백분류 JSON 파싱", f"응답 파싱 실패: {e}")
-        return []
+        return None
     except Exception as e:
         handle_error("피드백분류", e)
-        return []
+        return None
 
 
 async def resolve_skill_identity(artifact_text: str, candidates: List[Dict[str, Any]]) -> Dict[str, str]:
@@ -313,8 +346,13 @@ async def resolve_dmn_identity(artifact: Dict[str, Any], candidates: List[Dict[s
     artifact_desc = (decision_info.get("description") or "").strip()
 
     candidates_text = "\n".join(
-        f"- id: {c.get('id', '')}, 이름: {c.get('name', '')}, 설명: {c.get('description', '')}"
+        f"- id: {c.get('id', '')}, 이름: {c.get('name', '')}, 내용: {c.get('description', '')}"
         for c in candidates
+    ) or "없음"
+    proposed_rules = "\n".join(
+        f"- {r.get('when', '')} → {r.get('then', '')}"
+        for r in artifact.get("rules") or []
+        if isinstance(r, dict)
     ) or "없음"
 
     prompt = f"""
@@ -324,11 +362,14 @@ async def resolve_dmn_identity(artifact: Dict[str, Any], candidates: List[Dict[s
 **제안된 DMN 규칙:**
 이름: {artifact_name}
 설명: {artifact_desc}
+규칙:
+{proposed_rules}
 
-**이 에이전트의 기존 DMN 규칙 목록:**
+**이 에이전트의 기존 DMN 규칙 목록 (내용 = 실제 의사결정의 입력·출력과 규칙):**
 {candidates_text}
 
 **판단 기준:**
+- 이름이 달라도 같은 입력으로 같은 종류의 결과를 정하면(예: 고객등급으로 할인율·혜택률을 정함) 같은 대상입니다.
 - 기존 규칙 중 하나와 판단 대상/범위가 명확히 겹치면 UPDATE, 그 규칙의 정확한 id를 그대로 쓰세요.
 - 겹치는 기존 규칙이 없으면 PASS로 응답하세요 (id는 비워둠).
 
@@ -344,6 +385,10 @@ async def resolve_dmn_identity(artifact: Dict[str, Any], candidates: List[Dict[s
         name = (parsed.get("name") or artifact_name or "").strip()
         if decision == "UPDATE" and not rid:
             decision = "PASS"
+        # 개선 대상은 기존 DMN이다 — 제안이 붙인 새 이름이 아니라 그 DMN의 실제 이름을 쓴다.
+        matched = next((c for c in candidates if c.get("id") == rid), None)
+        if decision == "UPDATE" and matched and matched.get("name"):
+            name = matched["name"]
         return {"decision": decision if decision in ("PASS", "UPDATE") else "PASS", "id": rid, "name": name}
     except Exception as e:
         handle_error("DMN식별판단", e)
