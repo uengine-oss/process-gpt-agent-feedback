@@ -1229,6 +1229,15 @@ def merge_dmn_artifact_into_definition(definition: Dict[str, Any], artifact: Dic
     않고 생성됨) decision 이름 기준으로 06-dmn.md 컨벤션(dmn_decision_<slug>,
     dmn_rule_<slug>_<순번>)에 맞는 id를 여기서 새로 만든다. 이미 같은 id의
     decision/rule이 있으면 중복 추가하지 않는다.
+
+    기존 decision 매칭은 **이름**으로 한다. 예전에는 여기서 새로 만든
+    dmn_decision_<slug> id가 기존 목록에 있는지만 봤는데, DMN 편집기로 만든
+    decision은 id가 Decision_1 같은 값이라 이름이 똑같아도 매칭되지 않았다.
+    그 결과 "교통비 한도를 5만원에서 7만원으로 고쳐 달라"는 피드백이 기존 결정을
+    고치는 대신 같은 이름의 결정을 하나 더 만들어, 라이브 DMN에 한도가 다른
+    동명 결정 두 개가 남았다(실제 발생: proc_def_id=913ed5f8-ee79-f753-4e5b-
+    090a19ce64f2). 이름이 같으면 기존 decision_id를 그대로 재사용해 새 규칙이
+    그 결정에 붙게 한다.
     """
     import copy
 
@@ -1242,6 +1251,19 @@ def merge_dmn_artifact_into_definition(definition: Dict[str, Any], artifact: Dic
     decision = artifact.get("decision") or {}
     decision_name = decision.get("name", "")
     decision_id = f"dmn_decision_{_slugify_for_dmn_id(decision_name)}"
+
+    # 이름이 같은 기존 decision이 있으면 그 id를 쓴다(편집기가 만든 Decision_1 등).
+    name_key = _slugify_for_dmn_id(decision_name)
+    matched = next(
+        (
+            d
+            for d in decisions
+            if isinstance(d, dict) and _slugify_for_dmn_id(d.get("name", "")) == name_key
+        ),
+        None,
+    )
+    if matched and matched.get("decision_id"):
+        decision_id = matched["decision_id"]
 
     existing_decision_ids = {d.get("decision_id") for d in decisions if isinstance(d, dict)}
     if decision_id not in existing_decision_ids:

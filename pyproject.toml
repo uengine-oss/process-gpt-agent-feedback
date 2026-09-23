@@ -24,3 +24,10 @@ dependencies = [
     "supabase>=2.0.0",
     "uvicorn>=0.27.0",
 ]
+
+[tool.pytest.ini_options]
+# tests/manual/* 은 사람이 값을 채워 넣고 직접 돌리는 스크립트다(실제 TODO_ID,
+# 실제 DB 연결 등이 필요). 이름이 test_* 라 자동 수집돼 매번 실패로 잡혔으므로
+# 기본 수집 대상에서 뺀다 — 돌릴 때는 경로를 직접 지정한다.
+testpaths = ["tests"]
+norecursedirs = ["tests/manual"]
